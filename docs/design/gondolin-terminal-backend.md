@@ -449,9 +449,18 @@ terminal:
   cwd: /workspace        # in-VM path; defaults to /workspace
   timeout: 180           # per-command, seconds
   gondolin:
-    # VM resources
-    memory_mb: 512       # per VM
-    cpu_count: 2
+    # VM resources (forwarded to Gondolin's VMOptions.memory / .cpus).
+    # Omit to use Gondolin's defaults (1G / 2 cpus). Dial down for many
+    # concurrent sessions on a memory-constrained host: 256M + 1 cpu
+    # fits ~30 VMs in 8 GB at the cost of slower in-guest builds.
+    memory: null         # qemu syntax, e.g. "256M", "1G"
+    cpus: null           # integer
+
+    # Cap on the number of live Gondolin VMs in THIS process. Subagents,
+    # the gateway, and a separate `hermes` CLI live in different processes
+    # and don't share this counter — so this is not a host-wide guarantee
+    # (cross-process locking is a planned follow-up). 0 = disabled.
+    max_concurrent_vms: 0
 
     # Sandbox dir override (default: ${HERMES_HOME}/sandboxes/<session>/)
     sandbox_dir: null
@@ -615,10 +624,25 @@ injected into the sandbox if configured.
    per-skill copy?), and (b) needs env-var binding + multi-identity
    so the github bootstrap can produce `AUTH_METHOD=gh` with a
    wire-injected placeholder. Re-open this item alongside (3).
-5. **Memory cost at scale.** Each VM is ~256-512 MB. A gateway hosting
-   10 concurrent chats would use 2.5-5 GB. Not crippling on a
-   developer laptop, but worth a config cap (`max_concurrent_vms`) and
-   documented memory budget.
+5. ~~**Memory cost at scale.**~~ **Closed (2026-05-26).** Two knobs
+   landed:
+   - Per-VM `terminal.gondolin.memory` (qemu syntax, e.g. `"256M"`)
+     and `terminal.gondolin.cpus` (int). Defaults to Gondolin's own
+     defaults (1G, 2 cpus); dialing memory down to 256M and cpus to
+     1 brings the per-VM cost into a range where 30+ VMs fit in 8 GB.
+   - `terminal.gondolin.max_concurrent_vms` — in-process cap that
+     refuses to spawn another VM when the limit is reached. Set to
+     0 (default) to disable entirely. Slot is released on cleanup and
+     on init failure (including KeyboardInterrupt).
+
+   **Sub-item still deferred: cross-process locking.** The cap above is
+   in-process only. Subagents, the gateway, and a separate `hermes`
+   CLI live in different processes and don't share the counter — so on
+   a host running gateway + ad-hoc CLI sessions, both can each spawn
+   N VMs concurrently. Doing this properly needs a file lock under
+   `${HERMES_HOME}/sandboxes/.gondolin.lock` plus PID-liveness checks
+   for stale-lock recovery, which is real work and not gating phase 2
+   close. File as a follow-up.
 
 ## Where this goes after phase 2
 
@@ -663,3 +687,11 @@ injected into the sandbox if configured.
   shape: the github `.env` bootstrap will see distinct env vars
   per identity (`GITHUB_TOKEN_PERSONAL`, `GITHUB_TOKEN_WORK`) and
   pick one explicitly.
+- **2026-05-26** — Open question (5) closed for the in-process
+  case: per-VM `memory`/`cpus` knobs forwarded to Gondolin's
+  `VMOptions`, plus in-process `max_concurrent_vms` cap in
+  `GondolinEnvironment` that rejects over-cap construction and
+  releases slots on cleanup or init failure. Cross-process locking
+  (gateway + ad-hoc CLI in different PIDs) is filed as a follow-up;
+  needs `${HERMES_HOME}/sandboxes/.gondolin.lock` + PID-liveness
+  checks.
