@@ -1,8 +1,12 @@
 // Convert YAML-shaped policy config into Gondolin's createHttpHooks() input.
 //
-// Two pieces:
+// Three exports:
 //   resolveSecret(cfg) → string | null   — resolves one secret entry
-//   buildHooksInput(yaml) → { allowedHosts, secrets }   — full config
+//   buildHooksInput(yaml) → { allowedHosts, secrets }   — default builder
+//   loadPolicy(path) → async (yaml) → { allowedHosts, secrets }
+//                                        — returns a callable that uses
+//                                          either buildHooksInput (path null)
+//                                          or the user module's getHooks
 //
 // Resolution precedence (highest first):
 //   value          - literal string in the config
@@ -15,6 +19,8 @@
 // surfaced in daemon logs, not by crashing the VM.
 
 import { execSync } from "node:child_process";
+import path from "node:path";
+import { pathToFileURL } from "node:url";
 
 export function resolveSecret(cfg) {
   if (!cfg || typeof cfg !== "object") return null;
@@ -62,4 +68,24 @@ export function buildHooksInput(yaml = {}) {
   }
 
   return { allowedHosts, secrets };
+}
+
+export async function loadPolicy(scriptPath) {
+  if (!scriptPath) {
+    return async (yaml) => buildHooksInput(yaml);
+  }
+
+  let mod;
+  try {
+    const url = pathToFileURL(path.resolve(scriptPath)).href;
+    mod = await import(url);
+  } catch (e) {
+    throw new Error(`failed to load policy_script ${scriptPath}: ${e.message}`);
+  }
+
+  if (typeof mod.getHooks !== "function") {
+    throw new Error(`policy_script ${scriptPath} must export a getHooks(yaml) function`);
+  }
+
+  return async (yaml) => mod.getHooks(yaml);
 }
