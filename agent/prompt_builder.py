@@ -610,7 +610,7 @@ WSL_ENVIRONMENT_HINT = (
 # misleading — the agent should only see the machine it can actually touch.
 _REMOTE_TERMINAL_BACKENDS = frozenset({
     "docker", "singularity", "modal", "daytona", "ssh",
-    "vercel_sandbox", "managed_modal",
+    "vercel_sandbox", "managed_modal", "gondolin",
 })
 
 
@@ -626,6 +626,7 @@ _BACKEND_FALLBACK_DESCRIPTIONS: dict[str, str] = {
     "daytona": "a Daytona workspace (Linux)",
     "vercel_sandbox": "a Vercel sandbox (Linux)",
     "ssh": "a remote host reached over SSH (likely Linux)",
+    "gondolin": "a Gondolin microVM (Linux) with credential isolation; network egress is allowlisted per config",
 }
 
 
