@@ -1291,6 +1291,29 @@ def run_doctor(args):
                 issues,
             )
 
+    # ------------------------------------------------------------------
+    # Sandbox storage health (backend-agnostic).
+    #
+    # Surfaces only when there's something worth saying: total bytes over
+    # the threshold OR a stale per-task directory older than the age cap.
+    # Always silent on first-run / fresh install. Failure to import the
+    # inventory module is non-fatal — this is an info line, not a gate.
+    # ------------------------------------------------------------------
+    try:
+        from tools.environments.base import get_sandbox_dir
+        from tools.environments import sandbox_inventory as _sb_inv
+
+        _sb_report = _sb_inv.scan(get_sandbox_dir())
+        if _sb_inv.should_flag_in_doctor(
+            _sb_report, min_total_mb=500, max_age_days=30
+        ):
+            check_info(_sb_inv.human_summary(_sb_report))
+            check_info("Run 'hermes sandboxes prune' to reclaim space")
+    except Exception:  # noqa: BLE001 — defensive: never block doctor
+        # Inventory check is purely informational; silently swallow any
+        # import or filesystem error so a broken module can't gate doctor.
+        pass
+
     # Daytona (if using daytona backend)
     if terminal_env == "daytona":
         daytona_key = os.getenv("DAYTONA_API_KEY")

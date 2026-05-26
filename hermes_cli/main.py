@@ -12257,6 +12257,21 @@ Examples:
     _register_checkpoints_cli(checkpoints_parser)
 
     # =========================================================================
+    # sandboxes command
+    # =========================================================================
+    sandboxes_parser = subparsers.add_parser(
+        "sandboxes",
+        help="Inspect / prune ~/.hermes/sandboxes/",
+        description="Manage the host-side sandbox storage shared by the docker, "
+        "gondolin, and singularity terminal backends. Lets you see "
+        "how much space per-task sandboxes occupy and prune stale "
+        "ones. Shared infra (singularity SIF cache) is counted but "
+        "never pruned.",
+    )
+    from hermes_cli.sandboxes import register_cli as _register_sandboxes_cli
+    _register_sandboxes_cli(sandboxes_parser)
+
+    # =========================================================================
     # import command
     # =========================================================================
     import_parser = subparsers.add_parser(
