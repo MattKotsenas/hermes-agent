@@ -392,3 +392,150 @@ test("daemon: init without workspace_mount leaves workspaceMount undefined", asy
   assert.equal(init.result.workspaceMount, undefined,
     "no workspace_mount config -> no workspaceMount in init result");
 });
+
+
+// ---- set_secret RPC ----------------------------------------------------
+//
+// Mid-session secret refresh. The daemon owns Gondolin's secretManager
+// (from createHttpHooks); set_secret routes through it. In stub mode the
+// daemon keeps a fake secretManager that records updates so tests can
+// assert the plumbing without a real VM.
+
+test("daemon: set_secret updates a configured secret after init", async (t) => {
+  const tmp = mkdtempSync(path.join(os.tmpdir(), "gondolin-setsec-"));
+  const sockPath = path.join(tmp, "d.sock");
+
+  const proc = spawn("node", [DAEMON, "--socket", sockPath], {
+    stdio: ["ignore", "ignore", "pipe"],
+    env: {
+      ...process.env,
+      GONDOLIN_DAEMON_QUIET: "1",
+      GONDOLIN_DAEMON_STUB_VM: "1",
+    },
+  });
+  proc.stderr.on("data", () => {});
+  t.after(async () => {
+    try { proc.kill("SIGTERM"); } catch {}
+    await new Promise((r) => {
+      if (proc.exitCode != null) return r();
+      proc.once("exit", r);
+      setTimeout(r, 2000);
+    });
+    rmSync(tmp, { recursive: true, force: true });
+  });
+
+  await waitForSocket(sockPath);
+
+  // Init with one secret so the secretManager has something to update.
+  const init = await rpcCall(sockPath, {
+    id: 1,
+    method: "init",
+    params: {
+      config: {
+        secrets: {
+          GITHUB_TOKEN: {
+            hosts: ["github.com"],
+            value: "original-token",
+          },
+        },
+      },
+    },
+  });
+  assert.equal(init.error, undefined);
+  assert.equal(init.result.ready, true);
+
+  // Update the value.
+  const upd = await rpcCall(sockPath, {
+    id: 2,
+    method: "set_secret",
+    params: { name: "GITHUB_TOKEN", value: "rotated-token" },
+  });
+  assert.equal(upd.error, undefined, `set_secret should succeed: ${JSON.stringify(upd.error)}`);
+  assert.equal(upd.result.ok, true);
+
+  // Confirm via the debug echo: stub mode exposes the current resolved
+  // value for a named secret so tests can assert without booting a VM.
+  const peek = await rpcCall(sockPath, {
+    id: 3,
+    method: "_debug_get_secret",
+    params: { name: "GITHUB_TOKEN" },
+  });
+  assert.equal(peek.error, undefined);
+  assert.equal(peek.result.value, "rotated-token");
+});
+
+
+test("daemon: set_secret on unknown name returns an error", async (t) => {
+  const tmp = mkdtempSync(path.join(os.tmpdir(), "gondolin-setsec-unk-"));
+  const sockPath = path.join(tmp, "d.sock");
+
+  const proc = spawn("node", [DAEMON, "--socket", sockPath], {
+    stdio: ["ignore", "ignore", "pipe"],
+    env: {
+      ...process.env,
+      GONDOLIN_DAEMON_QUIET: "1",
+      GONDOLIN_DAEMON_STUB_VM: "1",
+    },
+  });
+  proc.stderr.on("data", () => {});
+  t.after(async () => {
+    try { proc.kill("SIGTERM"); } catch {}
+    await new Promise((r) => {
+      if (proc.exitCode != null) return r();
+      proc.once("exit", r);
+      setTimeout(r, 2000);
+    });
+    rmSync(tmp, { recursive: true, force: true });
+  });
+
+  await waitForSocket(sockPath);
+
+  await rpcCall(sockPath, {
+    id: 1,
+    method: "init",
+    params: { config: {} },  // no secrets configured
+  });
+
+  const upd = await rpcCall(sockPath, {
+    id: 2,
+    method: "set_secret",
+    params: { name: "NEVER_DEFINED", value: "x" },
+  });
+  assert.ok(upd.error, "set_secret on unknown name must error");
+  assert.match(upd.error.message, /NEVER_DEFINED|unknown|not.*found/i);
+});
+
+
+test("daemon: set_secret before init fails clearly", async (t) => {
+  const tmp = mkdtempSync(path.join(os.tmpdir(), "gondolin-setsec-pre-"));
+  const sockPath = path.join(tmp, "d.sock");
+
+  const proc = spawn("node", [DAEMON, "--socket", sockPath], {
+    stdio: ["ignore", "ignore", "pipe"],
+    env: {
+      ...process.env,
+      GONDOLIN_DAEMON_QUIET: "1",
+      GONDOLIN_DAEMON_STUB_VM: "1",
+    },
+  });
+  proc.stderr.on("data", () => {});
+  t.after(async () => {
+    try { proc.kill("SIGTERM"); } catch {}
+    await new Promise((r) => {
+      if (proc.exitCode != null) return r();
+      proc.once("exit", r);
+      setTimeout(r, 2000);
+    });
+    rmSync(tmp, { recursive: true, force: true });
+  });
+
+  await waitForSocket(sockPath);
+
+  const upd = await rpcCall(sockPath, {
+    id: 1,
+    method: "set_secret",
+    params: { name: "X", value: "y" },
+  });
+  assert.ok(upd.error, "set_secret pre-init must error");
+  assert.match(upd.error.message, /not initialized|init/i);
+});

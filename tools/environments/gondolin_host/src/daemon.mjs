@@ -43,6 +43,10 @@ async function loadGondolin() {
 
 // State: the daemon owns at most one VM, shared across every connection.
 let vm = null;
+// Gondolin's secretManager from createHttpHooks(). Lets us refresh secret
+// values mid-session without restarting the VM. In stub mode we install a
+// fake that records updates for test assertions.
+let secretManager = null;
 
 const handlers = {
   async init(params) {
@@ -99,6 +103,42 @@ const handlers = {
         },
         async close() {},
       };
+      // Fake secretManager seeded from config.secrets so set_secret tests
+      // can exercise the plumbing without a real createHttpHooks() call.
+      // Mirrors the real Gondolin API: updateSecret throws on unknown name,
+      // deleteSecret zeros the value.
+      const stubSecrets = new Map();
+      for (const [name, cfg] of Object.entries(config.secrets ?? {})) {
+        stubSecrets.set(name, {
+          value: cfg.value ?? "",
+          hosts: Array.isArray(cfg.hosts) ? [...cfg.hosts] : [],
+        });
+      }
+      secretManager = {
+        listSecrets() {
+          return Array.from(stubSecrets.entries()).map(([name, s]) => ({
+            name, hosts: [...s.hosts], placeholder: "", deleted: s.value === "",
+          }));
+        },
+        updateSecret(name, opts) {
+          if (!stubSecrets.has(name)) {
+            throw new Error(`unknown secret: ${name}`);
+          }
+          const cur = stubSecrets.get(name);
+          if (opts.value !== undefined) cur.value = opts.value;
+          if (opts.hosts !== undefined) cur.hosts = [...opts.hosts];
+        },
+        deleteSecret(name) {
+          if (!stubSecrets.has(name)) {
+            throw new Error(`unknown secret: ${name}`);
+          }
+          stubSecrets.get(name).value = "";
+        },
+        // Stub-only debug helper used by tests.
+        _peek(name) {
+          return stubSecrets.get(name);
+        },
+      };
       log("VM stub ready");
       // Echo back the resolved config so tests can assert what would
       // have been forwarded to a real VM.create() without booting one.
@@ -117,7 +157,9 @@ const handlers = {
       workspaceMount,
     });
     const { VM, createHttpHooks, RealFSProvider } = await loadGondolin();
-    const { httpHooks, env } = createHttpHooks(hooksInput);
+    const hooksResult = createHttpHooks(hooksInput);
+    const { httpHooks, env } = hooksResult;
+    secretManager = hooksResult.secretManager;
     const vmOptions = { httpHooks, env };
     if (imagePath != null) {
       // SandboxServerOptions hangs off VMOptions.sandbox.
@@ -165,11 +207,34 @@ const handlers = {
     };
   },
 
-  async set_secret(_params) {
-    // Phase 2.5: mid-session secret refresh.
-    // Gondolin's createHttpHooks() input isn't documented as mutable
-    // post-init; need to investigate the low-level API before wiring this.
-    throw new Error("set_secret: not implemented in phase 2");
+  async set_secret(params) {
+    if (!vm) throw new Error("not initialized");
+    if (!secretManager) {
+      throw new Error("set_secret unsupported: no secretManager available");
+    }
+    const name = params?.name;
+    if (typeof name !== "string" || !name) {
+      throw new Error("set_secret: 'name' must be a non-empty string");
+    }
+    const opts = {};
+    if (typeof params?.value === "string") opts.value = params.value;
+    if (Array.isArray(params?.hosts)) opts.hosts = params.hosts;
+    if (opts.value === undefined && opts.hosts === undefined) {
+      throw new Error("set_secret: must provide at least 'value' or 'hosts'");
+    }
+    secretManager.updateSecret(name, opts);
+    return { ok: true };
+  },
+
+  async _debug_get_secret(params) {
+    // Stub-mode only: introspect the fake secretManager for test assertions.
+    // No-op against a real Gondolin VM (real secretManager doesn't expose
+    // the value back — for security).
+    if (!secretManager || typeof secretManager._peek !== "function") {
+      throw new Error("_debug_get_secret only available in stub mode");
+    }
+    const entry = secretManager._peek(params?.name);
+    return { value: entry?.value, hosts: entry?.hosts };
   },
 
   async shutdown() {
@@ -180,6 +245,7 @@ const handlers = {
         log("vm.close error:", e.message);
       }
       vm = null;
+      secretManager = null;
     }
     setImmediate(() => process.exit(0));
     return { ok: true };

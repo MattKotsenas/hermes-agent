@@ -22,6 +22,8 @@ import { execSync } from "node:child_process";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
 
+import { makePlaceholderFunc } from "@earendil-works/gondolin";
+
 export function resolveSecret(cfg) {
   if (!cfg || typeof cfg !== "object") return null;
 
@@ -49,6 +51,36 @@ export function resolveSecret(cfg) {
   return null;
 }
 
+// Resolve a YAML-shaped placeholder value into the form Gondolin expects.
+//
+// Accepts:
+//   undefined → undefined (Gondolin auto-generates a random placeholder)
+//   string    → string (verbatim)
+//   object    → generator function via makePlaceholderFunc({prefix, length, alphabet})
+//
+// Throws on malformed object form (missing `length`) so misconfig surfaces
+// at init time rather than from inside Gondolin's hook machinery.
+export function resolvePlaceholder(secretName, ph) {
+  if (ph == null) return undefined;
+  if (typeof ph === "string") return ph;
+  if (typeof ph === "object") {
+    if (typeof ph.length !== "number" || ph.length <= 0) {
+      throw new Error(
+        `secret ${secretName}: placeholder object requires a positive 'length' (got ${ph.length})`,
+      );
+    }
+    return makePlaceholderFunc({
+      prefix: ph.prefix,
+      suffix: ph.suffix,
+      length: ph.length,
+      alphabet: ph.alphabet,
+    });
+  }
+  throw new Error(
+    `secret ${secretName}: placeholder must be a string or {prefix?, length, alphabet?} object`,
+  );
+}
+
 export function buildHooksInput(yaml = {}) {
   const allowedHosts = Array.isArray(yaml.allowed_hosts) && yaml.allowed_hosts.length
     ? [...yaml.allowed_hosts]
@@ -64,7 +96,12 @@ export function buildHooksInput(yaml = {}) {
       // Skip unresolved secrets — agent runs without that credential.
       continue;
     }
-    secrets[name] = { hosts: [...cfg.hosts], value };
+    const entry = { hosts: [...cfg.hosts], value };
+    const placeholder = resolvePlaceholder(name, cfg.placeholder);
+    if (placeholder !== undefined) {
+      entry.placeholder = placeholder;
+    }
+    secrets[name] = entry;
   }
 
   return { allowedHosts, secrets };
