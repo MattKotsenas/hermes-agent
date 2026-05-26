@@ -532,14 +532,52 @@ injected into the sandbox if configured.
    `RealFSProvider`). Wired up; round-trip file visibility verified
    in `tests/integration/test_gondolin_terminal.py`. No file-sync
    fallback needed.
-3. **Credential refresh.** Phase 2 ships `from_env` only. `from_command`
-   for re-fetchable creds (AAD tokens) is phase 2.5. The daemon needs a
-   `set_secret` RPC; verify `createHttpHooks` supports mutating the
-   secret value without restarting the VM.
+3. **Credential refresh + env-var binding + multi-identity.** Phase 2
+   ships `from_env` only and uses the secret name implicitly as the
+   placeholder. Three related extensions need to land together before
+   the github-skill family works under gondolin:
+
+   - `from_command` for re-fetchable creds (AAD tokens). Daemon needs a
+     `set_secret` RPC; verify `createHttpHooks` supports mutating the
+     secret value without restarting the VM.
+   - **Env-var binding.** Each secret needs an explicit "expose to the
+     guest as `$ENV_VAR_NAME`" knob, distinct from the secret's own
+     name. Tools like `gh` read `$GITHUB_TOKEN`; the guest needs that
+     env var populated with the placeholder so the wire hook can swap
+     it. Today the binding is implicit (secret name == env var name),
+     which is too restrictive for the multi-identity case below.
+   - **Multi-identity routing.** A single user can have 2+ tokens for
+     the same host — Matt's WSL setup has personal `MattKotsenas` and
+     work-EMU `mattkot_microsoft`, both on `github.com`, disambiguated
+     today by `~/.local/bin/gh-cred-as`. In-VM equivalent: each secret
+     gets a unique placeholder, the wire hook routes the real value
+     based on the placeholder it sees in the outbound request (not
+     just the host). Open: does `createHttpHooks` support "match this
+     bearer-token *value*, replace with that real value" semantics?
+     If not, we may need to drop to the lower-level TS API. Until this
+     is solved, gondolin is single-identity-per-host.
+
+   This composite is what unblocks deferred item (4) — the github skill
+   family's `.env`-bootstrap pattern currently falls through to
+   `AUTH_METHOD=none` inside the VM. Wire-injection via env vars makes
+   it produce `AUTH_METHOD=gh` correctly.
 4. **Skills that touch `~/.hermes/` from inside the VM.** Audit the
    bundled skills. Any that do `read_file('~/.hermes/skills/...')`
    directly will break under gondolin backend. Either patch those
    skills to use `skill_view`, or document the incompatibility.
+
+   **Deferred to backend-switch time (2026-05-26).** Two broad
+   categories surface today: (a) skill-bundled scripts referenced
+   as `~/.hermes/skills/<name>/scripts/...` which won't be present
+   in the guest filesystem, and (b) the github-skill family's
+   `~/.hermes/.env` bootstrap which silently falls through to
+   `AUTH_METHOD=none` instead of relying on wire-injection. Both
+   are blocked on (3) landing: (a) needs a story for how skill
+   scripts get into the guest (auto-mounted under
+   `/etc/hermes/skills/`? rewritten in the system prompt? individual
+   per-skill copy?), and (b) needs env-var binding + multi-identity
+   so the github bootstrap can produce `AUTH_METHOD=gh` with a
+   wire-injected placeholder. Re-open this item alongside (3).
 5. **Memory cost at scale.** Each VM is ~256-512 MB. A gateway hosting
    10 concurrent chats would use 2.5-5 GB. Not crippling on a
    developer laptop, but worth a config cap (`max_concurrent_vms`) and
@@ -570,3 +608,7 @@ injected into the sandbox if configured.
   at the configured cwd (default `/workspace`), read-write, with
   round-trip file visibility verified by KVM integration tests.
   Closes open question (2) from phase 2.
+- **2026-05-26** — Skill audit (open question 4) deferred to land
+  alongside open question 3. Two real breakages identified
+  (skill-bundled script paths, github `.env` bootstrap), both
+  blocked on env-var binding + multi-identity wire injection.
