@@ -175,3 +175,49 @@ def test_workspace_mount_can_be_disabled(stub_env_factory):
     need our default mount and may want a stricter image-only filesystem."""
     env = stub_env_factory(config={"workspace_mount": False})
     assert env.workspace_mount is None
+
+
+@requires_node
+def test_set_secret_routes_through_daemon_rpc(stub_env_factory):
+    """The env exposes set_secret(name, value=..., hosts=...) which routes
+    a set_secret RPC to the daemon's secretManager. Use case: a credential
+    refresh loop (e.g. AAD token) updates the wire-injection value without
+    restarting the VM."""
+    import json
+    import socket as _socket
+
+    env = stub_env_factory(config={
+        "secrets": {
+            "GITHUB_TOKEN": {"hosts": ["github.com"], "value": "initial"},
+        },
+    })
+
+    # Refresh via the Python helper.
+    env.set_secret("GITHUB_TOKEN", value="refreshed")
+
+    # Confirm via the daemon's stub-mode debug RPC (raw socket to avoid
+    # circular dependency on the helper we just tested).
+    def rpc(req):
+        s = _socket.socket(_socket.AF_UNIX, _socket.SOCK_STREAM)
+        s.connect(env.sock_path)
+        s.sendall((json.dumps(req) + "\n").encode())
+        buf = b""
+        while b"\n" not in buf:
+            chunk = s.recv(4096)
+            if not chunk:
+                break
+            buf += chunk
+        s.close()
+        return json.loads(buf.split(b"\n", 1)[0])
+
+    peek = rpc({"id": 1, "method": "_debug_get_secret", "params": {"name": "GITHUB_TOKEN"}})
+    assert peek.get("error") is None
+    assert peek["result"]["value"] == "refreshed"
+
+
+@requires_node
+def test_set_secret_raises_on_unknown_name(stub_env_factory):
+    """Unknown secret names surface as RuntimeError on the Python side."""
+    env = stub_env_factory(config={"secrets": {}})
+    with pytest.raises(RuntimeError, match=r"NEVER_DEFINED|unknown"):
+        env.set_secret("NEVER_DEFINED", value="x")

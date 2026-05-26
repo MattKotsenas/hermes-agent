@@ -273,10 +273,60 @@ terminal:
 ```
 
 The `from_command` form lets the host refresh the credential as needed
-(AAD tokens are ~1h). The daemon supports a `set_secret` RPC so the
-Python side can refresh values mid-session without VM restart.
+(AAD tokens are ~1h). The daemon's `set_secret` RPC also lets external
+code (a refresh loop) push a new value mid-session without restarting
+the VM.
 
-Phase 2 ships with `from_env` only. `from_command` is phase 2.5.
+#### Multi-identity per host
+
+A single user can have multiple credentials for the same host —
+e.g. personal and work GitHub accounts both on `github.com`,
+disambiguated on the host by `gh-cred-as` or similar. The in-VM
+equivalent works naturally because Gondolin's `secretManager` keys
+on the secret *name* (which becomes the guest env var name) and
+swaps based on the *placeholder value* it sees in the outbound
+request, not the host.
+
+```yaml
+terminal:
+  gondolin:
+    secrets:
+      GITHUB_TOKEN_PERSONAL:
+        hosts: [api.github.com, github.com]
+        from_env: GITHUB_TOKEN_PERSONAL
+        placeholder: { prefix: "GONDOL_GHP_", length: 24 }
+      GITHUB_TOKEN_WORK:
+        hosts: [api.github.com, github.com]
+        from_env: GITHUB_TOKEN_WORK
+        placeholder: { prefix: "GONDOL_GHW_", length: 24 }
+```
+
+Inside the guest, `$GITHUB_TOKEN_PERSONAL` and `$GITHUB_TOKEN_WORK`
+are distinct placeholder strings. Whichever one a tool reads (and
+bakes into its `Authorization` header) is what the wire hook
+swaps. Tools that read `$GITHUB_TOKEN` directly (e.g. `gh`) need
+a small shim — set `GITHUB_TOKEN=$GITHUB_TOKEN_PERSONAL` (or
+`_WORK`) before invoking the tool, per the same per-identity
+selection logic that lives in `gh-cred-as` host-side today.
+
+#### Placeholder configuration
+
+The `placeholder:` field on each secret accepts:
+
+- **string** — used verbatim. Useful when you want a recognizable
+  fingerprint in logs (e.g. `"PLACEHOLDER_FOR_GITHUB_PERSONAL"`).
+- **object** `{ prefix?, suffix?, length, alphabet? }` — converted
+  to a random generator via Gondolin's `makePlaceholderFunc`. The
+  declarative shape is easier to read than a function and travels
+  through YAML cleanly.
+- **omitted** — Gondolin auto-generates a random placeholder. Fine
+  for single-identity cases.
+
+Explicit placeholders are only *required* for multi-identity, where
+identical placeholders would collapse the routing — but they're a
+useful safety hint in any case, since a known prefix makes
+mis-injection obvious in logs (the agent sees `GONDOL_GHP_xxx`
+where it expected a real token, vs. some random hex string).
 
 ### Escape hatch: `policy_script` (no BCF)
 
@@ -532,35 +582,22 @@ injected into the sandbox if configured.
    `RealFSProvider`). Wired up; round-trip file visibility verified
    in `tests/integration/test_gondolin_terminal.py`. No file-sync
    fallback needed.
-3. **Credential refresh + env-var binding + multi-identity.** Phase 2
-   ships `from_env` only and uses the secret name implicitly as the
-   placeholder. Three related extensions need to land together before
-   the github-skill family works under gondolin:
-
-   - `from_command` for re-fetchable creds (AAD tokens). Daemon needs a
-     `set_secret` RPC; verify `createHttpHooks` supports mutating the
-     secret value without restarting the VM.
-   - **Env-var binding.** Each secret needs an explicit "expose to the
-     guest as `$ENV_VAR_NAME`" knob, distinct from the secret's own
-     name. Tools like `gh` read `$GITHUB_TOKEN`; the guest needs that
-     env var populated with the placeholder so the wire hook can swap
-     it. Today the binding is implicit (secret name == env var name),
-     which is too restrictive for the multi-identity case below.
-   - **Multi-identity routing.** A single user can have 2+ tokens for
-     the same host — Matt's WSL setup has personal `MattKotsenas` and
-     work-EMU `mattkot_microsoft`, both on `github.com`, disambiguated
-     today by `~/.local/bin/gh-cred-as`. In-VM equivalent: each secret
-     gets a unique placeholder, the wire hook routes the real value
-     based on the placeholder it sees in the outbound request (not
-     just the host). Open: does `createHttpHooks` support "match this
-     bearer-token *value*, replace with that real value" semantics?
-     If not, we may need to drop to the lower-level TS API. Until this
-     is solved, gondolin is single-identity-per-host.
-
-   This composite is what unblocks deferred item (4) — the github skill
-   family's `.env`-bootstrap pattern currently falls through to
-   `AUTH_METHOD=none` inside the VM. Wire-injection via env vars makes
-   it produce `AUTH_METHOD=gh` correctly.
+3. ~~**Credential refresh + env-var binding + multi-identity.**~~
+   **Closed (2026-05-26).** Gondolin's `createHttpHooks` already
+   exposes everything we need: `SecretDefinition.placeholder`
+   (string or generator), per-secret env-var binding via the secrets
+   map (name == guest env var), `SecretManager.updateSecret` for
+   mid-session refresh, and value-keyed routing that makes
+   multi-identity-per-host work without any custom hook code.
+   - `from_command` already supported by `buildHooksInput`.
+   - Daemon's `set_secret` RPC now routes through `secretManager`.
+   - YAML `placeholder:` field accepted as string or
+     `{ prefix?, suffix?, length, alphabet? }` (mapped to
+     `makePlaceholderFunc`).
+   - Multi-identity is just two `secrets:` entries with the same
+     hosts and distinct names+placeholders; the guest sees them as
+     distinct env vars (e.g. `GITHUB_TOKEN_PERSONAL` vs
+     `GITHUB_TOKEN_WORK`).
 4. **Skills that touch `~/.hermes/` from inside the VM.** Audit the
    bundled skills. Any that do `read_file('~/.hermes/skills/...')`
    directly will break under gondolin backend. Either patch those
@@ -612,3 +649,17 @@ injected into the sandbox if configured.
   alongside open question 3. Two real breakages identified
   (skill-bundled script paths, github `.env` bootstrap), both
   blocked on env-var binding + multi-identity wire injection.
+- **2026-05-26** — Open question (3) closed. Gondolin's
+  `createHttpHooks` API already supports per-secret placeholders
+  (string or generator), env-var binding via secrets map keys,
+  `secretManager.updateSecret` for mid-session refresh, and
+  value-keyed wire-routing for multi-identity-per-host. Wired up:
+  `hooks.mjs` threads `placeholder:` through (string or
+  `{prefix?, suffix?, length, alphabet?}`); daemon `set_secret`
+  RPC routes to `secretManager`; Python env exposes
+  `set_secret(name, value=..., hosts=...)`. Multi-identity works
+  with two `secrets:` entries having the same hosts and distinct
+  names+placeholders. Skill audit (4) can now proceed against this
+  shape: the github `.env` bootstrap will see distinct env vars
+  per identity (`GITHUB_TOKEN_PERSONAL`, `GITHUB_TOKEN_WORK`) and
+  pick one explicitly.

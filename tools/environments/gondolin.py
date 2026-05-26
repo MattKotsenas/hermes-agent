@@ -214,6 +214,42 @@ class GondolinEnvironment(BaseEnvironment):
         ]
         return _popen_bash(argv, stdin_data)
 
+    def set_secret(
+        self,
+        name: str,
+        *,
+        value: str | None = None,
+        hosts: list[str] | None = None,
+    ) -> None:
+        """Update a configured secret's value and/or host list without
+        restarting the VM. Routes through the daemon's set_secret RPC,
+        which calls Gondolin's secretManager.updateSecret(). At least
+        one of ``value`` or ``hosts`` must be provided.
+
+        Use case: a credential-refresh loop (AAD tokens last ~1h) calls
+        this when the cached token gets close to expiry, so wire-level
+        injection picks up the new value on the next outbound request.
+
+        Raises RuntimeError on unknown secret name or transport error.
+        """
+        params: dict[str, Any] = {"name": name}
+        if value is not None:
+            params["value"] = value
+        if hosts is not None:
+            params["hosts"] = list(hosts)
+        if "value" not in params and "hosts" not in params:
+            raise ValueError("set_secret: provide at least 'value' or 'hosts'")
+
+        response = _rpc_call(
+            self.sock_path,
+            {"id": int(time.time() * 1000) & 0xFFFFFFFF, "method": "set_secret", "params": params},
+            timeout=10.0,
+        )
+        err = response.get("error")
+        if err is not None:
+            msg = err.get("message", str(err)) if isinstance(err, dict) else str(err)
+            raise RuntimeError(f"gondolin set_secret({name}) failed: {msg}")
+
     def cleanup(self) -> None:
         """Send shutdown RPC, wait for daemon exit, kill if it hangs."""
         if not self._daemon_proc:
