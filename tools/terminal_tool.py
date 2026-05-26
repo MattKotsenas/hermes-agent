@@ -1015,14 +1015,17 @@ def _get_env_config() -> Dict[str, Any]:
     mount_docker_cwd = os.getenv("TERMINAL_DOCKER_MOUNT_CWD_TO_WORKSPACE", "false").lower() in {"true", "1", "yes"}
 
     # Default cwd: local uses the host's current directory, ssh uses the
-    # remote home, Vercel uses its documented workspace root, and everything
-    # else starts in the backend's default root-like cwd.
+    # remote home, Vercel uses its documented workspace root, gondolin
+    # uses the in-VM /workspace bind mount, and everything else starts
+    # in the backend's default root-like cwd.
     if env_type == "local":
         default_cwd = os.getcwd()
     elif env_type == "ssh":
         default_cwd = "~"
     elif env_type == "vercel_sandbox":
         default_cwd = _VERCEL_SANDBOX_DEFAULT_CWD
+    elif env_type == "gondolin":
+        default_cwd = "/workspace"
     else:
         default_cwd = "/root"
 
@@ -1091,6 +1094,20 @@ def _get_env_config() -> Dict[str, Any]:
         "docker_env": _parse_env_var("TERMINAL_DOCKER_ENV", "{}", json.loads, "valid JSON"),
         "docker_run_as_host_user": os.getenv("TERMINAL_DOCKER_RUN_AS_HOST_USER", "false").lower() in {"true", "1", "yes"},
         "docker_extra_args": _parse_env_var("TERMINAL_DOCKER_EXTRA_ARGS", "[]", json.loads, "valid JSON"),
+        # Gondolin-specific config — surfaces TERMINAL_GONDOLIN_* env vars into
+        # a structured block that _create_environment forwards to
+        # GondolinEnvironment. allowed_hosts defaults to ["*"] (open with
+        # credential isolation) to match the design doc; tightening is opt-in.
+        "gondolin": {
+            "allowed_hosts": _parse_env_var(
+                "TERMINAL_GONDOLIN_ALLOWED_HOSTS", '["*"]', json.loads, "valid JSON"
+            ),
+            "secrets": _parse_env_var(
+                "TERMINAL_GONDOLIN_SECRETS_JSON", "{}", json.loads, "valid JSON"
+            ),
+            "policy_script": os.getenv("TERMINAL_GONDOLIN_POLICY_SCRIPT") or None,
+            "sandbox_dir": os.getenv("TERMINAL_GONDOLIN_SANDBOX_DIR") or None,
+        },
     }
 
 
@@ -1106,6 +1123,7 @@ def _get_modal_backend_state(modal_mode: object | None) -> Dict[str, Any]:
 def _create_environment(env_type: str, image: str, cwd: str, timeout: int,
                         ssh_config: dict = None, container_config: dict = None,
                         local_config: dict = None,
+                        gondolin_config: dict = None,
                         task_id: str = "default",
                         host_cwd: str = None):
     """
@@ -1113,12 +1131,14 @@ def _create_environment(env_type: str, image: str, cwd: str, timeout: int,
     
     Args:
         env_type: One of "local", "docker", "singularity", "modal",
-            "daytona", "vercel_sandbox", "ssh"
-        image: Docker/Singularity/Modal image name (ignored for local/ssh/vercel)
+            "daytona", "vercel_sandbox", "ssh", "gondolin"
+        image: Docker/Singularity/Modal image name (ignored for local/ssh/vercel/gondolin)
         cwd: Working directory
         timeout: Default command timeout
         ssh_config: SSH connection config (for env_type="ssh")
         container_config: Resource config for container backends (cpu, memory, disk, persistent)
+        gondolin_config: Gondolin-specific config (allowed_hosts, secrets,
+            policy_script, sandbox_dir, stub_vm)
         task_id: Task identifier for environment reuse and snapshot keying
         host_cwd: Optional host working directory to bind into Docker when explicitly enabled
         
@@ -1247,10 +1267,39 @@ def _create_environment(env_type: str, image: str, cwd: str, timeout: int,
             timeout=timeout,
         )
 
+    elif env_type == "gondolin":
+        # Lazy import: gondolin backend pulls in @earendil-works/gondolin
+        # (via the daemon subprocess) and our wrapper script. Keep it out
+        # of the import path for the other backends.
+        from tools.environments.gondolin import GondolinEnvironment as _GondolinEnvironment
+        gc = gondolin_config or {}
+        sandbox_dir = gc.get("sandbox_dir")
+        if not sandbox_dir:
+            # Default: per-task sandbox under HERMES_HOME so subagents /
+            # parallel sessions never collide on the daemon socket path.
+            from hermes_constants import get_hermes_home
+            sandbox_dir = str(get_hermes_home() / "sandboxes" / f"gondolin-{task_id}")
+        # config dict forwarded to the daemon's init RPC. Keep only the
+        # keys the daemon understands; anything else stays out of the
+        # JSON-RPC payload.
+        daemon_config = {
+            "allowed_hosts": gc.get("allowed_hosts", ["*"]),
+            "secrets": gc.get("secrets", {}),
+            "policy_script": gc.get("policy_script"),
+        }
+        return _GondolinEnvironment(
+            sandbox_dir=sandbox_dir,
+            cwd=cwd,
+            timeout=timeout,
+            config=daemon_config,
+            stub_vm=bool(gc.get("stub_vm", False)),
+        )
+
     else:
         raise ValueError(
             f"Unknown environment type: {env_type}. Use 'local', 'docker', "
-            f"'singularity', 'modal', 'daytona', 'vercel_sandbox', or 'ssh'"
+            f"'singularity', 'modal', 'daytona', 'vercel_sandbox', 'ssh', "
+            f"or 'gondolin'"
         )
 
 
@@ -1831,6 +1880,10 @@ def terminal_tool(
                                 "persistent": config.get("local_persistent", False),
                             }
 
+                        gondolin_config = None
+                        if env_type == "gondolin":
+                            gondolin_config = config.get("gondolin") or {}
+
                         new_env = _create_environment(
                             env_type=env_type,
                             image=image,
@@ -1839,6 +1892,7 @@ def terminal_tool(
                             ssh_config=ssh_config,
                             container_config=container_config,
                             local_config=local_config,
+                            gondolin_config=gondolin_config,
                             task_id=effective_task_id,
                             host_cwd=config.get("host_cwd"),
                         )
