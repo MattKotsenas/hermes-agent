@@ -136,3 +136,41 @@ def test_create_environment_rejects_unknown_backend():
             cwd="/workspace",
             timeout=60,
         )
+
+
+def test_config_set_terminal_gondolin_keys_sync_to_env(monkeypatch, tmp_path):
+    """`hermes config set terminal.gondolin.<key>` must persist into .env
+    under the matching TERMINAL_GONDOLIN_* name so terminal_tool sees it.
+
+    Without the YAML->env sync, the user sets the YAML key but the
+    backend never reads it (terminal_tool only consults env vars), which
+    is a silent footgun.
+    """
+    import hermes_cli.config as config_mod
+
+    saved = {}
+    def _fake_save_env_value(key, value):
+        saved[key] = value
+    monkeypatch.setattr(config_mod, "save_env_value", _fake_save_env_value)
+
+    # Provide a minimal yaml/file harness so set_config doesn't need a real
+    # HERMES_HOME — write/read goes through tmp_path.
+    cfg_path = tmp_path / "config.yaml"
+    cfg_path.write_text("terminal:\n  backend: local\n")
+    monkeypatch.setattr(config_mod, "get_config_path", lambda: cfg_path)
+
+    keys_to_sync = {
+        "terminal.backend": ("gondolin", "TERMINAL_ENV"),
+        "terminal.gondolin.image": ("ubuntu-noble:latest", "TERMINAL_GONDOLIN_IMAGE"),
+        "terminal.gondolin.policy_script": ("/tmp/p.mjs", "TERMINAL_GONDOLIN_POLICY_SCRIPT"),
+        "terminal.gondolin.sandbox_dir": ("/tmp/sb", "TERMINAL_GONDOLIN_SANDBOX_DIR"),
+    }
+    for key, (value, expected_env_key) in keys_to_sync.items():
+        config_mod.set_config_value(key, value)
+
+    for key, (value, expected_env_key) in keys_to_sync.items():
+        assert expected_env_key in saved, (
+            f"{key} should have synced to env var {expected_env_key}; "
+            f"saved keys were {sorted(saved.keys())}"
+        )
+        assert saved[expected_env_key] == value

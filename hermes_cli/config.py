@@ -5440,6 +5440,14 @@ def set_config_value(key: str, value: str):
         "terminal.container_memory": "TERMINAL_CONTAINER_MEMORY",
         "terminal.container_disk": "TERMINAL_CONTAINER_DISK",
         "terminal.container_persistent": "TERMINAL_CONTAINER_PERSISTENT",
+        # Gondolin-specific YAML keys. terminal_tool reads only env vars,
+        # so each YAML key has to mirror to a TERMINAL_GONDOLIN_* env var
+        # or the user's `hermes config set` silently has no effect.
+        "terminal.gondolin.image": "TERMINAL_GONDOLIN_IMAGE",
+        "terminal.gondolin.allowed_hosts": "TERMINAL_GONDOLIN_ALLOWED_HOSTS",
+        "terminal.gondolin.secrets": "TERMINAL_GONDOLIN_SECRETS_JSON",
+        "terminal.gondolin.policy_script": "TERMINAL_GONDOLIN_POLICY_SCRIPT",
+        "terminal.gondolin.sandbox_dir": "TERMINAL_GONDOLIN_SANDBOX_DIR",
     }
     if key in _config_to_env_sync:
         save_env_value(_config_to_env_sync[key], str(value))
