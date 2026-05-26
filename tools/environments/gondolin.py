@@ -199,17 +199,25 @@ class GondolinEnvironment(BaseEnvironment):
         self.config = dict(config or {})
         self.stub_vm = stub_vm
 
-        # Default workspace mount: bind the host sandbox_dir to the in-VM cwd
-        # via Gondolin's vfs.mounts. This is what makes file tools work
-        # against /workspace in the guest — the same bytes appear on the host
-        # under sandbox_dir, so read_file/write_file/patch can either route
+        # Workspace lives in a SUBDIR of sandbox_dir, not at the root. The
+        # root holds infra the agent has no business seeing (the daemon's
+        # gondolin.sock, future per-session lock/state files). Binding the
+        # subdir keeps that infra out of the guest's /workspace listing
+        # while still letting the host pick up files the agent wrote.
+        self.workspace_dir = self.sandbox_dir / "workspace"
+        self.workspace_dir.mkdir(parents=True, exist_ok=True)
+
+        # Default workspace mount: bind workspace_dir to the in-VM cwd via
+        # Gondolin's vfs.mounts. This is what makes file tools work against
+        # /workspace in the guest — the same bytes appear on the host under
+        # workspace_dir, so read_file/write_file/patch can either route
         # through the VM (terminal-based) or use the host path directly.
         # User can opt out by setting `workspace_mount: False` in config; a
         # power-user policy_script that defines its own vfs may want that.
         if "workspace_mount" not in self.config:
             self.config["workspace_mount"] = {
                 "guest_path": cwd,
-                "host_path": str(self.sandbox_dir),
+                "host_path": str(self.workspace_dir),
             }
         elif self.config["workspace_mount"] is False:
             # Sentinel for "opt out" — strip so the daemon doesn't see a

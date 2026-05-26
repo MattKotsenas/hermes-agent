@@ -144,27 +144,34 @@ def test_missing_node_binary_raises_clear_error(monkeypatch, tmp_path):
 
 
 @requires_node
-def test_default_workspace_mount_wires_sandbox_dir_to_cwd(stub_env_factory):
-    """By default, the env tells the daemon to bind the host sandbox_dir to
-    the configured in-VM cwd via vfs.mounts. This is what makes file tools
-    (read_file/write_file/patch) work against /workspace in the VM: the same
-    bytes appear on the host under sandbox_dir/. The stub daemon echoes the
-    resolved mount back in its init response; we assert against that."""
+def test_default_workspace_mount_wires_workspace_dir_to_cwd(stub_env_factory):
+    """By default the env tells the daemon to bind the host ``workspace_dir``
+    (a SUBDIR of ``sandbox_dir``) to the configured in-VM cwd via vfs.mounts.
+    This is what makes file tools (read_file/write_file/patch) work against
+    /workspace in the VM: the same bytes appear on the host under
+    ``sandbox_dir/workspace/``. Per-session infra like ``gondolin.sock``
+    stays at the sandbox_dir root and is NOT visible to the guest. The
+    stub daemon echoes the resolved mount back in its init response; we
+    assert against that."""
     env = stub_env_factory()
     # cwd defaults to /workspace.
     assert env.workspace_mount == {
         "guestPath": "/workspace",
-        "hostPath": str(env.sandbox_dir),
+        "hostPath": str(env.workspace_dir),
     }
+    # workspace_dir is the 'workspace' subdir under sandbox_dir.
+    assert env.workspace_dir == env.sandbox_dir / "workspace"
+    assert env.workspace_dir.is_dir()
 
 
 @requires_node
 def test_custom_cwd_changes_workspace_mount_guest_path(stub_env_factory):
-    """Changing cwd shifts where the sandbox dir appears inside the VM."""
+    """Changing cwd shifts where the workspace dir appears inside the VM,
+    but the host path stays anchored at ``sandbox_dir/workspace/``."""
     env = stub_env_factory(cwd="/srv/work")
     assert env.workspace_mount == {
         "guestPath": "/srv/work",
-        "hostPath": str(env.sandbox_dir),
+        "hostPath": str(env.workspace_dir),
     }
 
 
@@ -172,7 +179,9 @@ def test_custom_cwd_changes_workspace_mount_guest_path(stub_env_factory):
 def test_workspace_mount_can_be_disabled(stub_env_factory):
     """Setting workspace_mount=False in config skips the VFS wiring entirely.
     Power-user escape: someone hand-rolling vfs via a policy_script doesn't
-    need our default mount and may want a stricter image-only filesystem."""
+    need our default mount and may want a stricter image-only filesystem.
+    The host workspace_dir is still created on disk (no-op cost) — disabling
+    the bind mount doesn't mean refusing to make the directory."""
     env = stub_env_factory(config={"workspace_mount": False})
     assert env.workspace_mount is None
 
