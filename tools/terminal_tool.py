@@ -2348,10 +2348,17 @@ def check_terminal_requirements() -> bool:
             from daytona import Daytona  # noqa: F401 — SDK presence check
             return os.getenv("DAYTONA_API_KEY") is not None
 
+        elif env_type == "gondolin":
+            # Gondolin requires Node.js, qemu-system-x86_64, and /dev/kvm. We
+            # don't probe them here (hermes doctor does that with actionable
+            # diagnostics); we just acknowledge the backend is known so we
+            # don't log a spurious "Unknown TERMINAL_ENV" error.
+            return True
+
         else:
             logger.error(
                 "Unknown TERMINAL_ENV '%s'. Use one of: local, docker, singularity, "
-                "modal, daytona, vercel_sandbox, ssh.",
+                "modal, daytona, vercel_sandbox, ssh, gondolin.",
                 env_type,
             )
             return False

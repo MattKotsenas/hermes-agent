@@ -31,6 +31,21 @@ class TestTerminalRequirements:
         )
         assert terminal_tool_module.check_terminal_requirements() is True
 
+    def test_gondolin_backend_requirements_acknowledged(self, monkeypatch, caplog):
+        """Gondolin backend should be recognised so we don't log a spurious
+        'Unknown TERMINAL_ENV' error at startup. Real Node/qemu/KVM probing
+        happens in `hermes doctor`, not here."""
+        monkeypatch.setattr(
+            terminal_tool_module,
+            "_get_env_config",
+            lambda: {"env_type": "gondolin"},
+        )
+        with caplog.at_level("ERROR", logger=terminal_tool_module.logger.name):
+            assert terminal_tool_module.check_terminal_requirements() is True
+        assert not any(
+            "Unknown TERMINAL_ENV" in rec.message for rec in caplog.records
+        )
+
     def test_terminal_and_file_tools_resolve_for_local_backend(self, monkeypatch):
         monkeypatch.setattr(
             terminal_tool_module,
