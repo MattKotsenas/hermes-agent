@@ -8,15 +8,19 @@ exit. Daemon crashes don't poison the next call.
 
 These tests stand up a Python AF_UNIX server that mimics the daemon's
 JSON-RPC contract so the wrapper can be exercised without booting a VM.
+A separate end-to-end test launches the real Node daemon in stub mode
+to verify both halves agree on the wire format.
 """
 
 import json
 import os
+import shutil
 import socket
 import subprocess
 import sys
 import tempfile
 import threading
+import time
 from pathlib import Path
 
 import pytest
@@ -214,3 +218,84 @@ def test_large_stdout_does_not_truncate():
     assert result.returncode == 0
     assert len(result.stdout) >= 100_000
     assert result.stdout.startswith("x" * 100)
+
+
+# ---------------------------------------------------------------------------
+# End-to-end: real Node daemon ↔ Python wrapper over a real socket.
+# ---------------------------------------------------------------------------
+#
+# The unit tests above exercise the wrapper against a Python stub server,
+# which verifies the wrapper's behavior in isolation but not that the two
+# halves agree on the wire format. This end-to-end test launches the
+# actual Node daemon in stub mode (GONDOLIN_DAEMON_STUB_VM=1) so it
+# doesn't need QEMU/KVM, and runs the real wrapper against it.
+
+NODE_DAEMON = REPO_ROOT / "tools" / "environments" / "gondolin_host" / "src" / "daemon.mjs"
+NODE_AVAILABLE = shutil.which("node") is not None and NODE_DAEMON.exists()
+
+
+def _wait_for_socket(sock_path: str, timeout: float = 5.0) -> None:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        try:
+            s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            s.connect(sock_path)
+            s.close()
+            return
+        except (FileNotFoundError, ConnectionRefusedError):
+            time.sleep(0.05)
+    raise RuntimeError(f"daemon socket {sock_path} never came up")
+
+
+@pytest.fixture
+def stubbed_daemon(tmp_path):
+    """Launch the real Node daemon in stub mode (no VM). Yields the socket path."""
+    if not NODE_AVAILABLE:
+        pytest.skip("node or daemon.mjs not available")
+    sock_path = str(tmp_path / "d.sock")
+    proc = subprocess.Popen(
+        ["node", str(NODE_DAEMON), "--socket", sock_path],
+        env={
+            **os.environ,
+            "GONDOLIN_DAEMON_QUIET": "1",
+            "GONDOLIN_DAEMON_STUB_VM": "1",
+        },
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+    )
+    try:
+        _wait_for_socket(sock_path)
+        # Init the daemon (stub VM) so exec calls work.
+        s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        s.connect(sock_path)
+        s.sendall(b'{"id":1,"method":"init","params":{"config":{}}}\n')
+        s.recv(4096)  # drain init response
+        s.close()
+        yield sock_path
+    finally:
+        proc.terminate()
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+
+
+def test_e2e_wrapper_talks_to_real_daemon(stubbed_daemon):
+    """Wrapper successfully exec's through the real Node daemon over the
+    real socket. Stub VM echoes the command back as stdout."""
+    result = _run_wrapper(stubbed_daemon, "echo hi-from-vm")
+
+    assert result.returncode == 0, f"wrapper failed: stderr={result.stderr!r}"
+    assert "echo hi-from-vm" in result.stdout
+
+
+def test_e2e_consecutive_calls_share_daemon(stubbed_daemon):
+    """Two sequential wrapper invocations against the same daemon both
+    succeed — proves the daemon accepts many short-lived connections."""
+    a = _run_wrapper(stubbed_daemon, "echo first")
+    b = _run_wrapper(stubbed_daemon, "echo second")
+
+    assert a.returncode == 0
+    assert b.returncode == 0
+    assert "first" in a.stdout
+    assert "second" in b.stdout
