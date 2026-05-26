@@ -463,3 +463,65 @@ def test_concurrent_vm_cap_config_knob_overrides_module_default(tmp_path, monkey
         )
     finally:
         e.cleanup()
+
+
+# ---- Secret diagnostics ------------------------------------------------
+#
+# from_command silently dropping unresolvable secrets is the right runtime
+# behavior (agent runs without the credential rather than crashing) but
+# terrible for unattended cron jobs where a token-fetch script breaking is
+# the most common reason a credential isn't injected. The daemon surfaces
+# a per-secret diagnostic; Python captures it on the env, logs at WARN,
+# and `hermes doctor` shows it.
+
+@requires_node
+def test_secret_diagnostics_captured_from_init(tmp_path, caplog):
+    """A from_command that exits non-zero shows up on env.secret_diagnostics
+    with stderr captured, and is logged at WARNING."""
+    import logging as _logging
+
+    env = GondolinEnvironment(
+        sandbox_dir=str(tmp_path / "diag"),
+        stub_vm=True,
+        config={
+            "secrets": {
+                "AAD_TOKEN": {
+                    "hosts": ["login.microsoftonline.com"],
+                    "from_command": "sh -c 'echo broken-creds >&2; exit 3'",
+                },
+            },
+        },
+    )
+    try:
+        assert len(env.secret_diagnostics) == 1
+        d = env.secret_diagnostics[0]
+        assert d["name"] == "AAD_TOKEN"
+        assert d["type"] == "from_command"
+        assert "3" in d["error"]
+        assert "broken-creds" in d.get("stderr", "")
+
+        # And it was logged at WARNING.
+        warnings = [r for r in caplog.records if r.levelno >= _logging.WARNING]
+        assert any("AAD_TOKEN" in r.getMessage() for r in warnings), (
+            f"expected WARNING log mentioning AAD_TOKEN, got {[r.getMessage() for r in warnings]}"
+        )
+    finally:
+        env.cleanup()
+
+
+@requires_node
+def test_secret_diagnostics_empty_when_all_resolved(tmp_path):
+    """No diagnostics surface when every secret resolves cleanly."""
+    env = GondolinEnvironment(
+        sandbox_dir=str(tmp_path / "diag-ok"),
+        stub_vm=True,
+        config={
+            "secrets": {
+                "OK_LITERAL": {"hosts": ["x"], "value": "real-token"},
+            },
+        },
+    )
+    try:
+        assert env.secret_diagnostics == []
+    finally:
+        env.cleanup()

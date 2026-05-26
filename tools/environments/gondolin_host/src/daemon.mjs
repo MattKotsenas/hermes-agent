@@ -26,7 +26,7 @@ import path from "node:path";
 import { parseArgs } from "node:util";
 
 import { runRpcServer } from "./rpc.mjs";
-import { loadPolicy } from "./hooks.mjs";
+import { loadPolicy, buildHooksInput } from "./hooks.mjs";
 
 const QUIET = !!process.env.GONDOLIN_DAEMON_QUIET;
 const STUB_VM = !!process.env.GONDOLIN_DAEMON_STUB_VM;
@@ -155,6 +155,19 @@ const handlers = {
       if (workspaceMount != null) result.workspaceMount = workspaceMount;
       if (memory != null) result.memory = memory;
       if (cpus != null) result.cpus = cpus;
+      // Compute secret diagnostics even in stub mode — they're host-side
+      // and don't require a real VM. Lets stub-mode integration tests
+      // exercise the diagnostic surface.
+      try {
+        const stubHooks = buildHooksInput(config);
+        if (stubHooks.secretDiagnostics && stubHooks.secretDiagnostics.length) {
+          result.secretDiagnostics = stubHooks.secretDiagnostics;
+        }
+      } catch {
+        // Malformed config (e.g. missing hosts) — propagate as a normal
+        // init failure on the real path; in stub mode we just skip the
+        // diagnostics block so the test can still assert other fields.
+      }
       return result;
     }
 
@@ -193,7 +206,11 @@ const handlers = {
     if (cpus != null) vmOptions.cpus = cpus;
     vm = await VM.create(vmOptions);
     log("VM ready");
-    return { ready: true };
+    const result = { ready: true };
+    if (hooksInput.secretDiagnostics && hooksInput.secretDiagnostics.length) {
+      result.secretDiagnostics = hooksInput.secretDiagnostics;
+    }
+    return result;
   },
 
   async exec(params) {

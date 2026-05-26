@@ -242,3 +242,89 @@ test("buildHooksInput: malformed placeholder object (no length) is rejected", ()
     /placeholder|length/,
   );
 });
+
+// ---- secretDiagnostics -------------------------------------------------
+//
+// from_command silently dropping unresolvable secrets is the right runtime
+// behavior (agent runs without the credential rather than crashing) but
+// terrible for unattended cron jobs where a token-fetch script breaking is
+// the most common reason a credential isn't injected. buildHooksInput
+// attaches a diagnostics array so the daemon can surface the reasons to
+// Python, and Python can log them / show them in `hermes doctor`.
+
+test("buildHooksInput: returns empty diagnostics when nothing fails", () => {
+  const input = buildHooksInput({
+    secrets: { OK: { hosts: ["a"], value: "v" } },
+  });
+  assert.deepEqual(input.secretDiagnostics, []);
+});
+
+test("buildHooksInput: from_command failure captures stderr + exit code", () => {
+  const input = buildHooksInput({
+    secrets: {
+      AAD: {
+        hosts: ["login.microsoftonline.com"],
+        from_command: "sh -c 'echo something-broke >&2; exit 7'",
+      },
+    },
+  });
+  // Secret still omitted (existing behavior preserved).
+  assert.equal(input.secrets.AAD, undefined);
+  // But the failure is now in diagnostics.
+  assert.equal(input.secretDiagnostics.length, 1);
+  const d = input.secretDiagnostics[0];
+  assert.equal(d.name, "AAD");
+  assert.equal(d.type, "from_command");
+  assert.match(d.error, /exit code 7|status 7|exited with code 7/);
+  assert.match(d.stderr, /something-broke/);
+});
+
+test("buildHooksInput: from_env unset captures the var name", () => {
+  delete process.env.NEVER_EVER_SET_RRR;
+  const input = buildHooksInput({
+    secrets: {
+      THING: { hosts: ["x"], from_env: "NEVER_EVER_SET_RRR" },
+    },
+  });
+  assert.equal(input.secrets.THING, undefined);
+  assert.equal(input.secretDiagnostics.length, 1);
+  const d = input.secretDiagnostics[0];
+  assert.equal(d.name, "THING");
+  assert.equal(d.type, "from_env");
+  assert.match(d.error, /NEVER_EVER_SET_RRR/);
+  assert.match(d.error, /unset|empty/);
+});
+
+test("buildHooksInput: from_command timeout is reported", () => {
+  const input = buildHooksInput({
+    secrets: {
+      SLOW: {
+        hosts: ["x"],
+        from_command: "sleep 10",
+        timeout_ms: 200,
+      },
+    },
+  });
+  assert.equal(input.secrets.SLOW, undefined);
+  assert.equal(input.secretDiagnostics.length, 1);
+  const d = input.secretDiagnostics[0];
+  assert.equal(d.name, "SLOW");
+  assert.equal(d.type, "from_command");
+  assert.match(d.error, /timed out|timeout/i);
+});
+
+test("buildHooksInput: from_command empty stdout reports it (likely script bug)", () => {
+  // An auth-script that exits 0 but prints nothing is a common silent
+  // failure mode — fix once, never look back. Surface it as a diagnostic.
+  const input = buildHooksInput({
+    secrets: {
+      EMPTY: { hosts: ["x"], from_command: "true" },
+    },
+  });
+  assert.equal(input.secrets.EMPTY, undefined);
+  assert.equal(input.secretDiagnostics.length, 1);
+  const d = input.secretDiagnostics[0];
+  assert.equal(d.name, "EMPTY");
+  assert.equal(d.type, "from_command");
+  assert.match(d.error, /empty|no output/i);
+});

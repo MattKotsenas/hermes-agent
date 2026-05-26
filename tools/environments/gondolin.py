@@ -330,6 +330,12 @@ class GondolinEnvironment(BaseEnvironment):
         # higher-level code that wants to know where the workspace lives.
         # None when workspace_mount is disabled.
         self.workspace_mount: dict | None = None
+        # Captured from the init response. Each entry is a dict with keys
+        # name (string), type (from_env|from_command|none), error (string),
+        # and optionally stderr/stdout. Empty list when all secrets
+        # resolved cleanly. Surfaced by `hermes doctor` and logged at WARN
+        # so unattended cron jobs don't silently run without credentials.
+        self.secret_diagnostics: list[dict] = []
 
         daemon_js = Path(daemon_path) if daemon_path else _DAEMON_JS
         if not daemon_js.exists():
@@ -369,6 +375,24 @@ class GondolinEnvironment(BaseEnvironment):
             wm = result.get("workspaceMount")
             if isinstance(wm, dict):
                 self.workspace_mount = wm
+            # Surface secret resolution failures at WARN so they don't get
+            # buried in DEBUG. The agent still runs without the credential;
+            # this lets the user / cron operator notice and fix.
+            sd = result.get("secretDiagnostics")
+            if isinstance(sd, list) and sd:
+                self.secret_diagnostics = list(sd)
+                for entry in self.secret_diagnostics:
+                    name = entry.get("name", "?")
+                    src = entry.get("type", "?")
+                    err = entry.get("error", "?")
+                    extra = ""
+                    stderr_txt = entry.get("stderr") or ""
+                    if stderr_txt:
+                        extra = f" stderr={stderr_txt[:500]!r}"
+                    logger.warning(
+                        "gondolin secret %s (%s) unresolved: %s%s",
+                        name, src, err, extra,
+                    )
         except Exception:
             self._terminate_daemon()
             raise

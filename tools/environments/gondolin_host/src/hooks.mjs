@@ -24,31 +24,94 @@ import { pathToFileURL } from "node:url";
 
 import { makePlaceholderFunc } from "@earendil-works/gondolin";
 
-export function resolveSecret(cfg) {
-  if (!cfg || typeof cfg !== "object") return null;
+// Resolve a single secret config to either a value (string) or a structured
+// diagnostic describing why it couldn't be resolved. The diagnostic includes
+// the secret name, the resolver type that was attempted, an error message,
+// and (for from_command) the captured stderr. Callers that don't care about
+// diagnostics can use the simpler resolveSecret() wrapper.
+export function resolveSecretWithDiagnostics(name, cfg) {
+  if (!cfg || typeof cfg !== "object") {
+    return { value: null, diagnostic: { name, type: "none", error: "no secret config" } };
+  }
 
-  if (cfg.value != null) return String(cfg.value);
+  if (cfg.value != null) return { value: String(cfg.value), diagnostic: null };
 
   if (cfg.from_env) {
     const v = process.env[cfg.from_env];
-    return v == null || v === "" ? null : v;
+    if (v == null || v === "") {
+      return {
+        value: null,
+        diagnostic: {
+          name,
+          type: "from_env",
+          error: `env var ${cfg.from_env} is unset or empty`,
+        },
+      };
+    }
+    return { value: v, diagnostic: null };
   }
 
   if (cfg.from_command) {
+    const timeoutMs = typeof cfg.timeout_ms === "number" && cfg.timeout_ms > 0
+      ? cfg.timeout_ms
+      : 30_000;
+    let stdout;
     try {
-      const out = execSync(cfg.from_command, {
+      stdout = execSync(cfg.from_command, {
         encoding: "utf8",
         stdio: ["ignore", "pipe", "pipe"],
-        timeout: 30_000,
+        timeout: timeoutMs,
       });
-      const trimmed = out.trim();
-      return trimmed === "" ? null : trimmed;
-    } catch {
-      return null;
+    } catch (err) {
+      // execSync attaches stderr/stdout/status/signal on the error object.
+      const stderr = err.stderr != null ? String(err.stderr).trim() : "";
+      const out = err.stdout != null ? String(err.stdout).trim() : "";
+      let msg;
+      if (err.code === "ETIMEDOUT" || err.signal === "SIGTERM") {
+        msg = `command timed out after ${timeoutMs}ms`;
+      } else if (typeof err.status === "number") {
+        msg = `command exited with code ${err.status}`;
+      } else if (err.signal) {
+        msg = `command killed by signal ${err.signal}`;
+      } else {
+        msg = `command failed: ${err.message}`;
+      }
+      return {
+        value: null,
+        diagnostic: {
+          name,
+          type: "from_command",
+          error: msg,
+          stderr,
+          stdout: out,
+        },
+      };
     }
+    const trimmed = stdout.trim();
+    if (trimmed === "") {
+      return {
+        value: null,
+        diagnostic: {
+          name,
+          type: "from_command",
+          error: "command exited 0 but produced empty output",
+          stderr: "",
+          stdout: "",
+        },
+      };
+    }
+    return { value: trimmed, diagnostic: null };
   }
 
-  return null;
+  return {
+    value: null,
+    diagnostic: { name, type: "none", error: "secret has no value/from_env/from_command" },
+  };
+}
+
+export function resolveSecret(cfg) {
+  // Backward-compat wrapper: just the value, no diagnostic.
+  return resolveSecretWithDiagnostics(null, cfg).value;
 }
 
 // Resolve a YAML-shaped placeholder value into the form Gondolin expects.
@@ -87,11 +150,13 @@ export function buildHooksInput(yaml = {}) {
     : ["*"];
 
   const secrets = {};
+  const secretDiagnostics = [];
   for (const [name, cfg] of Object.entries(yaml.secrets ?? {})) {
     if (!cfg || !Array.isArray(cfg.hosts) || cfg.hosts.length === 0) {
       throw new Error(`secret ${name}: missing required 'hosts' array`);
     }
-    const value = resolveSecret(cfg);
+    const { value, diagnostic } = resolveSecretWithDiagnostics(name, cfg);
+    if (diagnostic) secretDiagnostics.push(diagnostic);
     if (value == null) {
       // Skip unresolved secrets — agent runs without that credential.
       continue;
@@ -104,7 +169,7 @@ export function buildHooksInput(yaml = {}) {
     secrets[name] = entry;
   }
 
-  return { allowedHosts, secrets };
+  return { allowedHosts, secrets, secretDiagnostics };
 }
 
 export async function loadPolicy(scriptPath) {
