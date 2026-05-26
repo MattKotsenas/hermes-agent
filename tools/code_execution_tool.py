@@ -881,12 +881,24 @@ def _execute_remote(
             cwd="/", timeout=15,
         )
         if "OK" not in py_check.get("output", ""):
+            # Backend-specific actionable hint. For gondolin, the default
+            # alpine-base image ships without python3 — pointing the user
+            # at the right config knob saves a doc dive.
+            if env_type == "gondolin":
+                hint = (
+                    " The default Gondolin image (alpine-base) does not "
+                    "include python3. Build a custom image with python3 "
+                    "installed and point `terminal.gondolin.image` at it, "
+                    "or use the `terminal` tool instead of execute_code "
+                    "for shell-based work."
+                )
+            else:
+                hint = " Install Python to use execute_code with remote backends."
             return json.dumps({
                 "status": "error",
                 "error": (
                     f"Python 3 is not available in the {env_type} terminal "
-                    "environment. Install Python to use execute_code with "
-                    "remote backends."
+                    f"environment.{hint}"
                 ),
                 "tool_calls_made": 0,
                 "duration_seconds": 0,

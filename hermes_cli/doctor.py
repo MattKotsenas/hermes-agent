@@ -1291,6 +1291,17 @@ def run_doctor(args):
                 issues,
             )
 
+        # execute_code requires python3 inside the guest. The default
+        # alpine-base image doesn't ship it. Surface this as a non-fatal
+        # info line — execute_code is an optional tool and the user may
+        # not care; if they do, they need to know about the config knob.
+        if not os.getenv("TERMINAL_GONDOLIN_IMAGE", "").strip():
+            check_info(
+                "gondolin: default image (alpine-base) lacks python3 — "
+                "execute_code will refuse. Build a python-enabled image and "
+                "set terminal.gondolin.image, or use the terminal tool instead."
+            )
+
     # ------------------------------------------------------------------
     # Sandbox storage health (backend-agnostic).
     #

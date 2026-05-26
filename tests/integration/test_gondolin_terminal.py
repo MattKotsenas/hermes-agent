@@ -182,3 +182,83 @@ def test_daemon_socket_not_visible_in_guest_workspace(gondolin_env_workspace):
     assert "gondolin.sock" not in result["output"], (
         f"daemon socket leaked into guest /workspace listing:\n{result['output']}"
     )
+
+
+@requires_gondolin
+@pytest.mark.xfail(
+    reason=(
+        "execute_code requires python3 in the guest image. The default "
+        "alpine-base gondolin image has no python3. Users who need "
+        "execute_code must point terminal.gondolin.image at a custom image "
+        "(e.g. one built from alpine-base with `apk add python3`). When "
+        "we ship a python-enabled image, flip this to a passing test."
+    ),
+    strict=True,
+)
+def test_execute_code_round_trip(gondolin_env_workspace):
+    """End-to-end ``execute_code`` against a real Gondolin VM.
+
+    The flow:
+      1. ``execute_code`` calls ``_env_temp_dir(env)`` to decide where to
+         ship the script.
+      2. ``_ship_file_to_remote`` pipes the script's bytes through the
+         env's bash channel — so the path must exist (or be creatable)
+         inside the guest.
+      3. The script runs in-guest; stdout comes back through
+         ``env.execute(...)``.
+
+    Without a guest-side ``get_temp_dir()`` override on the environment,
+    ``_env_temp_dir`` falls back to ``tempfile.gettempdir()`` on the HOST,
+    which returns ``/tmp`` — a path that exists in the guest by accident
+    on Alpine, but the host file shipping uses base64-pipe-into-cat which
+    runs inside the guest, so the "wrong" path is actually still inside
+    the guest. This means the existing flow may incidentally work; the
+    test makes that explicit so any regression is caught.
+
+    The test is intentionally minimal: it runs a script that imports the
+    injected ``hermes_tools`` helper module, calls ``terminal('uname -a')``,
+    and prints the result. Failure modes we want to catch:
+      - ``hermes_tools`` not shipped (FileNotFoundError on import)
+      - script can't reach ``/tmp`` (ship failure)
+      - RPC dir doesn't exist (host-side path leaked to guest)
+    """
+    from tools.code_execution_tool import execute_code
+
+    env = gondolin_env_workspace
+    code = (
+        "import json\n"
+        "from hermes_tools import terminal\n"
+        "result = terminal('uname -a', timeout=30)\n"
+        "print('UNAME:', result['output'].strip())\n"
+        "print('EXIT:', result['exit_code'])\n"
+    )
+    # execute_code dispatches via the global tool registry; we don't go
+    # through that. Instead we go through the _execute_remote path which
+    # accepts an explicit env. That's the seam under test.
+    from tools.code_execution_tool import _execute_remote
+
+    # Patch the global env-resolution helper so _execute_remote uses our
+    # already-booted env instead of constructing a new one from
+    # TERMINAL_ENV (which would spin up a SECOND VM).
+    import tools.code_execution_tool as _cet
+
+    # _get_or_create_env returns (env, env_type) — match that contract.
+    original = _cet._get_or_create_env
+    _cet._get_or_create_env = lambda *a, **kw: (env, "gondolin")
+    try:
+        result_str = _execute_remote(code, task_id="kvm-exec-code-probe", enabled_tools=[])
+    finally:
+        _cet._get_or_create_env = original
+
+    # _execute_remote returns a formatted string. We don't know the exact
+    # framing (varies by exit code, may include "Output:" / "Error:" prefixes)
+    # so just assert the expected payload is in there.
+    assert "UNAME:" in result_str, (
+        f"missing UNAME marker in output:\n{result_str}"
+    )
+    assert "Linux" in result_str, f"Linux not in output:\n{result_str}"
+    # If the script crashed at import or exec time, an error block would
+    # be present. Fail loudly if that's what we see.
+    assert "Traceback" not in result_str, (
+        f"script raised an exception inside the VM:\n{result_str}"
+    )

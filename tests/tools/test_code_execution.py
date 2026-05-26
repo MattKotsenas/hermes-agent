@@ -175,6 +175,46 @@ class TestExecuteCodeRemoteTempDir(unittest.TestCase):
         self.assertNotIn("mkdir -p /tmp/hermes_exec_", mkdir_cmd)
 
 
+class TestExecuteCodeMissingPython(unittest.TestCase):
+    """When the remote backend's `command -v python3` returns nothing, we
+    surface a backend-specific actionable error. Gondolin's default
+    alpine-base image has no python3, so the error must point at the
+    config knob, not just say 'install python'."""
+
+    def _run_remote_without_python(self, env_type):
+        class FakeEnv:
+            def __init__(self):
+                self.commands = []
+
+            def execute(self, command, cwd=None, timeout=None):
+                self.commands.append((command, cwd, timeout))
+                if "command -v python3" in command:
+                    return {"output": ""}  # python3 missing
+                return {"output": ""}
+
+        env = FakeEnv()
+        with patch("tools.code_execution_tool._load_config",
+                   return_value={"timeout": 30, "max_tool_calls": 5}), \
+             patch("tools.code_execution_tool._get_or_create_env",
+                   return_value=(env, env_type)):
+            return json.loads(_execute_remote("print('hi')", "t", ["terminal"]))
+
+    def test_gondolin_error_mentions_image_config(self):
+        """Gondolin path must mention `terminal.gondolin.image` so the user
+        knows the config knob. Regression for the smoke that revealed this."""
+        result = self._run_remote_without_python("gondolin")
+        self.assertEqual(result["status"], "error")
+        self.assertIn("alpine-base", result["error"])
+        self.assertIn("terminal.gondolin.image", result["error"])
+
+    def test_generic_backend_falls_through_to_generic_hint(self):
+        """Non-gondolin backends keep the original 'install Python' guidance."""
+        result = self._run_remote_without_python("docker")
+        self.assertEqual(result["status"], "error")
+        self.assertIn("Install Python", result["error"])
+        self.assertNotIn("alpine-base", result["error"])
+
+
 @unittest.skipIf(sys.platform == "win32", "UDS not available on Windows")
 class TestExecuteCode(unittest.TestCase):
     """Integration tests using the mock dispatcher."""
