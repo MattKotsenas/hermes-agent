@@ -221,3 +221,106 @@ def test_set_secret_raises_on_unknown_name(stub_env_factory):
     env = stub_env_factory(config={"secrets": {}})
     with pytest.raises(RuntimeError, match=r"NEVER_DEFINED|unknown"):
         env.set_secret("NEVER_DEFINED", value="x")
+
+
+# ---- Concurrency cap ---------------------------------------------------
+#
+# Each Gondolin VM costs ~256-512 MB on the host. A gateway hosting many
+# parallel chats could exhaust memory; a configurable cap prevents that.
+# In-process only (subagents + CLI live in different processes; a
+# cross-process file lock is a deferred sub-item).
+
+@requires_node
+def test_concurrent_vm_cap_blocks_excess_envs(tmp_path, monkeypatch):
+    """When the in-process VM count is already at the cap, constructing
+    another GondolinEnvironment raises a RuntimeError that names the cap."""
+    from tools.environments import gondolin as gondolin_mod
+    from tools.environments.gondolin import GondolinEnvironment
+
+    # Force the cap down to 2 so we don't have to spawn N daemons.
+    monkeypatch.setattr(gondolin_mod, "_max_concurrent_vms", 2)
+
+    envs = []
+    try:
+        envs.append(GondolinEnvironment(
+            sandbox_dir=str(tmp_path / "s0"), stub_vm=True,
+        ))
+        envs.append(GondolinEnvironment(
+            sandbox_dir=str(tmp_path / "s1"), stub_vm=True,
+        ))
+        # Third should fail.
+        with pytest.raises(RuntimeError, match=r"max_concurrent_vms|cap|limit|2"):
+            GondolinEnvironment(
+                sandbox_dir=str(tmp_path / "s2"), stub_vm=True,
+            )
+    finally:
+        for e in envs:
+            try: e.cleanup()
+            except Exception: pass
+
+
+@requires_node
+def test_concurrent_vm_cap_releases_slot_on_cleanup(tmp_path, monkeypatch):
+    """cleanup() releases the slot so the next env can be created. Without
+    this, a cap of N would be a one-shot limit per process."""
+    from tools.environments import gondolin as gondolin_mod
+    from tools.environments.gondolin import GondolinEnvironment
+
+    monkeypatch.setattr(gondolin_mod, "_max_concurrent_vms", 1)
+
+    e1 = GondolinEnvironment(sandbox_dir=str(tmp_path / "s0"), stub_vm=True)
+    # Second under a cap of 1 must fail.
+    with pytest.raises(RuntimeError):
+        GondolinEnvironment(sandbox_dir=str(tmp_path / "s1"), stub_vm=True)
+    e1.cleanup()
+    # After cleanup the slot is free, so a fresh env constructs cleanly.
+    e2 = GondolinEnvironment(sandbox_dir=str(tmp_path / "s2"), stub_vm=True)
+    try:
+        assert e2._daemon_proc is not None
+    finally:
+        e2.cleanup()
+
+
+@requires_node
+def test_concurrent_vm_cap_releases_slot_on_failed_init(tmp_path, monkeypatch):
+    """If __init__ raises (daemon init fails), the slot must still be
+    released — otherwise a flaky daemon could permanently consume slots."""
+    from tools.environments import gondolin as gondolin_mod
+    from tools.environments.gondolin import GondolinEnvironment
+
+    monkeypatch.setattr(gondolin_mod, "_max_concurrent_vms", 1)
+
+    # Force a failure during init by pointing at a non-existent policy script
+    # (and disabling stub_vm so the real init path runs).
+    with pytest.raises(RuntimeError):
+        GondolinEnvironment(
+            sandbox_dir=str(tmp_path / "fail"),
+            stub_vm=False,
+            config={"policy_script": "/no/such/file.mjs"},
+            init_timeout=5.0,
+        )
+
+    # Slot should be free; a clean stub env constructs.
+    e = GondolinEnvironment(sandbox_dir=str(tmp_path / "ok"), stub_vm=True)
+    e.cleanup()
+
+
+@requires_node
+def test_concurrent_vm_cap_disabled_when_zero_or_negative(tmp_path, monkeypatch):
+    """Setting the cap to 0 (or negative) disables it entirely — the
+    user explicitly opts out of any limit."""
+    from tools.environments import gondolin as gondolin_mod
+    from tools.environments.gondolin import GondolinEnvironment
+
+    monkeypatch.setattr(gondolin_mod, "_max_concurrent_vms", 0)
+
+    envs = [
+        GondolinEnvironment(sandbox_dir=str(tmp_path / f"s{i}"), stub_vm=True)
+        for i in range(3)
+    ]
+    try:
+        # No exception means cap is disabled. Sanity-check the count.
+        assert len(envs) == 3
+    finally:
+        for e in envs:
+            e.cleanup()

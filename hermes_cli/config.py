@@ -5448,6 +5448,9 @@ def set_config_value(key: str, value: str):
         "terminal.gondolin.secrets": "TERMINAL_GONDOLIN_SECRETS_JSON",
         "terminal.gondolin.policy_script": "TERMINAL_GONDOLIN_POLICY_SCRIPT",
         "terminal.gondolin.sandbox_dir": "TERMINAL_GONDOLIN_SANDBOX_DIR",
+        "terminal.gondolin.memory": "TERMINAL_GONDOLIN_MEMORY",
+        "terminal.gondolin.cpus": "TERMINAL_GONDOLIN_CPUS",
+        "terminal.gondolin.max_concurrent_vms": "TERMINAL_GONDOLIN_MAX_CONCURRENT_VMS",
     }
     if key in _config_to_env_sync:
         save_env_value(_config_to_env_sync[key], str(value))

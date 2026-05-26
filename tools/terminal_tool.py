@@ -1110,6 +1110,15 @@ def _get_env_config() -> Dict[str, Any]:
             "policy_script": os.getenv("TERMINAL_GONDOLIN_POLICY_SCRIPT") or None,
             "sandbox_dir": os.getenv("TERMINAL_GONDOLIN_SANDBOX_DIR") or None,
             "image": os.getenv("TERMINAL_GONDOLIN_IMAGE") or None,
+            # Per-VM resource caps; None means "let Gondolin use defaults
+            # (1G memory, 2 cpus)". The knob exists so a user running many
+            # parallel sessions on a memory-constrained host can dial these
+            # down — each VM is ~256-512 MB at defaults, so 10 concurrent
+            # sessions would be 2.5-5 GB without caps.
+            "memory": os.getenv("TERMINAL_GONDOLIN_MEMORY") or None,
+            "cpus": _parse_env_var(
+                "TERMINAL_GONDOLIN_CPUS", "", lambda s: int(s) if s else None, "integer"
+            ),
         },
     }
 
@@ -1294,6 +1303,12 @@ def _create_environment(env_type: str, image: str, cwd: str, timeout: int,
         # Gondolin) falls back to GONDOLIN_DEFAULT_IMAGE otherwise.
         if gc.get("image"):
             daemon_config["image"] = gc["image"]
+        # Per-VM resource caps. Forward only when explicitly configured so
+        # Gondolin's defaults (1G / 2 cpus) apply otherwise.
+        if gc.get("memory"):
+            daemon_config["memory"] = gc["memory"]
+        if gc.get("cpus") is not None:
+            daemon_config["cpus"] = int(gc["cpus"])
         return _GondolinEnvironment(
             sandbox_dir=sandbox_dir,
             cwd=cwd,

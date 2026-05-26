@@ -539,3 +539,84 @@ test("daemon: set_secret before init fails clearly", async (t) => {
   assert.ok(upd.error, "set_secret pre-init must error");
   assert.match(upd.error.message, /not initialized|init/i);
 });
+
+
+// ---- VM resource caps --------------------------------------------------
+//
+// Each Gondolin VM costs ~256-512 MB of host memory at default settings.
+// Letting users cap per-VM memory + cpus is the lever for "I want to run
+// 10 sessions on a 16GB laptop." Forward config.memory and config.cpus to
+// Gondolin's VMOptions.memory / VMOptions.cpus.
+
+test("daemon: init forwards config.memory and config.cpus to VM", async (t) => {
+  const tmp = mkdtempSync(path.join(os.tmpdir(), "gondolin-vmres-"));
+  const sockPath = path.join(tmp, "d.sock");
+
+  const proc = spawn("node", [DAEMON, "--socket", sockPath], {
+    stdio: ["ignore", "ignore", "pipe"],
+    env: {
+      ...process.env,
+      GONDOLIN_DAEMON_QUIET: "1",
+      GONDOLIN_DAEMON_STUB_VM: "1",
+    },
+  });
+  proc.stderr.on("data", () => {});
+  t.after(async () => {
+    try { proc.kill("SIGTERM"); } catch {}
+    await new Promise((r) => {
+      if (proc.exitCode != null) return r();
+      proc.once("exit", r);
+      setTimeout(r, 2000);
+    });
+    rmSync(tmp, { recursive: true, force: true });
+  });
+
+  await waitForSocket(sockPath);
+
+  const init = await rpcCall(sockPath, {
+    id: 1,
+    method: "init",
+    params: { config: { memory: "256M", cpus: 1 } },
+  });
+  assert.equal(init.error, undefined);
+  assert.equal(init.result.ready, true);
+  assert.equal(init.result.memory, "256M");
+  assert.equal(init.result.cpus, 1);
+});
+
+
+test("daemon: init without resource caps leaves memory/cpus undefined", async (t) => {
+  // Unset means "let Gondolin pick its defaults" (1G memory, 2 cpus).
+  const tmp = mkdtempSync(path.join(os.tmpdir(), "gondolin-vmres-default-"));
+  const sockPath = path.join(tmp, "d.sock");
+
+  const proc = spawn("node", [DAEMON, "--socket", sockPath], {
+    stdio: ["ignore", "ignore", "pipe"],
+    env: {
+      ...process.env,
+      GONDOLIN_DAEMON_QUIET: "1",
+      GONDOLIN_DAEMON_STUB_VM: "1",
+    },
+  });
+  proc.stderr.on("data", () => {});
+  t.after(async () => {
+    try { proc.kill("SIGTERM"); } catch {}
+    await new Promise((r) => {
+      if (proc.exitCode != null) return r();
+      proc.once("exit", r);
+      setTimeout(r, 2000);
+    });
+    rmSync(tmp, { recursive: true, force: true });
+  });
+
+  await waitForSocket(sockPath);
+  const init = await rpcCall(sockPath, {
+    id: 1,
+    method: "init",
+    params: { config: {} },
+  });
+  assert.equal(init.error, undefined);
+  assert.equal(init.result.ready, true);
+  assert.equal(init.result.memory, undefined);
+  assert.equal(init.result.cpus, undefined);
+});

@@ -60,6 +60,14 @@ const handlers = {
     // (GONDOLIN_DEFAULT_IMAGE, currently alpine-base:latest)".
     const imagePath = config.image ?? null;
 
+    // Optional VM resource caps. Defaults (1G memory, 2 cpus) are fine for
+    // a developer laptop running one session; the knob exists for users
+    // running many concurrent sessions on a memory-constrained host, who
+    // can dial these down (e.g. 256M + 1 cpu fits ~30 VMs in 8 GB at the
+    // cost of slower builds inside the guest).
+    const memory = typeof config.memory === "string" ? config.memory : null;
+    const cpus = Number.isInteger(config.cpus) && config.cpus > 0 ? config.cpus : null;
+
     // Optional host->guest workspace mount. Maps a real host directory into
     // the guest's filesystem via Gondolin's vfs.mounts (RealFSProvider). The
     // guest sees a normal mountpoint; reads/writes hit the host directory
@@ -145,6 +153,8 @@ const handlers = {
       const result = { ready: true };
       if (imagePath != null) result.imagePath = imagePath;
       if (workspaceMount != null) result.workspaceMount = workspaceMount;
+      if (memory != null) result.memory = memory;
+      if (cpus != null) result.cpus = cpus;
       return result;
     }
 
@@ -179,6 +189,8 @@ const handlers = {
         },
       };
     }
+    if (memory != null) vmOptions.memory = memory;
+    if (cpus != null) vmOptions.cpus = cpus;
     vm = await VM.create(vmOptions);
     log("VM ready");
     return { ready: true };

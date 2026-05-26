@@ -30,6 +30,7 @@ import shutil
 import socket
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 from typing import Any
@@ -41,6 +42,52 @@ logger = logging.getLogger(__name__)
 # Location of the Node daemon source file relative to this module.
 _HERE = Path(__file__).resolve().parent
 _DAEMON_JS = _HERE / "gondolin_host" / "src" / "daemon.mjs"
+
+# In-process cap on the number of live Gondolin VMs. Each VM costs
+# ~256-512 MB of host memory at default settings; a gateway hosting many
+# parallel chats could exhaust memory without a cap. Override at runtime
+# by re-binding this module attribute (used by tests and by the factory
+# when the user sets TERMINAL_GONDOLIN_MAX_CONCURRENT_VMS).
+#
+# Set to <= 0 to disable the cap entirely. The cap is in-process only —
+# subagents and the gateway live in separate processes, so this does NOT
+# enforce a global host-wide limit. Cross-process locking is a deferred
+# item in the design doc (depends on signed PID liveness checks etc.).
+try:
+    _max_concurrent_vms = int(os.environ.get("TERMINAL_GONDOLIN_MAX_CONCURRENT_VMS", "0") or "0")
+except ValueError:
+    _max_concurrent_vms = 0
+
+# Active VM count + lock. Module-level state because the cap is process-wide.
+_vm_count_lock = threading.Lock()
+_active_vm_count = 0
+
+
+def _acquire_vm_slot() -> None:
+    """Reserve a slot under the concurrent-VM cap. Raises if at limit.
+
+    Must be paired with _release_vm_slot() in cleanup (and on init failure).
+    """
+    global _active_vm_count
+    cap = _max_concurrent_vms
+    with _vm_count_lock:
+        if cap > 0 and _active_vm_count >= cap:
+            raise RuntimeError(
+                f"gondolin: refusing to spawn another VM — at max_concurrent_vms cap ({cap}). "
+                f"Either raise TERMINAL_GONDOLIN_MAX_CONCURRENT_VMS / "
+                f"terminal.gondolin.max_concurrent_vms, or wait for an existing session "
+                f"to clean up. Set the cap to 0 to disable entirely."
+            )
+        _active_vm_count += 1
+
+
+def _release_vm_slot() -> None:
+    """Release a slot reserved via _acquire_vm_slot(). Idempotent-safe at
+    the call sites (only called on a slot that was actually acquired)."""
+    global _active_vm_count
+    with _vm_count_lock:
+        if _active_vm_count > 0:
+            _active_vm_count -= 1
 
 
 def _ensure_node_available() -> None:
@@ -112,6 +159,40 @@ class GondolinEnvironment(BaseEnvironment):
 
         _ensure_node_available()
 
+        # Reserve a slot against the in-process concurrent-VM cap BEFORE
+        # spawning anything. If we're at the cap, this raises immediately
+        # and no daemon/VM resources are touched. Released on cleanup or
+        # on init failure (see except block at the end).
+        _acquire_vm_slot()
+        self._slot_acquired = True
+        try:
+            self._init_after_slot(
+                sandbox_dir=sandbox_dir,
+                config=config,
+                stub_vm=stub_vm,
+                init_timeout=init_timeout,
+                daemon_path=daemon_path,
+                cwd=cwd,
+            )
+        except BaseException:
+            # Any failure between slot acquire and successful init must
+            # release the slot, regardless of source (slot logic, daemon
+            # spawn, RPC, KeyboardInterrupt).
+            if getattr(self, "_slot_acquired", False):
+                _release_vm_slot()
+                self._slot_acquired = False
+            raise
+
+    def _init_after_slot(
+        self,
+        *,
+        sandbox_dir: str,
+        config: dict | None,
+        stub_vm: bool,
+        init_timeout: float,
+        daemon_path: str | None,
+        cwd: str,
+    ) -> None:
         self.sandbox_dir = Path(sandbox_dir)
         self.sandbox_dir.mkdir(parents=True, exist_ok=True)
         self.sock_path = str(self.sandbox_dir / "gondolin.sock")
@@ -267,6 +348,13 @@ class GondolinEnvironment(BaseEnvironment):
             logger.debug("gondolin shutdown rpc failed (will SIGTERM): %s", exc)
 
         self._terminate_daemon()
+
+        # Release the concurrent-VM slot so the next session can spawn.
+        # Guarded against double-cleanup (cleanup called twice would
+        # otherwise under-count active VMs).
+        if getattr(self, "_slot_acquired", False):
+            _release_vm_slot()
+            self._slot_acquired = False
 
     # ------------------------------------------------------------------
     # Internal

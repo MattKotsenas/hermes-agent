@@ -43,6 +43,8 @@ def test_get_env_config_reads_gondolin_keys(monkeypatch):
     )
     monkeypatch.setenv("TERMINAL_GONDOLIN_SANDBOX_DIR", "/tmp/my-sandbox")
     monkeypatch.setenv("TERMINAL_GONDOLIN_IMAGE", "ubuntu-noble:latest")
+    monkeypatch.setenv("TERMINAL_GONDOLIN_MEMORY", "512M")
+    monkeypatch.setenv("TERMINAL_GONDOLIN_CPUS", "1")
 
     cfg = _get_env_config()
     g = cfg["gondolin"]
@@ -51,6 +53,8 @@ def test_get_env_config_reads_gondolin_keys(monkeypatch):
     assert g["policy_script"] == "/tmp/my-policy.mjs"
     assert g["sandbox_dir"] == "/tmp/my-sandbox"
     assert g["image"] == "ubuntu-noble:latest"
+    assert g["memory"] == "512M"
+    assert g["cpus"] == 1
 
 
 def test_get_env_config_defaults_for_gondolin(monkeypatch):
@@ -66,6 +70,8 @@ def test_get_env_config_defaults_for_gondolin(monkeypatch):
         "TERMINAL_GONDOLIN_POLICY_SCRIPT",
         "TERMINAL_GONDOLIN_SANDBOX_DIR",
         "TERMINAL_GONDOLIN_IMAGE",
+        "TERMINAL_GONDOLIN_MEMORY",
+        "TERMINAL_GONDOLIN_CPUS",
     ):
         monkeypatch.delenv(k, raising=False)
     monkeypatch.setenv("TERMINAL_ENV", "gondolin")
@@ -77,6 +83,8 @@ def test_get_env_config_defaults_for_gondolin(monkeypatch):
     assert g["policy_script"] is None
     assert g["sandbox_dir"] is None
     assert g["image"] is None
+    assert g["memory"] is None
+    assert g["cpus"] is None
 
 
 def test_get_env_config_default_cwd_for_gondolin(monkeypatch):
@@ -164,6 +172,9 @@ def test_config_set_terminal_gondolin_keys_sync_to_env(monkeypatch, tmp_path):
         "terminal.gondolin.image": ("ubuntu-noble:latest", "TERMINAL_GONDOLIN_IMAGE"),
         "terminal.gondolin.policy_script": ("/tmp/p.mjs", "TERMINAL_GONDOLIN_POLICY_SCRIPT"),
         "terminal.gondolin.sandbox_dir": ("/tmp/sb", "TERMINAL_GONDOLIN_SANDBOX_DIR"),
+        "terminal.gondolin.memory": ("512M", "TERMINAL_GONDOLIN_MEMORY"),
+        "terminal.gondolin.cpus": ("1", "TERMINAL_GONDOLIN_CPUS"),
+        "terminal.gondolin.max_concurrent_vms": ("4", "TERMINAL_GONDOLIN_MAX_CONCURRENT_VMS"),
     }
     for key, (value, expected_env_key) in keys_to_sync.items():
         config_mod.set_config_value(key, value)
