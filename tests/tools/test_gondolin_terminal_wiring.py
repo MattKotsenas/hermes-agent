@@ -98,6 +98,37 @@ def test_get_env_config_default_cwd_for_gondolin(monkeypatch):
     assert cfg["cwd"] == "/workspace"
 
 
+def test_get_env_config_rejects_host_cwd_for_gondolin(monkeypatch):
+    """TERMINAL_CWD pointing at a host path must be overridden — the guest
+    VM doesn't have ``/home/matt``. This is the regression for the
+    real-world smoke that did ``echo … > /workspace/proof.txt`` against a
+    VM whose actual cwd was bind-mounted to ``/home/matt`` (so writes
+    failed and the host sandbox_dir stayed empty).
+
+    Behaviour mirrors what docker/singularity/modal already do."""
+    from tools.terminal_tool import _get_env_config
+
+    monkeypatch.setenv("TERMINAL_ENV", "gondolin")
+    monkeypatch.setenv("TERMINAL_CWD", "/home/matt")  # host path
+
+    cfg = _get_env_config()
+    assert cfg["cwd"] == "/workspace", (
+        f"gondolin must override host-path TERMINAL_CWD; got {cfg['cwd']!r}"
+    )
+
+
+def test_get_env_config_rejects_relative_cwd_for_gondolin(monkeypatch):
+    """Relative cwd ('.' or 'src/') is meaningless in the guest VM and
+    must fall back to /workspace."""
+    from tools.terminal_tool import _get_env_config
+
+    monkeypatch.setenv("TERMINAL_ENV", "gondolin")
+    monkeypatch.setenv("TERMINAL_CWD", ".")
+
+    cfg = _get_env_config()
+    assert cfg["cwd"] == "/workspace"
+
+
 @pytest.mark.skipif(not NODE_AVAILABLE, reason="node or daemon.mjs missing")
 def test_create_environment_returns_gondolin_environment(tmp_path):
     """_create_environment('gondolin', ...) constructs a GondolinEnvironment
