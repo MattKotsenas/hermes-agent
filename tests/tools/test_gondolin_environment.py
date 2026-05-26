@@ -25,6 +25,7 @@ from tools.environments.gondolin import GondolinEnvironment
 
 
 REPO_ROOT = Path(__file__).resolve().parent.parent.parent
+_REPO_ROOT = REPO_ROOT  # alias used by subprocess test bodies below
 NODE_DAEMON = REPO_ROOT / "tools" / "environments" / "gondolin_host" / "src" / "daemon.mjs"
 NODE_AVAILABLE = shutil.which("node") is not None and NODE_DAEMON.exists()
 
@@ -333,3 +334,132 @@ def test_concurrent_vm_cap_disabled_when_zero_or_negative(tmp_path, monkeypatch)
     finally:
         for e in envs:
             e.cleanup()
+
+
+# ---- Cross-process cap -------------------------------------------------
+#
+# The in-process cap above only blocks excess VMs from a single Python
+# process. Real deployments have many: the CLI, subagents (each a fresh
+# subprocess), the gateway, scheduled cron jobs. Without a host-wide cap,
+# a fleet of subagents can blow past the configured limit and OOM the host.
+#
+# We use flock() on N slot files in a shared lock directory. The kernel
+# releases flock on process exit, so we get crash-safe cleanup for free
+# without PID liveness checks.
+
+@requires_node
+def test_concurrent_vm_cap_blocks_across_processes(tmp_path, monkeypatch):
+    """A second Python process honoring the same cap cannot acquire a slot
+    once the in-process count is at the limit. This is the cross-process
+    case the in-process cap deliberately doesn't cover."""
+    import subprocess as _sp
+    import sys as _sys
+    import textwrap as _tw
+
+    from tools.environments.gondolin import GondolinEnvironment
+
+    # Pin the in-process cap via monkeypatch so the config-knob path below
+    # doesn't leak a mutation to subsequent tests in the same session.
+    monkeypatch.setattr(gondolin_mod, "_max_concurrent_vms", 1)
+    lock_dir = tmp_path / "gondolin-locks"
+
+    # Hold one slot in *this* process via a stub env. The slot is registered
+    # in the shared lock dir; the second process below must respect it.
+    e1 = GondolinEnvironment(
+        sandbox_dir=str(tmp_path / "s0"),
+        stub_vm=True,
+        config={"lock_dir": str(lock_dir)},
+    )
+    try:
+        script = _tw.dedent(f"""
+            import sys
+            sys.path.insert(0, {repr(str(_REPO_ROOT))})
+            from tools.environments import gondolin as gmod
+            gmod._max_concurrent_vms = 1
+            from tools.environments.gondolin import GondolinEnvironment
+            try:
+                GondolinEnvironment(
+                    sandbox_dir={repr(str(tmp_path / 's1'))},
+                    stub_vm=True,
+                    config={{"lock_dir": {repr(str(lock_dir))}}},
+                )
+            except RuntimeError as exc:
+                print("BLOCKED:" + str(exc))
+                sys.exit(0)
+            print("ACQUIRED")
+            sys.exit(1)
+        """)
+        result = _sp.run(
+            [_sys.executable, "-c", script],
+            capture_output=True, text=True, timeout=30,
+        )
+        assert result.returncode == 0, (
+            f"second process should have been blocked, got rc={result.returncode}\n"
+            f"stdout={result.stdout!r}\nstderr={result.stderr!r}"
+        )
+        assert "BLOCKED:" in result.stdout, result.stdout
+    finally:
+        e1.cleanup()
+
+
+@requires_node
+def test_concurrent_vm_cap_releases_across_processes_on_exit(tmp_path, monkeypatch):
+    """When the first process exits (cleanup or hard kill), its slot frees up
+    and a subsequent process can acquire it. flock() releases on process
+    death — no zombie-slot tracking needed."""
+    import subprocess as _sp
+    import sys as _sys
+    import textwrap as _tw
+
+    from tools.environments.gondolin import GondolinEnvironment
+
+    monkeypatch.setattr(gondolin_mod, "_max_concurrent_vms", 1)
+    lock_dir = tmp_path / "gondolin-locks"
+
+    # Process A: hold a slot, exit cleanly.
+    holder_script = _tw.dedent(f"""
+        import sys
+        sys.path.insert(0, {repr(str(_REPO_ROOT))})
+        from tools.environments import gondolin as gmod
+        gmod._max_concurrent_vms = 1
+        from tools.environments.gondolin import GondolinEnvironment
+        env = GondolinEnvironment(
+            sandbox_dir={repr(str(tmp_path / 'hold'))},
+            stub_vm=True,
+            config={{"lock_dir": {repr(str(lock_dir))}}},
+        )
+        env.cleanup()
+    """)
+    rc = _sp.run(
+        [_sys.executable, "-c", holder_script], capture_output=True, text=True, timeout=30,
+    )
+    assert rc.returncode == 0, rc.stderr
+
+    # Process B (us): slot should be free.
+    env_b = GondolinEnvironment(
+        sandbox_dir=str(tmp_path / "after"),
+        stub_vm=True,
+        config={"lock_dir": str(lock_dir)},
+    )
+    env_b.cleanup()
+
+
+@requires_node
+def test_concurrent_vm_cap_config_knob_overrides_module_default(tmp_path, monkeypatch):
+    """The user-facing config knob `max_concurrent_vms` overrides the
+    module-level default. Restored via monkeypatch so the mutation doesn't
+    leak across tests."""
+    # Start clean: module default of 0 (disabled). The knob should bump it.
+    monkeypatch.setattr(gondolin_mod, "_max_concurrent_vms", 0)
+
+    e = GondolinEnvironment(
+        sandbox_dir=str(tmp_path / "knob"),
+        stub_vm=True,
+        config={"max_concurrent_vms": 5},
+    )
+    try:
+        assert gondolin_mod._max_concurrent_vms == 5, (
+            "config knob did not propagate to module-level cap"
+        )
+    finally:
+        e.cleanup()

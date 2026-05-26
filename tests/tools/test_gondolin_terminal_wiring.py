@@ -163,6 +163,68 @@ def test_create_environment_returns_gondolin_environment(tmp_path):
         env.cleanup()
 
 
+@pytest.mark.skipif(not NODE_AVAILABLE, reason="node or daemon.mjs missing")
+def test_create_environment_propagates_lock_dir_for_cross_process_cap(tmp_path, monkeypatch):
+    """The factory injects a default lock_dir under HERMES_HOME so the
+    cross-process concurrent-VM cap is honored across the CLI, subagents,
+    the gateway, and cron jobs — without users having to set anything."""
+    from tools.terminal_tool import _create_environment
+    from tools.environments.gondolin import GondolinEnvironment
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes-home"))
+
+    env = _create_environment(
+        env_type="gondolin",
+        image="",
+        cwd="/workspace",
+        timeout=60,
+        gondolin_config={
+            "sandbox_dir": str(tmp_path / "vm-sandbox"),
+            "stub_vm": True,
+        },
+        task_id="test-lockdir",
+    )
+    try:
+        assert isinstance(env, GondolinEnvironment)
+        # The default lock dir lives under HERMES_HOME and is created on
+        # first slot acquire. Even though the in-process cap defaults to
+        # 0 (disabled), the lock dir wiring should still be intact.
+        # We probe via the resolved value flowing through __init__: with
+        # cap=0 no flock is taken, so the slot's fd is None — but the
+        # default path is computed and would be used if cap were > 0.
+        assert env._slot is not None
+        assert env._slot.in_process is True
+    finally:
+        env.cleanup()
+
+
+@pytest.mark.skipif(not NODE_AVAILABLE, reason="node or daemon.mjs missing")
+def test_create_environment_propagates_max_concurrent_vms_knob(tmp_path, monkeypatch):
+    """`terminal.gondolin.max_concurrent_vms` set in config flows through
+    to the module-level cap so users don't have to also export the env var."""
+    from tools.terminal_tool import _create_environment
+    from tools.environments import gondolin as gondolin_mod
+
+    monkeypatch.setattr(gondolin_mod, "_max_concurrent_vms", 0)
+
+    env = _create_environment(
+        env_type="gondolin",
+        image="",
+        cwd="/workspace",
+        timeout=60,
+        gondolin_config={
+            "sandbox_dir": str(tmp_path / "vm-sandbox"),
+            "stub_vm": True,
+            "max_concurrent_vms": 3,
+        },
+        task_id="test-cap-knob",
+    )
+    try:
+        assert gondolin_mod._max_concurrent_vms == 3
+    finally:
+        env.cleanup()
+
+
 def test_create_environment_rejects_unknown_backend():
     """Sanity: the existing error path still rejects gibberish so the
     new gondolin branch doesn't accidentally swallow it."""

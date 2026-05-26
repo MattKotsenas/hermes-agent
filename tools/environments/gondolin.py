@@ -23,6 +23,7 @@ crash, or VM hang surfaces as a clean tool error on the next call.
 
 from __future__ import annotations
 
+import fcntl
 import json
 import logging
 import os
@@ -32,6 +33,7 @@ import subprocess
 import sys
 import threading
 import time
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -49,27 +51,51 @@ _DAEMON_JS = _HERE / "gondolin_host" / "src" / "daemon.mjs"
 # by re-binding this module attribute (used by tests and by the factory
 # when the user sets TERMINAL_GONDOLIN_MAX_CONCURRENT_VMS).
 #
-# Set to <= 0 to disable the cap entirely. The cap is in-process only —
-# subagents and the gateway live in separate processes, so this does NOT
-# enforce a global host-wide limit. Cross-process locking is a deferred
-# item in the design doc (depends on signed PID liveness checks etc.).
+# Set to <= 0 to disable the cap entirely. This module-level value is the
+# IN-PROCESS cap. When a lock_dir is also configured, we additionally hold
+# a flock() on a slot file so the cap is honored host-wide across the CLI,
+# subagents, the gateway, and cron jobs. flock() is released on process
+# exit by the kernel, so a crashed process doesn't leak slots.
 try:
     _max_concurrent_vms = int(os.environ.get("TERMINAL_GONDOLIN_MAX_CONCURRENT_VMS", "0") or "0")
 except ValueError:
     _max_concurrent_vms = 0
+
+# Default cross-process lock directory. Resolved lazily so HERMES_HOME /
+# tests can override via the config knob. Empty string = in-process only.
+_DEFAULT_LOCK_DIR = os.environ.get("TERMINAL_GONDOLIN_LOCK_DIR", "")
 
 # Active VM count + lock. Module-level state because the cap is process-wide.
 _vm_count_lock = threading.Lock()
 _active_vm_count = 0
 
 
-def _acquire_vm_slot() -> None:
+@dataclass
+class _Slot:
+    """A reserved concurrent-VM slot.
+
+    ``fd`` is set when the slot is backed by a cross-process flock; closing
+    the fd releases the kernel-side lock. ``in_process`` is True when we
+    bumped the module counter — released by decrementing it.
+    """
+    fd: int | None
+    lock_path: str | None
+    in_process: bool
+
+
+def _acquire_vm_slot(*, lock_dir: str | None = None) -> _Slot:
     """Reserve a slot under the concurrent-VM cap. Raises if at limit.
 
-    Must be paired with _release_vm_slot() in cleanup (and on init failure).
+    When ``lock_dir`` is set, also takes a non-blocking flock() on one of
+    slot-0.lock..slot-{N-1}.lock so the cap is honored across processes.
+    The kernel releases flock() on process exit, so crash-recovery is free.
+
+    Must be paired with _release_vm_slot() on cleanup / init failure.
     """
     global _active_vm_count
     cap = _max_concurrent_vms
+
+    # In-process counter is always the first gate. Cheap, no syscalls.
     with _vm_count_lock:
         if cap > 0 and _active_vm_count >= cap:
             raise RuntimeError(
@@ -79,15 +105,75 @@ def _acquire_vm_slot() -> None:
                 f"to clean up. Set the cap to 0 to disable entirely."
             )
         _active_vm_count += 1
+    in_process_acquired = True
+
+    # Cross-process flock layer — opt-in via lock_dir. Without it, the cap
+    # is in-process only (legacy default; documented).
+    fd: int | None = None
+    lock_path: str | None = None
+    if cap > 0 and lock_dir:
+        try:
+            os.makedirs(lock_dir, exist_ok=True)
+            for slot_idx in range(cap):
+                candidate = os.path.join(lock_dir, f"slot-{slot_idx}.lock")
+                candidate_fd = os.open(candidate, os.O_RDWR | os.O_CREAT, 0o600)
+                try:
+                    fcntl.flock(candidate_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except BlockingIOError:
+                    os.close(candidate_fd)
+                    continue
+                # Got the lock. Stamp the file with our PID for forensics —
+                # not used for enforcement (flock alone is authoritative).
+                try:
+                    os.ftruncate(candidate_fd, 0)
+                    os.write(candidate_fd, f"{os.getpid()}\n".encode("ascii"))
+                except OSError:
+                    pass
+                fd = candidate_fd
+                lock_path = candidate
+                break
+            if fd is None:
+                # All slot files held by other processes. Roll back the
+                # in-process counter we already bumped above.
+                with _vm_count_lock:
+                    if _active_vm_count > 0:
+                        _active_vm_count -= 1
+                in_process_acquired = False
+                raise RuntimeError(
+                    f"gondolin: refusing to spawn another VM — host-wide cap "
+                    f"({cap}) reached (slot files in {lock_dir} all held by other "
+                    f"processes). Either raise max_concurrent_vms, wait for an "
+                    f"existing session to release, or set the cap to 0 to disable."
+                )
+        except BaseException:
+            # Any other failure during flock setup: roll back the counter.
+            if in_process_acquired:
+                with _vm_count_lock:
+                    if _active_vm_count > 0:
+                        _active_vm_count -= 1
+            raise
+
+    return _Slot(fd=fd, lock_path=lock_path, in_process=in_process_acquired)
 
 
-def _release_vm_slot() -> None:
-    """Release a slot reserved via _acquire_vm_slot(). Idempotent-safe at
-    the call sites (only called on a slot that was actually acquired)."""
+def _release_vm_slot(slot: _Slot | None) -> None:
+    """Release a slot reserved via _acquire_vm_slot(). Safe to call once
+    per slot; subsequent calls with the same slot are no-ops (fd cleared)."""
     global _active_vm_count
-    with _vm_count_lock:
-        if _active_vm_count > 0:
-            _active_vm_count -= 1
+    if slot is None:
+        return
+    if slot.fd is not None:
+        try:
+            # Closing the fd releases flock automatically (kernel-side).
+            os.close(slot.fd)
+        except OSError:
+            pass
+        slot.fd = None
+    if slot.in_process:
+        with _vm_count_lock:
+            if _active_vm_count > 0:
+                _active_vm_count -= 1
+        slot.in_process = False
 
 
 def _ensure_node_available() -> None:
@@ -159,16 +245,32 @@ class GondolinEnvironment(BaseEnvironment):
 
         _ensure_node_available()
 
-        # Reserve a slot against the in-process concurrent-VM cap BEFORE
-        # spawning anything. If we're at the cap, this raises immediately
-        # and no daemon/VM resources are touched. Released on cleanup or
-        # on init failure (see except block at the end).
-        _acquire_vm_slot()
-        self._slot_acquired = True
+        # Resolve the cross-process lock directory. Order of precedence:
+        # 1) config["lock_dir"] (explicit per-call), 2) env var, 3) None
+        # (in-process cap only). The env var is mostly for testing /
+        # fleet ops; normal Hermes wiring sets the config knob.
+        resolved_config = dict(config or {})
+        lock_dir = resolved_config.pop("lock_dir", None) or _DEFAULT_LOCK_DIR or None
+        # Also respect a config-supplied override of the in-process cap so
+        # tests / per-process knobs don't have to monkeypatch the module.
+        if "max_concurrent_vms" in resolved_config:
+            try:
+                cap_override = int(resolved_config.pop("max_concurrent_vms"))
+            except (TypeError, ValueError):
+                cap_override = None
+            if cap_override is not None:
+                global _max_concurrent_vms
+                _max_concurrent_vms = cap_override
+
+        # Reserve a slot against the concurrent-VM cap BEFORE spawning
+        # anything. If we're at the cap, this raises immediately and no
+        # daemon/VM resources are touched. Released on cleanup or on
+        # init failure (see except block at the end).
+        self._slot: _Slot | None = _acquire_vm_slot(lock_dir=lock_dir)
         try:
             self._init_after_slot(
                 sandbox_dir=sandbox_dir,
-                config=config,
+                config=resolved_config,
                 stub_vm=stub_vm,
                 init_timeout=init_timeout,
                 daemon_path=daemon_path,
@@ -178,9 +280,9 @@ class GondolinEnvironment(BaseEnvironment):
             # Any failure between slot acquire and successful init must
             # release the slot, regardless of source (slot logic, daemon
             # spawn, RPC, KeyboardInterrupt).
-            if getattr(self, "_slot_acquired", False):
-                _release_vm_slot()
-                self._slot_acquired = False
+            if self._slot is not None:
+                _release_vm_slot(self._slot)
+                self._slot = None
             raise
 
     def _init_after_slot(
@@ -360,9 +462,9 @@ class GondolinEnvironment(BaseEnvironment):
         # Release the concurrent-VM slot so the next session can spawn.
         # Guarded against double-cleanup (cleanup called twice would
         # otherwise under-count active VMs).
-        if getattr(self, "_slot_acquired", False):
-            _release_vm_slot()
-            self._slot_acquired = False
+        if self._slot is not None:
+            _release_vm_slot(self._slot)
+            self._slot = None
 
     # ------------------------------------------------------------------
     # Internal

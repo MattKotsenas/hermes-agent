@@ -1309,6 +1309,17 @@ def _create_environment(env_type: str, image: str, cwd: str, timeout: int,
             daemon_config["memory"] = gc["memory"]
         if gc.get("cpus") is not None:
             daemon_config["cpus"] = int(gc["cpus"])
+        # Host-wide concurrency knobs. lock_dir defaults to a shared dir
+        # under HERMES_HOME so the cap is enforced across the CLI,
+        # subagents, the gateway, and cron jobs by default — no extra
+        # config required.
+        if gc.get("max_concurrent_vms") is not None:
+            daemon_config["max_concurrent_vms"] = int(gc["max_concurrent_vms"])
+        lock_dir = gc.get("lock_dir")
+        if not lock_dir:
+            from hermes_constants import get_hermes_home
+            lock_dir = str(get_hermes_home() / "sandboxes" / "gondolin" / ".locks")
+        daemon_config["lock_dir"] = lock_dir
         return _GondolinEnvironment(
             sandbox_dir=sandbox_dir,
             cwd=cwd,
