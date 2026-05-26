@@ -175,3 +175,86 @@ test("daemon: connection closing mid-exec doesn't kill the daemon", async (t) =>
   assert.equal(resp.error, undefined);
   assert.match(resp.result.stdout, /still-alive/);
 });
+
+
+test("daemon: init forwards config.image to VM as imagePath", async (t) => {
+  // In stub mode, the daemon echoes back the resolved image selector
+  // in the init result so we can assert it without booting a real VM.
+  const tmp = mkdtempSync(path.join(os.tmpdir(), "gondolin-img-test-"));
+  const sockPath = path.join(tmp, "d.sock");
+
+  const proc = spawn("node", [DAEMON, "--socket", sockPath], {
+    stdio: ["ignore", "ignore", "pipe"],
+    env: {
+      ...process.env,
+      GONDOLIN_DAEMON_QUIET: "1",
+      GONDOLIN_DAEMON_STUB_VM: "1",
+    },
+  });
+  proc.stderr.on("data", () => {});
+
+  t.after(async () => {
+    try { proc.kill("SIGTERM"); } catch {}
+    await new Promise((r) => {
+      if (proc.exitCode != null) return r();
+      proc.once("exit", r);
+      setTimeout(r, 2000);
+    });
+    rmSync(tmp, { recursive: true, force: true });
+  });
+
+  await waitForSocket(sockPath);
+
+  // Caller passes a custom image selector.
+  const init = await rpcCall(sockPath, {
+    id: 1,
+    method: "init",
+    params: { config: { image: "ubuntu-noble:latest" } },
+  });
+  assert.equal(init.error, undefined);
+  assert.equal(init.result.ready, true);
+  assert.equal(
+    init.result.imagePath,
+    "ubuntu-noble:latest",
+    "stub-mode init must echo the resolved image selector",
+  );
+});
+
+
+test("daemon: init without config.image leaves imagePath undefined", async (t) => {
+  // When no image is configured, the daemon must NOT inject one — Gondolin
+  // gets to fall back to its own default (GONDOLIN_DEFAULT_IMAGE).
+  const tmp = mkdtempSync(path.join(os.tmpdir(), "gondolin-img-test-"));
+  const sockPath = path.join(tmp, "d.sock");
+
+  const proc = spawn("node", [DAEMON, "--socket", sockPath], {
+    stdio: ["ignore", "ignore", "pipe"],
+    env: {
+      ...process.env,
+      GONDOLIN_DAEMON_QUIET: "1",
+      GONDOLIN_DAEMON_STUB_VM: "1",
+    },
+  });
+  proc.stderr.on("data", () => {});
+
+  t.after(async () => {
+    try { proc.kill("SIGTERM"); } catch {}
+    await new Promise((r) => {
+      if (proc.exitCode != null) return r();
+      proc.once("exit", r);
+      setTimeout(r, 2000);
+    });
+    rmSync(tmp, { recursive: true, force: true });
+  });
+
+  await waitForSocket(sockPath);
+  const init = await rpcCall(sockPath, {
+    id: 1,
+    method: "init",
+    params: { config: {} },
+  });
+  assert.equal(init.error, undefined);
+  assert.equal(init.result.ready, true);
+  assert.equal(init.result.imagePath, undefined,
+    "no image config -> no imagePath in init result (Gondolin uses its own default)");
+});

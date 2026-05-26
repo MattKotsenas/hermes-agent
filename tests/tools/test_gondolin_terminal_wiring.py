@@ -42,6 +42,7 @@ def test_get_env_config_reads_gondolin_keys(monkeypatch):
         "/tmp/my-policy.mjs",
     )
     monkeypatch.setenv("TERMINAL_GONDOLIN_SANDBOX_DIR", "/tmp/my-sandbox")
+    monkeypatch.setenv("TERMINAL_GONDOLIN_IMAGE", "ubuntu-noble:latest")
 
     cfg = _get_env_config()
     g = cfg["gondolin"]
@@ -49,11 +50,13 @@ def test_get_env_config_reads_gondolin_keys(monkeypatch):
     assert g["secrets"]["GITHUB_TOKEN"]["from_env"] == "GITHUB_TOKEN"
     assert g["policy_script"] == "/tmp/my-policy.mjs"
     assert g["sandbox_dir"] == "/tmp/my-sandbox"
+    assert g["image"] == "ubuntu-noble:latest"
 
 
 def test_get_env_config_defaults_for_gondolin(monkeypatch):
     """When no gondolin env vars are set, the block is present but empty
-    so downstream code can use ``.get()`` uniformly."""
+    so downstream code can use ``.get()`` uniformly. image=None means
+    'let Gondolin use its own default (alpine-base:latest)'."""
     from tools.terminal_tool import _get_env_config
 
     # Make sure no gondolin vars leak in from the surrounding shell.
@@ -62,6 +65,7 @@ def test_get_env_config_defaults_for_gondolin(monkeypatch):
         "TERMINAL_GONDOLIN_SECRETS_JSON",
         "TERMINAL_GONDOLIN_POLICY_SCRIPT",
         "TERMINAL_GONDOLIN_SANDBOX_DIR",
+        "TERMINAL_GONDOLIN_IMAGE",
     ):
         monkeypatch.delenv(k, raising=False)
     monkeypatch.setenv("TERMINAL_ENV", "gondolin")
@@ -72,6 +76,7 @@ def test_get_env_config_defaults_for_gondolin(monkeypatch):
     assert g["secrets"] == {}
     assert g["policy_script"] is None
     assert g["sandbox_dir"] is None
+    assert g["image"] is None
 
 
 def test_get_env_config_default_cwd_for_gondolin(monkeypatch):
@@ -99,6 +104,7 @@ def test_create_environment_returns_gondolin_environment(tmp_path):
         "secrets": {},
         "policy_script": None,
         "sandbox_dir": sandbox,
+        "image": "ubuntu-noble:latest",
         "stub_vm": True,  # test-only flag honored by factory
     }
     env = _create_environment(
@@ -112,6 +118,8 @@ def test_create_environment_returns_gondolin_environment(tmp_path):
     try:
         assert isinstance(env, GondolinEnvironment)
         assert env.sandbox_dir.as_posix() == sandbox
+        # Image must have been forwarded into the daemon's init payload.
+        assert env.config.get("image") == "ubuntu-noble:latest"
     finally:
         env.cleanup()
 

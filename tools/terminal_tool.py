@@ -1098,6 +1098,8 @@ def _get_env_config() -> Dict[str, Any]:
         # a structured block that _create_environment forwards to
         # GondolinEnvironment. allowed_hosts defaults to ["*"] (open with
         # credential isolation) to match the design doc; tightening is opt-in.
+        # image=None means "let Gondolin use its own default
+        # (GONDOLIN_DEFAULT_IMAGE, currently alpine-base:latest)".
         "gondolin": {
             "allowed_hosts": _parse_env_var(
                 "TERMINAL_GONDOLIN_ALLOWED_HOSTS", '["*"]', json.loads, "valid JSON"
@@ -1107,6 +1109,7 @@ def _get_env_config() -> Dict[str, Any]:
             ),
             "policy_script": os.getenv("TERMINAL_GONDOLIN_POLICY_SCRIPT") or None,
             "sandbox_dir": os.getenv("TERMINAL_GONDOLIN_SANDBOX_DIR") or None,
+            "image": os.getenv("TERMINAL_GONDOLIN_IMAGE") or None,
         },
     }
 
@@ -1287,6 +1290,10 @@ def _create_environment(env_type: str, image: str, cwd: str, timeout: int,
             "secrets": gc.get("secrets", {}),
             "policy_script": gc.get("policy_script"),
         }
+        # `image` is optional — only forward when set so the daemon (and
+        # Gondolin) falls back to GONDOLIN_DEFAULT_IMAGE otherwise.
+        if gc.get("image"):
+            daemon_config["image"] = gc["image"]
         return _GondolinEnvironment(
             sandbox_dir=sandbox_dir,
             cwd=cwd,

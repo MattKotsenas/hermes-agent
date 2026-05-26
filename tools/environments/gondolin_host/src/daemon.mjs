@@ -48,6 +48,13 @@ const handlers = {
   async init(params) {
     if (vm) throw new Error("already initialized");
     const config = params?.config ?? {};
+    // Gondolin's SandboxServerOptions accepts `imagePath` as either a
+    // directory path with kernel/initrd/rootfs, an image selector
+    // ("name:tag" or build id resolved via builtin-image-registry.json),
+    // or an explicit GuestAssets object. We surface it as a single string
+    // knob here; null/undefined means "let Gondolin use its own default
+    // (GONDOLIN_DEFAULT_IMAGE, currently alpine-base:latest)".
+    const imagePath = config.image ?? null;
 
     if (STUB_VM) {
       vm = {
@@ -57,7 +64,11 @@ const handlers = {
         async close() {},
       };
       log("VM stub ready");
-      return { ready: true };
+      // Echo back the resolved imagePath so tests can assert what would
+      // have been forwarded to a real VM.create() without booting one.
+      const result = { ready: true };
+      if (imagePath != null) result.imagePath = imagePath;
+      return result;
     }
 
     const policy = await loadPolicy(config.policy_script ?? null);
@@ -65,10 +76,16 @@ const handlers = {
     log("policy resolved:", {
       allowedHosts: hooksInput.allowedHosts,
       secrets: Object.keys(hooksInput.secrets ?? {}),
+      imagePath,
     });
     const { VM, createHttpHooks } = await loadGondolin();
     const { httpHooks, env } = createHttpHooks(hooksInput);
-    vm = await VM.create({ httpHooks, env });
+    const vmOptions = { httpHooks, env };
+    if (imagePath != null) {
+      // SandboxServerOptions hangs off VMOptions.sandbox.
+      vmOptions.sandbox = { imagePath };
+    }
+    vm = await VM.create(vmOptions);
     log("VM ready");
     return { ready: true };
   },
