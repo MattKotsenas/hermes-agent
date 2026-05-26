@@ -162,20 +162,28 @@ older than N hours and offer to kill them.
 
 ### Workspace mapping
 
-The agent's "writable working directory" inside the VM maps to a
-host-side bind mount at `${HERMES_HOME}/sandboxes/<session_id>/`.
+The agent's "writable working directory" inside the VM is the host
+directory `${HERMES_HOME}/sandboxes/<session_id>/`, exposed through
+Gondolin's VFS layer.
 
-- Inside VM: `/workspace`.
+- Inside VM: `/workspace` (or wherever `terminal.cwd` points).
 - On host: `${HERMES_HOME}/sandboxes/<session_id>/`.
 - `cwd` defaults to `/workspace`. Hermes's existing cwd-tracking
   machinery just works.
 
-This requires Gondolin to support a host-to-guest mount. The spike
-proved exec + http hooks; need to confirm VFS mount support in the npm
-package and what mechanism it uses (9p / virtiofs / shared block).
-**Open verification item.** Fallback if not supported natively: use
-file-sync (the `file_sync.py` pattern Hermes already has for ssh/modal)
-to push/pull workspace state at exec boundaries. Slower but simpler.
+Implementation: at `init` time the daemon configures
+`VMOptions.vfs.mounts = { [cwd]: new RealFSProvider(sandbox_dir) }`.
+Gondolin's guest-side init script mounts the VFS provider tree over
+sandboxfs (FUSE-on-virtio-serial) at `/data` and then `mount --bind`s
+the configured guest path into the rest of the filesystem. The
+result is a normal read-write directory inside the VM whose contents
+live on the host — proven end-to-end by
+`tests/integration/test_gondolin_terminal.py` (host→guest and
+guest→host file visibility).
+
+User opt-out: set `terminal.gondolin.workspace_mount: false`. The
+daemon skips VFS wiring entirely — useful for power users whose
+`policy_script` defines its own `vfs` block.
 
 ### Hermes runtime files
 
@@ -519,9 +527,11 @@ injected into the sandbox if configured.
    - Petition upstream Gondolin for streaming.
    Plan: ship with no streaming, file an upstream issue, revisit when
    it bites.
-2. **VFS bind-mount.** Spike used the default rootfs only. Need to
-   verify Gondolin supports a host-dir bind mount (9p/virtiofs) in the
-   npm package. If not, fall back to file-sync at exec boundaries.
+2. ~~**VFS bind-mount.**~~ **Closed (2026-05-26)** — Gondolin exposes
+   host-dir mounts as a first-class API (`VMOptions.vfs.mounts` +
+   `RealFSProvider`). Wired up; round-trip file visibility verified
+   in `tests/integration/test_gondolin_terminal.py`. No file-sync
+   fallback needed.
 3. **Credential refresh.** Phase 2 ships `from_env` only. `from_command`
    for re-fetchable creds (AAD tokens) is phase 2.5. The daemon needs a
    `set_secret` RPC; verify `createHttpHooks` supports mutating the
@@ -554,3 +564,9 @@ injected into the sandbox if configured.
   terminal_tool factory wiring, doctor check, KVM integration tests,
   configurable VM image via `terminal.gondolin.image`. 15 commits on
   `feat/gondolin-terminal-backend`.
+- **2026-05-26** — Workspace bind-mount wired up via
+  `VMOptions.vfs.mounts` + `RealFSProvider`. Host
+  `${HERMES_HOME}/sandboxes/<session>/` is now visible inside the VM
+  at the configured cwd (default `/workspace`), read-write, with
+  round-trip file visibility verified by KVM integration tests.
+  Closes open question (2) from phase 2.
