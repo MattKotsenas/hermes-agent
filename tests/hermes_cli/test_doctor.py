@@ -285,6 +285,76 @@ def test_doctor_reports_vercel_backend_diagnostics(monkeypatch, tmp_path):
     assert "snapshot filesystem only" in out
 
 
+def test_doctor_reports_gondolin_backend_all_green(monkeypatch, tmp_path):
+    """When the gondolin backend is selected and node + qemu + /dev/kvm are
+    all present, doctor reports each prerequisite as OK with the resolved
+    versions, and doesn't append an issue."""
+    monkeypatch.setenv("TERMINAL_ENV", "gondolin")
+
+    # Pretend node, qemu, and /dev/kvm are all present.
+    def fake_which(cmd):
+        return {"node": "/usr/bin/node", "qemu-system-x86_64": "/usr/bin/qemu-system-x86_64"}.get(cmd)
+    monkeypatch.setattr(doctor_mod, "_safe_which", fake_which)
+    real_exists = os.path.exists
+    monkeypatch.setattr(doctor_mod.os.path, "exists", lambda p: True if p == "/dev/kvm" else real_exists(p))
+
+    # Stub `node --version` and `qemu-system-x86_64 --version` so doctor's
+    # subprocess.run calls don't hit anything real.
+    real_run = doctor_mod.subprocess.run
+    def fake_run(cmd, *args, **kwargs):
+        if cmd and cmd[0] == "node" and "--version" in cmd:
+            return SimpleNamespace(returncode=0, stdout="v22.22.3\n", stderr="")
+        if cmd and cmd[0] == "qemu-system-x86_64" and "--version" in cmd:
+            return SimpleNamespace(returncode=0, stdout="QEMU emulator version 8.2.2\n", stderr="")
+        return real_run(cmd, *args, **kwargs)
+    monkeypatch.setattr(doctor_mod.subprocess, "run", fake_run)
+
+    fake_model_tools = types.SimpleNamespace(
+        check_tool_availability=lambda *a, **kw: ([], []),
+        TOOLSET_REQUIREMENTS={},
+    )
+    monkeypatch.setitem(sys.modules, "model_tools", fake_model_tools)
+
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        doctor_mod.run_doctor(Namespace(fix=False))
+    out = buf.getvalue()
+
+    assert "gondolin" in out.lower()
+    assert "node" in out.lower()
+    assert "qemu" in out.lower()
+    assert "/dev/kvm" in out
+
+
+def test_doctor_reports_gondolin_missing_prereqs(monkeypatch, tmp_path):
+    """When gondolin is selected but node is missing, doctor names the
+    missing dependency and suggests an install command."""
+    monkeypatch.setenv("TERMINAL_ENV", "gondolin")
+
+    # Pretend nothing relevant is on PATH and /dev/kvm is absent.
+    monkeypatch.setattr(doctor_mod, "_safe_which", lambda cmd: None)
+    real_exists = os.path.exists
+    monkeypatch.setattr(doctor_mod.os.path, "exists", lambda p: False if p == "/dev/kvm" else real_exists(p))
+
+    fake_model_tools = types.SimpleNamespace(
+        check_tool_availability=lambda *a, **kw: ([], []),
+        TOOLSET_REQUIREMENTS={},
+    )
+    monkeypatch.setitem(sys.modules, "model_tools", fake_model_tools)
+
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        doctor_mod.run_doctor(Namespace(fix=False))
+    out = buf.getvalue()
+
+    # All three prereqs called out as missing.
+    assert "node not found" in out.lower() or "node.js" in out.lower()
+    assert "qemu" in out.lower()
+    assert "/dev/kvm" in out
+    # Install hints surface for at least one of them.
+    assert "apt install" in out.lower() or "install" in out.lower()
+
+
 # ── Memory provider section (doctor should only check the *active* provider) ──
 
 

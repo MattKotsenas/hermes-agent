@@ -1239,6 +1239,58 @@ def run_doctor(args):
                 issues,
             )
     
+    # Gondolin (if using gondolin backend)
+    if terminal_env == "gondolin":
+        # node: required to run the daemon (>= 20 for parseArgs, AF_UNIX).
+        node_path = _safe_which("node")
+        if node_path:
+            try:
+                result = subprocess.run(
+                    ["node", "--version"], capture_output=True, text=True, timeout=5
+                )
+                version = (result.stdout or "").strip() if result.returncode == 0 else ""
+                check_ok("node (gondolin daemon)", f"({version})" if version else "")
+            except (subprocess.TimeoutExpired, OSError):
+                check_ok("node (gondolin daemon)", "(version check failed)")
+        else:
+            _fail_and_issue(
+                "node not found",
+                "(required for TERMINAL_ENV=gondolin daemon)",
+                "Install Node.js >= 20: apt install nodejs (or use nvm)",
+                issues,
+            )
+
+        # qemu-system-x86_64: the gondolin VM runs on QEMU.
+        qemu_path = _safe_which("qemu-system-x86_64")
+        if qemu_path:
+            try:
+                result = subprocess.run(
+                    ["qemu-system-x86_64", "--version"],
+                    capture_output=True, text=True, timeout=5,
+                )
+                first_line = ((result.stdout or "").splitlines() or [""])[0].strip()
+                check_ok("qemu-system-x86_64 (gondolin VM)", f"({first_line})" if first_line else "")
+            except (subprocess.TimeoutExpired, OSError):
+                check_ok("qemu-system-x86_64 (gondolin VM)", "(version check failed)")
+        else:
+            _fail_and_issue(
+                "qemu-system-x86_64 not found",
+                "(required for TERMINAL_ENV=gondolin VM)",
+                "Install QEMU: apt install qemu-system-x86",
+                issues,
+            )
+
+        # /dev/kvm: software-only TCG is too slow to be useful.
+        if os.path.exists("/dev/kvm"):
+            check_ok("/dev/kvm", "(hardware acceleration available)")
+        else:
+            _fail_and_issue(
+                "/dev/kvm not available",
+                "(gondolin without KVM falls back to TCG and is unusably slow)",
+                "Enable KVM: ensure the kvm kernel module is loaded and your user is in the 'kvm' group",
+                issues,
+            )
+
     # Daytona (if using daytona backend)
     if terminal_env == "daytona":
         daytona_key = os.getenv("DAYTONA_API_KEY")
