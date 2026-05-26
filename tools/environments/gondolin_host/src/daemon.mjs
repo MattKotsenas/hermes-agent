@@ -79,7 +79,15 @@ const handlers = {
     if (typeof cmd !== "string") throw new Error("exec: 'cmd' must be a string");
     const timeoutMs = params?.timeout_ms ?? 180_000;
     const start = Date.now();
-    const result = await vm.exec(cmd, { timeout: timeoutMs });
+    // Wrap with bash -c so the user's command runs under bash (which the
+    // BaseEnvironment session-snapshot prelude relies on: 'builtin cd',
+    // 'declare -f', 'shopt', 'set +e/+u' are all bashisms). The Gondolin
+    // helper image's default /bin/sh is BusyBox sh and would reject those.
+    // Single-quote the cmd and escape any embedded single quotes the
+    // standard way (POSIX trick: end-quote, escape, start-quote).
+    const escaped = cmd.replace(/'/g, "'\\''");
+    const wrapped = `bash -c '${escaped}'`;
+    const result = await vm.exec(wrapped, { timeout: timeoutMs });
     return {
       exit_code: result.exitCode,
       stdout: result.stdout,
