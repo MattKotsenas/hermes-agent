@@ -421,6 +421,23 @@ terminal:
     # Daemon
     daemon_path: null    # override path to gondolin-host.mjs
     boot_timeout_ms: 30000   # fail VM init if it takes longer
+
+    # VM image
+    #
+    # null  →  let Gondolin use its own default (GONDOLIN_DEFAULT_IMAGE,
+    #          currently 'alpine-base:latest'). Boots fast, BusyBox tools.
+    # str   →  forwarded to SandboxServerOptions.imagePath. Accepts:
+    #            - registry selector ('name:tag' or build id; resolved via
+    #              builtin-image-registry.json and cached under
+    #              ~/.cache/gondolin/images/)
+    #            - directory path containing kernel/initrd/rootfs assets
+    #              built with `gondolin build`
+    # Examples: 'alpine-base:latest', 'ubuntu-noble:latest',
+    #           '/home/me/.gondolin-builds/my-stack/'
+    #
+    # The daemon always invokes the user's command via 'bash -c' so any
+    # image with bash on PATH works regardless of /bin/sh choice.
+    image: null
 ```
 
 ## Acceptance criteria (gated phase 2 close)
@@ -531,3 +548,9 @@ injected into the sandbox if configured.
 
 - **2026-05-25** — Design doc drafted. Predecessor phase 1 spike at
   `../phase-1/` proved the technical basis.
+- **2026-05-26** — Phase 2 landed. Daemon (RPC framing, hooks builder,
+  policy_script, VM lifecycle), AF_UNIX socket transport, Python RPC
+  bridge, GondolinEnvironment, prompt_builder registration,
+  terminal_tool factory wiring, doctor check, KVM integration tests,
+  configurable VM image via `terminal.gondolin.image`. 15 commits on
+  `feat/gondolin-terminal-backend`.
