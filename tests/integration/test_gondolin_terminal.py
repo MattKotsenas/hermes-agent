@@ -99,3 +99,65 @@ def test_nonzero_exit_codes_propagate(gondolin_env):
     in the execute() result."""
     result = gondolin_env.execute("exit 42")
     assert result["returncode"] == 42
+
+
+# ----------------------------------------------------------------------
+# Workspace bind-mount: host <-> guest filesystem sharing.
+# These tests prove the vfs.mounts + RealFSProvider wiring actually works
+# end-to-end inside a real VM.
+# ----------------------------------------------------------------------
+
+@pytest.fixture
+def gondolin_env_workspace(tmp_path):
+    """Real Gondolin VM with the default /workspace bind mount."""
+    from tools.environments.gondolin import GondolinEnvironment
+    env = GondolinEnvironment(
+        sandbox_dir=str(tmp_path / "sandbox"),
+        cwd="/workspace",
+        timeout=60,
+        init_timeout=120.0,
+        stub_vm=False,
+    )
+    try:
+        yield env
+    finally:
+        env.cleanup()
+
+
+@requires_gondolin
+def test_host_write_visible_in_guest(gondolin_env_workspace):
+    """A file written on the host under sandbox_dir/ appears at the
+    corresponding path inside the guest /workspace/."""
+    env = gondolin_env_workspace
+    # Host side: drop a file directly in the sandbox dir.
+    (Path(env.sandbox_dir) / "from-host.txt").write_text("hello from host\n")
+    # Guest side: read it back via the VM.
+    result = env.execute("cat /workspace/from-host.txt")
+    assert result["returncode"] == 0, f"cat failed: {result}"
+    assert "hello from host" in result["output"]
+
+
+@requires_gondolin
+def test_guest_write_visible_on_host(gondolin_env_workspace):
+    """A file written inside the guest under /workspace/ appears on the
+    host under sandbox_dir/."""
+    env = gondolin_env_workspace
+    result = env.execute(
+        "printf 'hello from guest\\n' > /workspace/from-guest.txt"
+    )
+    assert result["returncode"] == 0, f"write failed: {result}"
+    # Host side: file is present with the expected content.
+    host_file = Path(env.sandbox_dir) / "from-guest.txt"
+    assert host_file.exists(), f"file not on host: {host_file}"
+    assert host_file.read_text() == "hello from guest\n"
+
+
+@requires_gondolin
+def test_workspace_mount_is_writable(gondolin_env_workspace):
+    """Sanity check that the bind mount is read-write, not read-only."""
+    env = gondolin_env_workspace
+    result = env.execute(
+        "touch /workspace/.write-probe && rm /workspace/.write-probe && echo ok"
+    )
+    assert result["returncode"] == 0, f"write probe failed: {result}"
+    assert "ok" in result["output"]

@@ -141,3 +141,37 @@ def test_missing_node_binary_raises_clear_error(monkeypatch, tmp_path):
             sandbox_dir=str(tmp_path / "sandbox"),
             stub_vm=True,
         )
+
+
+@requires_node
+def test_default_workspace_mount_wires_sandbox_dir_to_cwd(stub_env_factory):
+    """By default, the env tells the daemon to bind the host sandbox_dir to
+    the configured in-VM cwd via vfs.mounts. This is what makes file tools
+    (read_file/write_file/patch) work against /workspace in the VM: the same
+    bytes appear on the host under sandbox_dir/. The stub daemon echoes the
+    resolved mount back in its init response; we assert against that."""
+    env = stub_env_factory()
+    # cwd defaults to /workspace.
+    assert env.workspace_mount == {
+        "guestPath": "/workspace",
+        "hostPath": str(env.sandbox_dir),
+    }
+
+
+@requires_node
+def test_custom_cwd_changes_workspace_mount_guest_path(stub_env_factory):
+    """Changing cwd shifts where the sandbox dir appears inside the VM."""
+    env = stub_env_factory(cwd="/srv/work")
+    assert env.workspace_mount == {
+        "guestPath": "/srv/work",
+        "hostPath": str(env.sandbox_dir),
+    }
+
+
+@requires_node
+def test_workspace_mount_can_be_disabled(stub_env_factory):
+    """Setting workspace_mount=False in config skips the VFS wiring entirely.
+    Power-user escape: someone hand-rolling vfs via a policy_script doesn't
+    need our default mount and may want a stricter image-only filesystem."""
+    env = stub_env_factory(config={"workspace_mount": False})
+    assert env.workspace_mount is None

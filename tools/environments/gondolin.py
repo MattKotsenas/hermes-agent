@@ -115,8 +115,30 @@ class GondolinEnvironment(BaseEnvironment):
         self.sandbox_dir = Path(sandbox_dir)
         self.sandbox_dir.mkdir(parents=True, exist_ok=True)
         self.sock_path = str(self.sandbox_dir / "gondolin.sock")
-        self.config = config or {}
+        self.config = dict(config or {})
         self.stub_vm = stub_vm
+
+        # Default workspace mount: bind the host sandbox_dir to the in-VM cwd
+        # via Gondolin's vfs.mounts. This is what makes file tools work
+        # against /workspace in the guest — the same bytes appear on the host
+        # under sandbox_dir, so read_file/write_file/patch can either route
+        # through the VM (terminal-based) or use the host path directly.
+        # User can opt out by setting `workspace_mount: False` in config; a
+        # power-user policy_script that defines its own vfs may want that.
+        if "workspace_mount" not in self.config:
+            self.config["workspace_mount"] = {
+                "guest_path": cwd,
+                "host_path": str(self.sandbox_dir),
+            }
+        elif self.config["workspace_mount"] is False:
+            # Sentinel for "opt out" — strip so the daemon doesn't see a
+            # non-dict and trip its validation.
+            self.config.pop("workspace_mount")
+
+        # Captured from the init response; useful for tests and for
+        # higher-level code that wants to know where the workspace lives.
+        # None when workspace_mount is disabled.
+        self.workspace_mount: dict | None = None
 
         daemon_js = Path(daemon_path) if daemon_path else _DAEMON_JS
         if not daemon_js.exists():
@@ -152,6 +174,10 @@ class GondolinEnvironment(BaseEnvironment):
                 err = response["error"]
                 msg = err.get("message", str(err)) if isinstance(err, dict) else str(err)
                 raise RuntimeError(f"gondolin daemon init failed: {msg}")
+            result = response.get("result") or {}
+            wm = result.get("workspaceMount")
+            if isinstance(wm, dict):
+                self.workspace_mount = wm
         except Exception:
             self._terminate_daemon()
             raise

@@ -18,7 +18,7 @@ import { spawn } from "node:child_process";
 import net from "node:net";
 import os from "node:os";
 import path from "node:path";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, mkdirSync, rmSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -257,4 +257,138 @@ test("daemon: init without config.image leaves imagePath undefined", async (t) =
   assert.equal(init.result.ready, true);
   assert.equal(init.result.imagePath, undefined,
     "no image config -> no imagePath in init result (Gondolin uses its own default)");
+});
+
+
+test("daemon: init forwards config.workspace_mount to VM as vfs.mounts", async (t) => {
+  // The Python side passes workspace_mount = { guest_path, host_path } to
+  // wire a real host directory into the guest filesystem via Gondolin's
+  // vfs.mounts + RealFSProvider. In stub mode the daemon echoes back what
+  // it would have configured, so we can assert the mapping without booting.
+  const tmp = mkdtempSync(path.join(os.tmpdir(), "gondolin-mount-test-"));
+  const sockPath = path.join(tmp, "d.sock");
+  const hostDir = path.join(tmp, "workspace");
+  mkdirSync(hostDir, { recursive: true });
+
+  const proc = spawn("node", [DAEMON, "--socket", sockPath], {
+    stdio: ["ignore", "ignore", "pipe"],
+    env: {
+      ...process.env,
+      GONDOLIN_DAEMON_QUIET: "1",
+      GONDOLIN_DAEMON_STUB_VM: "1",
+    },
+  });
+  proc.stderr.on("data", () => {});
+
+  t.after(async () => {
+    try { proc.kill("SIGTERM"); } catch {}
+    await new Promise((r) => {
+      if (proc.exitCode != null) return r();
+      proc.once("exit", r);
+      setTimeout(r, 2000);
+    });
+    rmSync(tmp, { recursive: true, force: true });
+  });
+
+  await waitForSocket(sockPath);
+
+  const init = await rpcCall(sockPath, {
+    id: 1,
+    method: "init",
+    params: {
+      config: {
+        workspace_mount: { guest_path: "/workspace", host_path: hostDir },
+      },
+    },
+  });
+  assert.equal(init.error, undefined);
+  assert.equal(init.result.ready, true);
+  assert.deepEqual(
+    init.result.workspaceMount,
+    { guestPath: "/workspace", hostPath: hostDir },
+    "stub-mode init must echo the resolved workspace mount",
+  );
+});
+
+
+test("daemon: init rejects workspace_mount whose host_path doesn't exist", async (t) => {
+  // Fail fast at init: if the host directory doesn't exist, the user has a
+  // config bug or a permissions problem. Surface it as an init error rather
+  // than letting it through and erroring obscurely from inside the guest.
+  const tmp = mkdtempSync(path.join(os.tmpdir(), "gondolin-mount-bad-"));
+  const sockPath = path.join(tmp, "d.sock");
+  const missing = path.join(tmp, "does", "not", "exist");
+
+  const proc = spawn("node", [DAEMON, "--socket", sockPath], {
+    stdio: ["ignore", "ignore", "pipe"],
+    env: {
+      ...process.env,
+      GONDOLIN_DAEMON_QUIET: "1",
+      GONDOLIN_DAEMON_STUB_VM: "1",
+    },
+  });
+  proc.stderr.on("data", () => {});
+
+  t.after(async () => {
+    try { proc.kill("SIGTERM"); } catch {}
+    await new Promise((r) => {
+      if (proc.exitCode != null) return r();
+      proc.once("exit", r);
+      setTimeout(r, 2000);
+    });
+    rmSync(tmp, { recursive: true, force: true });
+  });
+
+  await waitForSocket(sockPath);
+
+  const init = await rpcCall(sockPath, {
+    id: 1,
+    method: "init",
+    params: {
+      config: {
+        workspace_mount: { guest_path: "/workspace", host_path: missing },
+      },
+    },
+  });
+  assert.ok(init.error, "init must error when host_path is missing");
+  assert.match(init.error.message, /host_path/);
+});
+
+
+test("daemon: init without workspace_mount leaves workspaceMount undefined", async (t) => {
+  // No mount config -> no VFS wiring. (Gondolin still runs; the guest just
+  // doesn't get a host-backed /workspace.)
+  const tmp = mkdtempSync(path.join(os.tmpdir(), "gondolin-mount-none-"));
+  const sockPath = path.join(tmp, "d.sock");
+
+  const proc = spawn("node", [DAEMON, "--socket", sockPath], {
+    stdio: ["ignore", "ignore", "pipe"],
+    env: {
+      ...process.env,
+      GONDOLIN_DAEMON_QUIET: "1",
+      GONDOLIN_DAEMON_STUB_VM: "1",
+    },
+  });
+  proc.stderr.on("data", () => {});
+
+  t.after(async () => {
+    try { proc.kill("SIGTERM"); } catch {}
+    await new Promise((r) => {
+      if (proc.exitCode != null) return r();
+      proc.once("exit", r);
+      setTimeout(r, 2000);
+    });
+    rmSync(tmp, { recursive: true, force: true });
+  });
+
+  await waitForSocket(sockPath);
+  const init = await rpcCall(sockPath, {
+    id: 1,
+    method: "init",
+    params: { config: {} },
+  });
+  assert.equal(init.error, undefined);
+  assert.equal(init.result.ready, true);
+  assert.equal(init.result.workspaceMount, undefined,
+    "no workspace_mount config -> no workspaceMount in init result");
 });

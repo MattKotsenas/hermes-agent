@@ -56,6 +56,42 @@ const handlers = {
     // (GONDOLIN_DEFAULT_IMAGE, currently alpine-base:latest)".
     const imagePath = config.image ?? null;
 
+    // Optional host->guest workspace mount. Maps a real host directory into
+    // the guest's filesystem via Gondolin's vfs.mounts (RealFSProvider). The
+    // guest sees a normal mountpoint; reads/writes hit the host directory
+    // through the sandboxfs FUSE bridge. We validate host_path exists at
+    // init so config bugs surface here rather than from inside the VM.
+    let workspaceMount = null;
+    if (config.workspace_mount != null) {
+      const wm = config.workspace_mount;
+      const guestPath = wm.guest_path;
+      const hostPath = wm.host_path;
+      if (typeof guestPath !== "string" || !guestPath.startsWith("/")) {
+        throw new Error(
+          "workspace_mount.guest_path must be an absolute path string",
+        );
+      }
+      if (typeof hostPath !== "string" || hostPath.length === 0) {
+        throw new Error("workspace_mount.host_path must be a non-empty string");
+      }
+      try {
+        const stat = fs.statSync(hostPath);
+        if (!stat.isDirectory()) {
+          throw new Error(
+            `workspace_mount.host_path is not a directory: ${hostPath}`,
+          );
+        }
+      } catch (e) {
+        if (e.code === "ENOENT") {
+          throw new Error(
+            `workspace_mount.host_path does not exist: ${hostPath}`,
+          );
+        }
+        throw e;
+      }
+      workspaceMount = { guestPath, hostPath };
+    }
+
     if (STUB_VM) {
       vm = {
         async exec(cmd) {
@@ -64,10 +100,11 @@ const handlers = {
         async close() {},
       };
       log("VM stub ready");
-      // Echo back the resolved imagePath so tests can assert what would
+      // Echo back the resolved config so tests can assert what would
       // have been forwarded to a real VM.create() without booting one.
       const result = { ready: true };
       if (imagePath != null) result.imagePath = imagePath;
+      if (workspaceMount != null) result.workspaceMount = workspaceMount;
       return result;
     }
 
@@ -77,13 +114,28 @@ const handlers = {
       allowedHosts: hooksInput.allowedHosts,
       secrets: Object.keys(hooksInput.secrets ?? {}),
       imagePath,
+      workspaceMount,
     });
-    const { VM, createHttpHooks } = await loadGondolin();
+    const { VM, createHttpHooks, RealFSProvider } = await loadGondolin();
     const { httpHooks, env } = createHttpHooks(hooksInput);
     const vmOptions = { httpHooks, env };
     if (imagePath != null) {
       // SandboxServerOptions hangs off VMOptions.sandbox.
       vmOptions.sandbox = { imagePath };
+    }
+    if (workspaceMount != null) {
+      // vfs.mounts is a Record<guestPath, VirtualProvider>. RealFSProvider
+      // exposes a host directory directly. Gondolin's sandboxfs init script
+      // mounts the VFS provider tree at /data and binds the configured guest
+      // paths into the rest of the filesystem (see Alpine ROOTFS_INIT_SCRIPT
+      // and SandboxFsConfig.fuseBinds). For the agent, this means files
+      // written under workspaceMount.guestPath inside the VM appear under
+      // workspaceMount.hostPath on the host, and vice versa.
+      vmOptions.vfs = {
+        mounts: {
+          [workspaceMount.guestPath]: new RealFSProvider(workspaceMount.hostPath),
+        },
+      };
     }
     vm = await VM.create(vmOptions);
     log("VM ready");
