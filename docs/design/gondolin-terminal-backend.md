@@ -1,6 +1,7 @@
 # Hermes Gondolin Terminal Backend — Design
 
-**Status:** draft for review (2026-05-25)
+**Status:** phase 2 implementation complete; pre-PR cleanup
+(2026-05-26)
 **Predecessor:** phase 1 spike at `../phase-1/` proved Gondolin runs in WSL2,
 credential injection works, exfil is denied.
 
@@ -17,9 +18,14 @@ credential injection works, exfil is denied.
 
 - Windows support. Linux/WSL2 only. Matt's Windows Gondolin fork stays
   out of scope.
-- Streaming stdout/stderr from in-VM commands. Gondolin's `vm.exec` is
-  request/response. Address in a follow-up if upstream adds streaming or
-  we drop to lower-level APIs.
+- ~~Streaming stdout/stderr from in-VM commands.~~ **Closed
+  (2026-05-26)** — Gondolin's `vm.exec()` is async-iterable in
+  addition to awaitable. Wired into the daemon as a separate
+  `exec_stream` RPC method (rpc.mjs grew a `streamWriter` arg threaded
+  through handlers, daemon returns chunk frames before the final
+  response), the Python wrapper supports `--stream`, and
+  `GondolinEnvironment._run_bash` opts in by default (config:
+  `stream: false` to disable). Open question (1) closed below.
 - VM-state snapshots across session resume. Resumed sessions get a fresh
   VM and an empty (or reused-by-sandbox-dir) workspace.
 - Routing MCP servers through the VM. MCP servers run host-side, which
@@ -578,14 +584,27 @@ injected into the sandbox if configured.
 
 ## Open questions tracked into phase 2
 
-1. **Streaming.** Gondolin `vm.exec` is request-response. For long
-   commands, output arrives all at once. Three paths:
-   - Accept it. Most agent terminal calls finish in <2s.
-   - Investigate Gondolin's lower-level TS APIs (`host/` package) for a
-     streaming interface.
-   - Petition upstream Gondolin for streaming.
-   Plan: ship with no streaming, file an upstream issue, revisit when
-   it bites.
+1. ~~**Streaming.**~~ **Closed (2026-05-26)** — Gondolin's `vm.exec()`
+   returns an `ExecProcess` that's both awaitable AND async-iterable.
+   Wired up end-to-end:
+   - `rpc.mjs` framing extended to support multi-frame responses:
+     handlers now receive a second `ctx` arg with a `streamWriter` that
+     writes `{stream: {kind, data}}` frames before the terminal
+     `{result}` frame. Back-compat preserved — single-arg handlers
+     ignore ctx.
+   - Daemon `exec_stream(cmd, timeout_ms)` RPC iterates the
+     `ExecProcess` and forwards each chunk. Stub-mode equivalent
+     (`vm.execStreaming`) recognizes a `STREAM:` test marker for
+     pure-JS tests.
+   - Python `gondolin_rpc_call --stream` consumes stream frames and
+     writes each chunk to its own stdout/stderr immediately, then
+     exits with the final exit_code. `BaseEnvironment`'s `select()`
+     drain loop sees real-time output without modification.
+   - `GondolinEnvironment._run_bash` passes `--stream` by default;
+     opt out with `terminal.gondolin.stream: false`.
+   - Safety: CWD-marker prelude survives streaming because Gondolin
+     chunks at coarse granularity (whole-write boundaries), not
+     mid-byte. Watch for split-marker bugs if they surface.
 2. ~~**VFS bind-mount.**~~ **Closed (2026-05-26)** — Gondolin exposes
    host-dir mounts as a first-class API (`VMOptions.vfs.mounts` +
    `RealFSProvider`). Wired up; round-trip file visibility verified
@@ -635,23 +654,44 @@ injected into the sandbox if configured.
      0 (default) to disable entirely. Slot is released on cleanup and
      on init failure (including KeyboardInterrupt).
 
-   **Sub-item still deferred: cross-process locking.** The cap above is
-   in-process only. Subagents, the gateway, and a separate `hermes`
-   CLI live in different processes and don't share the counter — so on
-   a host running gateway + ad-hoc CLI sessions, both can each spawn
-   N VMs concurrently. Doing this properly needs a file lock under
-   `${HERMES_HOME}/sandboxes/.gondolin.lock` plus PID-liveness checks
-   for stale-lock recovery, which is real work and not gating phase 2
-   close. File as a follow-up.
+   **Sub-item cross-process locking:** ~~The cap above is in-process
+   only.~~ **Closed (2026-05-26)** — `terminal.gondolin.lock_dir`
+   (default `${HERMES_HOME}/sandboxes/gondolin/.locks/`) holds one
+   file per slot; each VM acquires `fcntl.flock(LOCK_EX|LOCK_NB)` on
+   the lowest free slot file. Kernel auto-releases on process exit,
+   so PID-liveness checks aren't needed for stale-lock recovery. Cap
+   now applies across subagents, gateway, and standalone CLI on the
+   same host, all sharing the lock dir.
+
+6. **`execute_code` (in-VM Python REPL).** The default
+   `alpine-base:latest` image ships BusyBox without `python3`, so the
+   built-in `execute_code` tool can't run inside the Gondolin VM. The
+   error message in `tools/code_execution_tool.py::_execute_remote`
+   now names this case explicitly and points at switching to a
+   python-enabled image (e.g. `ubuntu-noble:latest` with python3
+   layered in, or a custom-built image), and `hermes doctor` warns
+   when `terminal.backend: gondolin` is configured. Test
+   `test_execute_code_round_trip` is marked strict-xfail until a
+   python-enabled image is selected. Bundling a python-bearing image
+   as the default is a phase 3 question — adds ~50 MB to the
+   download and a sharper "what's our default" debate.
 
 ## Where this goes after phase 2
 
 - **Upstream PR** to `NousResearch/hermes-agent` with the diff above,
   citing this design doc as the design rationale.
-- **Phase 2.5** if PR feedback wants it: `from_command` secrets,
-  streaming via low-level Gondolin APIs, memory caps.
+- **Protocol revisit.** With streaming in place, JSON-RPC line
+  framing is doing double duty: control plane (init/set_secret/etc.)
+  and data plane (stdout/stderr chunks base64'd into JSON). Docker's
+  hijacked-stream framing (8-byte header + raw bytes for stdout/stderr,
+  JSON for control) is the directly-analogous precedent. Considering a
+  Docker-style multiplexed byte channel for `exec_stream` only, JSON
+  for everything else. Not gating phase 2 close, but worth doing
+  before the upstream PR if benchmarks justify.
 - **Phase 3** (separate project): bring sbx into the same shape as a
   sibling backend, since the abstraction is now proven to work.
+  Also: bundling a python-enabled default image so `execute_code`
+  works out of the box.
 
 ## Activity log
 
@@ -695,3 +735,54 @@ injected into the sandbox if configured.
   (gateway + ad-hoc CLI in different PIDs) is filed as a follow-up;
   needs `${HERMES_HOME}/sandboxes/.gondolin.lock` + PID-liveness
   checks.
+- **2026-05-26** — Operability batch:
+  - `hermes sandboxes` CLI (list/prune subcommands) for the
+    sandbox-dir cleanup story called out in §Filesystem.
+  - Workspace bind-mount regression fixed: socket no longer lives
+    inside the bind-mounted workspace dir (would have leaked the
+    daemon socket into guest userspace). Moved to a sibling subdir.
+  - `terminal.gondolin.image` knob added (forwarded to
+    `SandboxServerOptions.imagePath`) so users can swap images
+    without touching daemon code.
+- **2026-05-26** — `execute_code` in-VM gap (open question 6) wired
+  up: explicit error in `code_execution_tool._execute_remote`,
+  `hermes doctor` info-line warning when backend is gondolin,
+  strict-xfail on `test_execute_code_round_trip` until a
+  python-enabled image is supplied.
+- **2026-05-26** — Cross-process VM cap closed (5 sub-item):
+  `fcntl.flock(LOCK_EX|LOCK_NB)` on per-slot files in
+  `terminal.gondolin.lock_dir` (default
+  `${HERMES_HOME}/sandboxes/gondolin/.locks/`). Kernel-released on
+  process exit, so stale-lock recovery is free. `_GondolinSlot`
+  abstraction wraps fd/lock_path. 5 new tests including
+  cross-process subprocess scenarios.
+- **2026-05-26** — Secret-resolution diagnostics surfaced. The
+  daemon's `init` response now includes a `secretDiagnostics` array
+  (`[{name, type, error, stderr}]`) populated from
+  `resolveSecretWithDiagnostics()` in `hooks.mjs`; per-secret
+  `timeout_ms` (default 30s) prevents hung `from_command` calls
+  blocking VM init. Python `GondolinEnvironment.secret_diagnostics`
+  exposes the list and WARN-logs each entry. 8 new tests across the
+  Node and Python sides.
+- **2026-05-26** — `SecretRefresher` shipped
+  (`tools/environments/gondolin_secret_refresh.py`). Background
+  thread per env; JWT exp parsing → ttl_seconds fallback → skip;
+  10/30/60s exponential backoff on refresh failures. Opt-in via
+  `refresh: true` per-secret (reuses `from_command`). Wired in
+  post-init via `_start_secret_refresher_if_needed`, torn down in
+  cleanup. 16 unit + 3 env wiring tests.
+- **2026-05-26** — `hermes doctor` log-grep probe added
+  (`hermes_cli/gondolin_log_scan.py`). Parses `errors.log` for
+  recent "gondolin secret X (kind) unresolved/refresh failed"
+  warnings, dedupes by (name, kind), shows age, trims stderr.
+  Read-only — no VM spawn. 12 unit tests.
+- **2026-05-26** — Streaming landed end-to-end (open question 1
+  closed; see updated §Open questions). Three sub-cycles:
+  rpc.mjs `streamWriter` framing (3 new tests, 8 total in
+  `rpc.test.mjs`); daemon `exec_stream` RPC with stub-mode
+  `vm.execStreaming` (2 new tests, 14 total in
+  `socket_transport`); Python wrapper `--stream` flag (4 new
+  tests, 13 total in `test_gondolin_rpc_call.py`). `_run_bash`
+  passes `--stream` by default; `terminal.gondolin.stream: false`
+  opts out. 33 commits on `feat/gondolin-terminal-backend`, all
+  pushed to `fork`. Totals: 73 Python + 52 Node tests green.
