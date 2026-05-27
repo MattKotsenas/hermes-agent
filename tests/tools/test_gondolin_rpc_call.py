@@ -37,10 +37,16 @@ class FakeDaemon:
     Accepts one connection, reads one newline-delimited JSON-RPC request,
     writes back the configured response (also newline-delimited), then
     closes the connection. Designed to be one-shot per test.
+
+    For streaming: pass `stream_frames=[...]` and the server will write
+    each frame followed by `response` as the final terminator. Frames are
+    wrapped as `{"id": <req-id>, "stream": <frame>}` to match the wire
+    contract; pass them as plain dicts (e.g. {"kind": "stdout", "data": "x"}).
     """
 
-    def __init__(self, response: dict):
+    def __init__(self, response: dict, stream_frames: list[dict] | None = None):
         self.response = response
+        self.stream_frames = list(stream_frames or [])
         self.received_request: dict | None = None
         self._tmpdir = tempfile.mkdtemp(prefix="gondolin-fake-")
         # Keep the path short — AF_UNIX has a ~104 byte cap on macOS.
@@ -84,12 +90,17 @@ class FakeDaemon:
             line, _, _ = buf.partition(b"\n")
             req = json.loads(line.decode("utf-8"))
             self.received_request = req
+            req_id = req.get("id")
+            # Emit any streaming frames first.
+            for frame in self.stream_frames:
+                msg = {"id": req_id, "stream": frame}
+                conn.sendall((json.dumps(msg) + "\n").encode("utf-8"))
             resp = dict(self.response)
-            resp.setdefault("id", req.get("id"))
+            resp.setdefault("id", req_id)
             conn.sendall((json.dumps(resp) + "\n").encode("utf-8"))
 
 
-def _run_wrapper(sock_path: str, cmd: str, *, timeout_ms: int | None = None, env: dict | None = None):
+def _run_wrapper(sock_path: str, cmd: str, *, timeout_ms: int | None = None, env: dict | None = None, stream: bool = False):
     """Invoke the wrapper as a subprocess; return CompletedProcess."""
     full_env = os.environ.copy()
     # Make sure the wrapper can import from the repo without an editable install.
@@ -99,6 +110,8 @@ def _run_wrapper(sock_path: str, cmd: str, *, timeout_ms: int | None = None, env
     argv = [sys.executable, str(WRAPPER), sock_path, cmd]
     if timeout_ms is not None:
         argv.extend(["--timeout-ms", str(timeout_ms)])
+    if stream:
+        argv.append("--stream")
     return subprocess.run(
         argv,
         capture_output=True,
@@ -299,3 +312,66 @@ def test_e2e_consecutive_calls_share_daemon(stubbed_daemon):
     assert b.returncode == 0
     assert "first" in a.stdout
     assert "second" in b.stdout
+
+
+# ---------------------------------------------------------------------------
+# Streaming exec — chunks arrive at the wrapper's stdout as they're produced.
+# ---------------------------------------------------------------------------
+
+def test_streaming_writes_stdout_chunks_in_order():
+    """With --stream, the wrapper sends `exec_stream` and writes each stdout
+    chunk to its own stdout immediately, finishing with the daemon's exit_code."""
+    frames = [
+        {"kind": "stdout", "data": "alpha\n"},
+        {"kind": "stdout", "data": "beta\n"},
+        {"kind": "stdout", "data": "gamma\n"},
+    ]
+    response = {"result": {"exit_code": 0, "chunks": 3, "duration_ms": 4}}
+    with FakeDaemon(response, stream_frames=frames) as daemon:
+        result = _run_wrapper(daemon.sock_path, "echo abc", stream=True)
+
+    assert result.returncode == 0
+    assert result.stdout == "alpha\nbeta\ngamma\n"
+    assert daemon.received_request["method"] == "exec_stream"
+    assert daemon.received_request["params"]["cmd"] == "echo abc"
+
+
+def test_streaming_stderr_chunks_go_to_stderr():
+    """{kind: 'stderr', data: ...} frames write to the wrapper's stderr,
+    not its stdout, so existing log-routing keeps working."""
+    frames = [
+        {"kind": "stdout", "data": "out1\n"},
+        {"kind": "stderr", "data": "warn1\n"},
+        {"kind": "stdout", "data": "out2\n"},
+    ]
+    response = {"result": {"exit_code": 0, "chunks": 3, "duration_ms": 4}}
+    with FakeDaemon(response, stream_frames=frames) as daemon:
+        result = _run_wrapper(daemon.sock_path, "noisy", stream=True)
+
+    assert result.returncode == 0
+    assert result.stdout == "out1\nout2\n"
+    assert "warn1" in result.stderr
+
+
+def test_streaming_nonzero_exit_relayed():
+    """Final {result: {exit_code: N}} after a stream becomes the wrapper's exit code."""
+    frames = [{"kind": "stdout", "data": "partial output\n"}]
+    response = {"result": {"exit_code": 99, "chunks": 1, "duration_ms": 4}}
+    with FakeDaemon(response, stream_frames=frames) as daemon:
+        result = _run_wrapper(daemon.sock_path, "exit 99", stream=True)
+
+    assert result.returncode == 99
+    assert "partial output" in result.stdout
+
+
+def test_streaming_rpc_error_after_partial_chunks():
+    """Error final frame after some stream chunks: chunks still surface on
+    stdout/stderr; wrapper exits nonzero with the error message on stderr."""
+    frames = [{"kind": "stdout", "data": "before-crash\n"}]
+    response = {"error": {"code": -32603, "message": "vm crashed mid-stream"}}
+    with FakeDaemon(response, stream_frames=frames) as daemon:
+        result = _run_wrapper(daemon.sock_path, "go", stream=True)
+
+    assert result.returncode != 0
+    assert "before-crash" in result.stdout
+    assert "vm crashed mid-stream" in result.stderr

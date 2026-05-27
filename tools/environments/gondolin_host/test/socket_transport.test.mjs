@@ -57,6 +57,44 @@ function rpcCall(sockPath, request, { timeoutMs = 5000 } = {}) {
   });
 }
 
+// Streaming variant: collect all frames (stream + final result/error) until
+// a frame without `stream` arrives, then close. Returns { streamFrames, final }.
+function rpcCallStreaming(sockPath, request, { timeoutMs = 10000 } = {}) {
+  return new Promise((resolve, reject) => {
+    const sock = net.createConnection(sockPath);
+    let buf = "";
+    const streamFrames = [];
+    const timer = setTimeout(() => {
+      sock.destroy();
+      reject(new Error(`streaming rpc timeout after ${timeoutMs}ms`));
+    }, timeoutMs);
+    sock.on("data", (chunk) => {
+      buf += chunk.toString("utf8");
+      let idx;
+      while ((idx = buf.indexOf("\n")) >= 0) {
+        const line = buf.slice(0, idx);
+        buf = buf.slice(idx + 1);
+        if (!line.trim()) continue;
+        let frame;
+        try { frame = JSON.parse(line); }
+        catch (e) { clearTimeout(timer); sock.destroy(); reject(e); return; }
+        if (frame.stream !== undefined) {
+          streamFrames.push(frame.stream);
+        } else {
+          clearTimeout(timer);
+          sock.end();
+          resolve({ streamFrames, final: frame });
+          return;
+        }
+      }
+    });
+    sock.on("error", (err) => { clearTimeout(timer); reject(err); });
+    sock.on("connect", () => {
+      sock.write(JSON.stringify(request) + "\n");
+    });
+  });
+}
+
 async function waitForSocket(sockPath, timeoutMs = 5000) {
   const start = Date.now();
   while (Date.now() - start < timeoutMs) {
@@ -619,4 +657,92 @@ test("daemon: init without resource caps leaves memory/cpus undefined", async (t
   assert.equal(init.result.ready, true);
   assert.equal(init.result.memory, undefined);
   assert.equal(init.result.cpus, undefined);
+});
+
+// ---- exec_stream: chunked stdout/stderr before final exit_code -------------
+//
+// Long-running commands (test suites, build scripts) shouldn't have to buffer
+// all output until exit. exec_stream uses the RPC streamWriter to push
+// chunks as they arrive. Stub-mode test: the stub vm.exec recognizes a
+// "STREAM:" prefix and emits one chunk per "|" segment, then exits.
+
+test("daemon: exec_stream emits chunked stdout frames then a final result", async (t) => {
+  const tmp = mkdtempSync(path.join(os.tmpdir(), "gondolin-stream-test-"));
+  const sockPath = path.join(tmp, "d.sock");
+
+  const proc = spawn("node", [DAEMON, "--socket", sockPath], {
+    stdio: ["ignore", "ignore", "pipe"],
+    env: { ...process.env, GONDOLIN_DAEMON_QUIET: "1", GONDOLIN_DAEMON_STUB_VM: "1" },
+  });
+  proc.stderr.on("data", () => {});
+
+  t.after(async () => {
+    try { proc.kill("SIGTERM"); } catch {}
+    await new Promise((r) => {
+      if (proc.exitCode != null) return r();
+      proc.once("exit", r);
+      setTimeout(r, 2000);
+    });
+    rmSync(tmp, { recursive: true, force: true });
+  });
+
+  await waitForSocket(sockPath);
+  const init = await rpcCall(sockPath, { id: 1, method: "init", params: { config: {} } });
+  assert.equal(init.error, undefined);
+
+  // STREAM: prefix is a stub-mode marker — chunks separated by '|'.
+  const { streamFrames, final } = await rpcCallStreaming(sockPath, {
+    id: 42,
+    method: "exec_stream",
+    params: { cmd: "STREAM:hello|world|done" },
+  });
+
+  // Each segment should arrive as its own frame.
+  assert.equal(streamFrames.length, 3, `got frames: ${JSON.stringify(streamFrames)}`);
+  assert.equal(streamFrames[0].kind, "stdout");
+  assert.equal(streamFrames[0].data, "hello");
+  assert.equal(streamFrames[1].data, "world");
+  assert.equal(streamFrames[2].data, "done");
+
+  // Final frame: exit_code only (stdout/stderr accumulated by the wrapper).
+  assert.equal(final.id, 42);
+  assert.equal(final.error, undefined);
+  assert.equal(final.result.exit_code, 0);
+});
+
+test("daemon: exec_stream falls back to a single chunk for non-STREAM stub commands", async (t) => {
+  // Plain commands in stub mode should still work end-to-end — they just
+  // produce one chunk (the echoed cmd) plus a final result. Confirms that
+  // exec_stream is a drop-in for exec on the daemon side without forcing
+  // every caller to format their cmds with STREAM: markers.
+  const tmp = mkdtempSync(path.join(os.tmpdir(), "gondolin-stream-test2-"));
+  const sockPath = path.join(tmp, "d.sock");
+
+  const proc = spawn("node", [DAEMON, "--socket", sockPath], {
+    stdio: ["ignore", "ignore", "pipe"],
+    env: { ...process.env, GONDOLIN_DAEMON_QUIET: "1", GONDOLIN_DAEMON_STUB_VM: "1" },
+  });
+  proc.stderr.on("data", () => {});
+  t.after(async () => {
+    try { proc.kill("SIGTERM"); } catch {}
+    await new Promise((r) => {
+      if (proc.exitCode != null) return r();
+      proc.once("exit", r);
+      setTimeout(r, 2000);
+    });
+    rmSync(tmp, { recursive: true, force: true });
+  });
+
+  await waitForSocket(sockPath);
+  const init = await rpcCall(sockPath, { id: 1, method: "init", params: { config: {} } });
+  assert.equal(init.error, undefined);
+
+  const { streamFrames, final } = await rpcCallStreaming(sockPath, {
+    id: 9,
+    method: "exec_stream",
+    params: { cmd: "echo hello" },
+  });
+  assert.equal(streamFrames.length, 1);
+  assert.match(streamFrames[0].data, /echo hello/);
+  assert.equal(final.result.exit_code, 0);
 });

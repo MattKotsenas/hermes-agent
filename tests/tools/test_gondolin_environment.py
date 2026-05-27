@@ -610,3 +610,47 @@ def test_refresh_loop_warns_when_refresh_true_but_no_command(tmp_path, caplog):
         )
     finally:
         env.cleanup()
+
+
+# ---- Streaming exec --------------------------------------------------------
+#
+# _run_bash passes --stream to the wrapper by default so the agent sees
+# stdout chunks live. Config knob `stream: false` opts out (one-shot exec
+# for snapshot-prelude calls or environments where chunk timing matters).
+
+@requires_node
+def test_run_bash_defaults_to_streaming(tmp_path):
+    """A default-config env wires --stream into the wrapper argv."""
+    env = GondolinEnvironment(
+        sandbox_dir=str(tmp_path / "stream-default"),
+        stub_vm=True,
+    )
+    try:
+        proc = env._run_bash("STREAM:hello|world", timeout=30)
+        proc.wait(timeout=10)
+        out = proc.stdout.read() if proc.stdout else ""
+        # The stub VM streams each segment as a chunk; output concatenates them.
+        assert "hello" in out
+        assert "world" in out
+        assert proc.returncode == 0
+    finally:
+        env.cleanup()
+
+
+@requires_node
+def test_run_bash_can_opt_out_of_streaming(tmp_path):
+    """`stream: false` falls back to the one-shot exec path."""
+    env = GondolinEnvironment(
+        sandbox_dir=str(tmp_path / "stream-off"),
+        stub_vm=True,
+        config={"stream": False},
+    )
+    try:
+        proc = env._run_bash("echo hi", timeout=30)
+        proc.wait(timeout=10)
+        out = proc.stdout.read() if proc.stdout else ""
+        # Non-streaming stub echoes the wrapped cmd back as stdout.
+        assert "echo hi" in out
+        assert proc.returncode == 0
+    finally:
+        env.cleanup()

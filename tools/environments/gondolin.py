@@ -427,6 +427,13 @@ class GondolinEnvironment(BaseEnvironment):
         it captures env vars from the first call and re-sources them on
         subsequent ones — but ``bash -l`` semantics aren't available inside
         the VM.
+
+        Output is streamed by default — the wrapper writes stdout/stderr
+        chunks to its pipes as they arrive from the daemon rather than
+        buffering until exit. BaseEnvironment's select() drain hands those
+        chunks to the agent UI in real time, so a long-running command
+        (test suite, build) doesn't appear hung. Set ``stream: False`` in
+        the env config to opt out (one-shot exec, full result at end).
         """
         argv = [
             sys.executable,
@@ -437,6 +444,9 @@ class GondolinEnvironment(BaseEnvironment):
             "--timeout-ms",
             str(timeout * 1000),
         ]
+        # Streaming defaults to True. Honored per-env via config["stream"].
+        if self.config.get("stream", True):
+            argv.append("--stream")
         return _popen_bash(argv, stdin_data)
 
     def _start_secret_refresher_if_needed(self) -> None:

@@ -123,3 +123,86 @@ test("handles multiple sequential requests in order", async () => {
   inp.end();
   await serverDone;
 });
+
+// ---- streamWriter: intermediate frames before the final response -----------
+//
+// For streaming exec, the handler needs to push stdout chunks as they arrive
+// from the VM rather than buffering everything until the command exits.
+// We extend the RPC contract: handlers receive a `streamWriter` second arg.
+// Calling streamWriter(obj) emits `{ id, stream: obj }` lines. The handler's
+// eventual return value becomes the final `{ id, result }` frame as before.
+// Handlers that don't use streamWriter behave exactly like today (back-compat).
+
+test("streamWriter emits intermediate {stream} frames tagged with the request id", async () => {
+  const inp = new PassThrough();
+  const outp = new PassThrough();
+  const handlers = {
+    chunked: async (_params, ctx) => {
+      ctx.streamWriter({ kind: "stdout", data: "hello\n" });
+      ctx.streamWriter({ kind: "stdout", data: "world\n" });
+      ctx.streamWriter({ kind: "stderr", data: "warn\n" });
+      return { exit_code: 0 };
+    },
+  };
+  const serverDone = runRpcServer({ input: inp, output: outp, handlers });
+
+  writeReq(inp, { id: 99, method: "chunked", params: {} });
+  const frames = await readNResponses(outp, 4);  // 3 stream + 1 final
+
+  // First three are stream frames in order.
+  assert.deepEqual(frames[0], { id: 99, stream: { kind: "stdout", data: "hello\n" } });
+  assert.deepEqual(frames[1], { id: 99, stream: { kind: "stdout", data: "world\n" } });
+  assert.deepEqual(frames[2], { id: 99, stream: { kind: "stderr", data: "warn\n" } });
+  // Fourth is the final result.
+  assert.equal(frames[3].id, 99);
+  assert.deepEqual(frames[3].result, { exit_code: 0 });
+  assert.equal(frames[3].stream, undefined);
+
+  inp.end();
+  await serverDone;
+});
+
+test("streamWriter is optional — handlers that ignore it still work (back-compat)", async () => {
+  const inp = new PassThrough();
+  const outp = new PassThrough();
+  const handlers = {
+    // Handlers from before the streamWriter change had signature (params)
+    // only. They must keep working.
+    legacy: async (params) => ({ echoed: params.x }),
+  };
+  const serverDone = runRpcServer({ input: inp, output: outp, handlers });
+
+  writeReq(inp, { id: 1, method: "legacy", params: { x: 7 } });
+  const [resp] = await readNResponses(outp, 1);
+  assert.deepEqual(resp, { id: 1, result: { echoed: 7 } });
+
+  inp.end();
+  await serverDone;
+});
+
+test("streamWriter frames emitted after handler error are dropped (no result frame either way)", async () => {
+  // Edge case: a handler that streams some chunks then throws. The thrown
+  // error gets a normal {id, error} frame; the streamed chunks that
+  // happened before the throw are already on the wire and that's fine.
+  // What we must NOT do is emit both a {result} and an {error} frame.
+  const inp = new PassThrough();
+  const outp = new PassThrough();
+  const handlers = {
+    boom: async (_params, ctx) => {
+      ctx.streamWriter({ kind: "stdout", data: "partial\n" });
+      throw new Error("mid-stream failure");
+    },
+  };
+  const serverDone = runRpcServer({ input: inp, output: outp, handlers });
+
+  writeReq(inp, { id: 5, method: "boom" });
+  const frames = await readNResponses(outp, 2);
+  assert.deepEqual(frames[0], { id: 5, stream: { kind: "stdout", data: "partial\n" } });
+  assert.equal(frames[1].id, 5);
+  assert.equal(frames[1].result, undefined);
+  assert.equal(frames[1].error.code, -32603);
+  assert.match(frames[1].error.message, /mid-stream failure/);
+
+  inp.end();
+  await serverDone;
+});

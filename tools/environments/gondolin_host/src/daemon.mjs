@@ -109,6 +109,30 @@ const handlers = {
         async exec(cmd) {
           return { exitCode: 0, stdout: cmd + "\n", stderr: "" };
         },
+        // Streaming exec: if cmd starts with "STREAM:", split the rest by
+        // "|" and yield each segment as its own chunk; otherwise yield a
+        // single chunk = cmd + "\n" (matches non-streaming behavior).
+        // The real Gondolin vm.exec returns an ExecProcess that's awaitable
+        // AND async-iterable; this stub mimics just the iterable surface
+        // needed by exec_stream's chunk pump.
+        execStreaming(cmd) {
+          // The daemon wraps every cmd in `bash -c '...'`. Strip that wrap
+          // so the STREAM: marker still works for tests that drive the
+          // daemon through the full bash-wrap path.
+          const m = cmd.match(/^bash -c '(.*)'$/);
+          const inner = m ? m[1].replace(/'\\''/g, "'") : cmd;
+          const parts = inner.startsWith("STREAM:")
+            ? inner.slice("STREAM:".length).split("|")
+            : [inner];
+          return {
+            async *chunks() {
+              for (const p of parts) {
+                yield { kind: "stdout", data: p };
+              }
+            },
+            async exitCode() { return 0; },
+          };
+        },
         async close() {},
       };
       // Fake secretManager seeded from config.secrets so set_secret tests
@@ -236,6 +260,65 @@ const handlers = {
     };
   },
 
+  // Streaming exec: same wire-level command, but stdout/stderr chunks are
+  // pushed via ctx.streamWriter as they arrive from the VM. Final response
+  // carries exit_code + duration only — accumulated bytes already streamed.
+  //
+  // Stub-mode VMs implement vm.execStreaming(cmd) returning
+  // { chunks(): AsyncIterable<{kind, data}>, exitCode(): Promise<number> }.
+  // Real Gondolin's vm.exec returns an ExecProcess that's both awaitable
+  // and async-iterable — we adapt it via the same interface below.
+  async exec_stream(params, ctx) {
+    if (!vm) throw new Error("not initialized");
+    const cmd = params?.cmd;
+    if (typeof cmd !== "string") throw new Error("exec_stream: 'cmd' must be a string");
+    const timeoutMs = params?.timeout_ms ?? 180_000;
+    const start = Date.now();
+    const escaped = cmd.replace(/'/g, "'\\''");
+    const wrapped = `bash -c '${escaped}'`;
+
+    let proc;
+    if (typeof vm.execStreaming === "function") {
+      // Stub path or any adapter that exposes a stream-shaped interface.
+      proc = vm.execStreaming(wrapped, { timeout: timeoutMs });
+    } else {
+      // Real Gondolin: vm.exec with { stdout: "pipe" } returns an
+      // ExecProcess that's async-iterable per chunk. The iterator yields
+      // raw chunks (strings); we re-wrap each as {kind: "stdout", data}.
+      const real = vm.exec(wrapped, { timeout: timeoutMs, stdout: "pipe", stderr: "pipe" });
+      proc = {
+        async *chunks() {
+          // Gondolin emits chunks via for-await. We don't know which is
+          // stdout vs stderr from the unified iterator without extra
+          // metadata — fall back to tagging everything as stdout.
+          // (Gondolin's stderr is interleaved in stdout when both are
+          // "pipe"; users who want a strict split can use the non-stream
+          // exec call.)
+          for await (const chunk of real) {
+            const data = typeof chunk === "string" ? chunk : String(chunk);
+            yield { kind: "stdout", data };
+          }
+        },
+        async exitCode() {
+          const finalResult = await real;
+          return finalResult.exitCode;
+        },
+      };
+    }
+
+    let chunkCount = 0;
+    for await (const c of proc.chunks()) {
+      ctx.streamWriter(c);
+      chunkCount++;
+    }
+    const exitCode = await proc.exitCode();
+    return {
+      exit_code: exitCode,
+      chunks: chunkCount,
+      duration_ms: Date.now() - start,
+    };
+  },
+
   async set_secret(params) {
     if (!vm) throw new Error("not initialized");
     if (!secretManager) {
@@ -288,27 +371,27 @@ const handlers = {
 // would race on the `vm` global during init/shutdown. A simple promise
 // chain is sufficient: each new request awaits the previous one.
 let dispatchChain = Promise.resolve();
-function dispatch(method, params) {
+function dispatch(method, params, ctx) {
   const handler = handlers[method];
   if (!handler) {
     return Promise.reject(
       Object.assign(new Error(`method not found: ${method}`), { code: -32601 }),
     );
   }
-  const next = dispatchChain.then(() => handler(params));
+  const next = dispatchChain.then(() => handler(params, ctx));
   // Don't propagate rejections through the chain — each call awaits its
   // own result, but a handler error shouldn't poison subsequent calls.
   dispatchChain = next.catch(() => {});
   return next;
 }
 
-// Wrapped handlers that go through the serializer. We pass these to
-// runRpcServer per connection rather than the raw handlers above, so
-// the serialization is uniform across every transport entry point.
+// `runRpcServer` invokes handlers[method](params, ctx). We wrap that here
+// so the per-VM dispatch lock applies across connections; the wrapper
+// forwards params + ctx (the streamWriter facility) into dispatch().
 const serializedHandlers = new Proxy(
   {},
   {
-    get: (_t, method) => (params) => dispatch(method, params),
+    get: (_t, method) => (params, ctx) => dispatch(method, params, ctx),
   },
 );
 

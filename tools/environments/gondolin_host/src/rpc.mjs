@@ -32,8 +32,14 @@ export function runRpcServer({ input, output, handlers }) {
         write({ id, error: { code: -32601, message: `method not found: ${method}` } });
         return;
       }
+      // Streaming context: handlers can call ctx.streamWriter(obj) to push
+      // intermediate `{ id, stream: obj }` frames before the final response.
+      // Old single-arg handlers ignore ctx and behave unchanged.
+      const ctx = {
+        streamWriter: (frame) => write({ id, stream: frame }),
+      };
       try {
-        const result = await handler(params);
+        const result = await handler(params, ctx);
         write({ id, result });
       } catch (e) {
         write({ id, error: { code: -32603, message: e.message ?? String(e) } });

@@ -102,14 +102,27 @@ def main(argv: list[str] | None = None) -> int:
         default=None,
         help="Per-exec timeout in milliseconds (default: daemon-side default).",
     )
+    parser.add_argument(
+        "--stream",
+        action="store_true",
+        help=(
+            "Use exec_stream: write stdout/stderr chunks to our pipes as they "
+            "arrive from the daemon instead of buffering the whole result. "
+            "Required for long-running commands whose output the user (or "
+            "BaseEnvironment) wants to see live."
+        ),
+    )
     args = parser.parse_args(argv)
 
     params: dict[str, Any] = {"cmd": args.cmd}
     if args.timeout_ms is not None:
         params["timeout_ms"] = args.timeout_ms
-    request = {"id": 1, "method": "exec", "params": params}
+    method = "exec_stream" if args.stream else "exec"
+    request = {"id": 1, "method": method, "params": params}
 
     with _connect_with_diagnostic(args.socket) as sock:
+        if args.stream:
+            return _run_streaming(sock, request)
         response = _send_request(sock, request)
 
     if "error" in response and response["error"] is not None:
@@ -135,6 +148,68 @@ def main(argv: list[str] | None = None) -> int:
         sys.stderr.write(f"\n{POLICY_DENIED_SENTINEL}\n")
     sys.stderr.flush()
     return exit_code
+
+
+def _run_streaming(sock: socket.socket, request: dict[str, Any]) -> int:
+    """Send `exec_stream` and pump frames live to our stdout/stderr.
+
+    Frame shapes (one JSON object per line):
+      {"id", "stream": {"kind": "stdout"|"stderr", "data": "..."}}
+      {"id", "result": {"exit_code": N, ...}}   ← final
+      {"id", "error": {...}}                     ← final on error
+
+    Each stream frame is written to its respective pipe immediately so
+    BaseEnvironment's select() drain can hand chunks to the agent UI as
+    the command runs, rather than waiting for the whole exec to finish.
+    """
+    sock.sendall((json.dumps(request) + "\n").encode("utf-8"))
+    buf = bytearray()
+    while True:
+        # Read until next newline. We can't use _recv_line() because that
+        # reads exactly one line and discards the rest of the buffer — we
+        # need to preserve unread bytes across iterations.
+        while b"\n" not in buf:
+            chunk = sock.recv(65536)
+            if not chunk:
+                # Daemon closed without a final frame.
+                sys.stderr.write("gondolin: daemon closed connection mid-stream\n")
+                return 1
+            buf.extend(chunk)
+        line_bytes, _, rest = bytes(buf).partition(b"\n")
+        buf = bytearray(rest)
+        try:
+            frame = json.loads(line_bytes.decode("utf-8"))
+        except json.JSONDecodeError as exc:
+            sys.stderr.write(f"gondolin: malformed daemon frame: {exc}\n")
+            return 1
+
+        if "stream" in frame:
+            payload = frame["stream"] or {}
+            kind = payload.get("kind", "stdout")
+            data = payload.get("data", "")
+            if kind == "stderr":
+                sys.stderr.write(data)
+                sys.stderr.flush()
+            else:
+                sys.stdout.write(data)
+                sys.stdout.flush()
+            continue
+
+        # Final frame.
+        if frame.get("error") is not None:
+            err = frame["error"]
+            msg = err.get("message", str(err)) if isinstance(err, dict) else str(err)
+            sys.stderr.write(f"gondolin: rpc error: {msg}\n")
+            sys.stderr.flush()
+            return 1
+
+        result = frame.get("result") or {}
+        exit_code = int(result.get("exit_code", 1))
+        policy_denied = bool(result.get("policy_denied", False))
+        if policy_denied:
+            sys.stderr.write(f"\n{POLICY_DENIED_SENTINEL}\n")
+            sys.stderr.flush()
+        return exit_code
 
 
 if __name__ == "__main__":
