@@ -47,16 +47,29 @@ the command completes. The shapes don't compose directly.
 
 Each Hermes session that uses `terminal.backend: gondolin` spawns a
 small Node.js daemon (`gondolin-host`) at backend init. The daemon owns
-exactly one Gondolin VM and exposes a stdio JSON-RPC line protocol:
+exactly one Gondolin VM and exposes a length-prefixed msgpack JSON-RPC
+protocol over an AF_UNIX socket:
 
 ```
-host  -> { "id": 1, "method": "exec", "params": { "cmd": "ls -la", "timeout_ms": 60000 } }
-daemon -> { "id": 1, "result": { "exit_code": 0, "stdout": "...", "stderr": "" } }
+host  -> [u32 BE: N][N bytes: msgpack{"id":1,"method":"exec","params":{...}}]
+daemon -> [u32 BE: M][M bytes: msgpack{"id":1,"result":{"exit_code":0,...}}]
 ```
+
+The wire is length-prefixed msgpack in both directions. msgpack carries
+binary chunks natively (bin8/bin32), so stream output from
+`vm.exec({stdout: "pipe"})` round-trips byte-for-byte — no base64 tax,
+no UTF-8 corruption of non-text bytes. The 4-byte BE length prefix
+eliminates the delimiter-scan that newline-delimited JSON requires and
+keeps reassembly trivially correct across TCP segmentation. Both sides
+enforce a 64 MiB cap on a single frame's payload as defence-in-depth
+against a hostile or buggy peer.
 
 Methods (minimum viable):
 - `init(config)` — boots the VM with provided httpHooks/env/workspace.
 - `exec(cmd, timeout_ms)` — runs a shell command, returns result.
+- `exec_stream(cmd, timeout_ms)` — same shape but emits intermediate
+  `{id, stream: {kind, data}}` frames as stdout/stderr chunks arrive
+  from the VM, ending with a final `{id, result: {exit_code, ...}}`.
 - `set_secret(name, value)` — updates a secret value without VM restart
   (for credential refresh, e.g. a re-issued AAD token).
 - `shutdown()` — closes the VM.
@@ -64,8 +77,10 @@ Methods (minimum viable):
 The Python `GondolinEnvironment._run_bash` spawns a thin Python wrapper
 subprocess (`gondolin-rpc-call <session_dir>`) per command. The wrapper:
 1. Connects to the daemon's socket.
-2. Sends the JSON-RPC `exec` request.
-3. Receives the response.
+2. Sends the JSON-RPC `exec` (or `exec_stream`) request as one framed
+   msgpack object.
+3. Reads framed response(s); for `exec_stream`, decodes and writes
+   each `{kind, data}` chunk to its respective pipe as it arrives.
 4. Writes stdout/stderr to its own stdout/stderr and exits with the
    in-VM command's exit code.
 
@@ -81,7 +96,8 @@ Hermes (Python)
   │   ├─ __init__ → spawns: node gondolin-host.mjs <session-dir>
   │   └─ _run_bash(cmd) → spawns: python -m gondolin_rpc_call <socket> <cmd>
   │                                  │
-  │                                  ├─ JSON-RPC over Unix socket
+  │                                  ├─ length-prefixed msgpack
+  │                                  │  JSON-RPC over Unix socket
   │                                  ↓
   └─ ~/.hermes/sandboxes/<session>/  daemon process
                                      ├─ @earendil-works/gondolin VM (QEMU)
@@ -680,14 +696,6 @@ injected into the sandbox if configured.
 
 - **Upstream PR** to `NousResearch/hermes-agent` with the diff above,
   citing this design doc as the design rationale.
-- **Protocol revisit.** With streaming in place, JSON-RPC line
-  framing is doing double duty: control plane (init/set_secret/etc.)
-  and data plane (stdout/stderr chunks base64'd into JSON). Docker's
-  hijacked-stream framing (8-byte header + raw bytes for stdout/stderr,
-  JSON for control) is the directly-analogous precedent. Considering a
-  Docker-style multiplexed byte channel for `exec_stream` only, JSON
-  for everything else. Not gating phase 2 close, but worth doing
-  before the upstream PR if benchmarks justify.
 - **Phase 3** (separate project): bring sbx into the same shape as a
   sibling backend, since the abstraction is now proven to work.
   Also: bundling a python-enabled default image so `execute_code`
@@ -786,3 +794,21 @@ injected into the sandbox if configured.
   passes `--stream` by default; `terminal.gondolin.stream: false`
   opts out. 33 commits on `feat/gondolin-terminal-backend`, all
   pushed to `fork`. Totals: 73 Python + 52 Node tests green.
+- **2026-05-27** — Wire flipped from newline-delimited JSON to
+  length-prefixed msgpack (closes the "Protocol revisit" follow-up
+  in §Where this goes after phase 2). Both sides change in lockstep;
+  no back-compat negotiation per Matt. Two motivations, measured:
+  (a) binary safety — the streaming path used to `String(chunk)`
+  Buffer output from `vm.exec({stdout: "pipe"})`, silently mangling
+  non-UTF-8 bytes; msgpack carries `bin8/bin32` natively, so chunks
+  now round-trip byte-for-byte; (b) throughput — `bench/protocol_compare.{py,mjs}`
+  measured ~5-7x faster encode+decode on multi-MB binary payloads,
+  ~3x faster on 1 MB text, ~1.34x smaller wire on every workload
+  (no base64 expansion). One outlier: small line-oriented chunks
+  under apt's older msgpack 1.0.3 are ~2 ms slower (invisible
+  against a 300+ ms command). msgpack is declared as the
+  `terminal.gondolin` extra in `pyproject.toml` + `LAZY_DEPS`, so
+  non-gondolin users never pay for it (matches the modal/daytona/vercel
+  pattern). 12 RPC tests + 14 socket tests + 13 wrapper tests +
+  2 KVM integration tests + 8 sandbox/doctor/inventory ripple tests
+  all green on the new wire.
