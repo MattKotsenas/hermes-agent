@@ -1302,6 +1302,35 @@ def run_doctor(args):
                 "set terminal.gondolin.image, or use the terminal tool instead."
             )
 
+        # Recent gondolin secret resolution warnings — surfaced from
+        # errors.log so the user sees init-time and refresh-time failures
+        # without re-running auth commands (slow, side-effect-y). Read-only
+        # by contract: we just parse what already happened.
+        try:
+            from hermes_cli.gondolin_log_scan import scan_errors_log, humanize_age
+            from hermes_constants import get_hermes_home
+            errors_log = get_hermes_home() / "logs" / "errors.log"
+            recent = scan_errors_log(errors_log)
+            for w in recent:
+                kind_label = "init" if w.kind == "init" else "refresh"
+                src = f"({w.type})" if w.type else ""
+                detail = f"{w.error}"
+                if w.stderr:
+                    # Trim noisy stderr to one short line for the doctor surface.
+                    stderr_one_line = " ".join(w.stderr.split())[:120]
+                    detail = f"{detail} — stderr: {stderr_one_line}"
+                check_info(
+                    f"gondolin secret {w.name} {kind_label} failure "
+                    f"{humanize_age(w.when)} {src}: {detail}"
+                )
+            if recent:
+                check_info(
+                    "Start a fresh gondolin session to re-attempt; "
+                    "tail errors.log for more context."
+                )
+        except Exception:  # noqa: BLE001 — defensive: never block doctor
+            pass
+
     # ------------------------------------------------------------------
     # Sandbox storage health (backend-agnostic).
     #
