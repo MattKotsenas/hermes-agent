@@ -110,18 +110,13 @@ def test_get_env_config_reads_gondolin_keys(monkeypatch):
     assert g["cpus"] == 1
 
 
-def test_get_env_config_defaults_for_gondolin(monkeypatch, _no_hermes_runtime_ref):
-    """When no gondolin env vars are set AND no hermes-runtime image is
-    built, the gondolin block is present but empty so downstream code
-    can use ``.get()`` uniformly. image=None means 'let Gondolin use
-    its own default (alpine-base:latest)'.
-
-    Real-world test: the ``_no_hermes_runtime_ref`` fixture moves any
-    existing ref aside for the duration of the test, then restores it.
-    No internal mocking — we exercise the actual resolution path
-    against gondolin's actual image store.
+def test_get_env_config_defaults_for_gondolin(monkeypatch):
+    """When no gondolin env vars are set, the gondolin block is present
+    with sane defaults. ``image`` carries the default-sentinel so
+    downstream resolution can tell "user didn't override" from "user
+    pinned a tag".
     """
-    from tools.terminal_tool import _get_env_config
+    from tools.terminal_tool import _DEFAULT_GONDOLIN_IMAGE, _get_env_config
 
     # Make sure no gondolin vars leak in from the surrounding shell.
     for k in (
@@ -142,32 +137,79 @@ def test_get_env_config_defaults_for_gondolin(monkeypatch, _no_hermes_runtime_re
     assert g["secrets"] == {}
     assert g["policy_script"] is None
     assert g["sandbox_dir"] is None
-    assert g["image"] is None
+    assert g["image"] is _DEFAULT_GONDOLIN_IMAGE
     assert g["memory"] is None
     assert g["cpus"] is None
 
 
-def test_get_env_config_resolves_hermes_runtime_when_built(
+def test_resolve_gondolin_image_returns_tag_when_built(
     monkeypatch, _hermes_runtime_ref_present
 ):
-    """When no explicit image override is set AND the hermes-runtime
-    image is present in gondolin's local store, _get_env_config picks
-    it up automatically. This is the user-facing payoff of
-    `hermes gondolin build`: build once, every session boots into the
-    image without a config edit.
+    """``_resolve_gondolin_image_or_raise(_DEFAULT_GONDOLIN_IMAGE)`` returns
+    the hermes-runtime tag when the image is present in gondolin's local
+    store.
 
-    Real-world test: ``_hermes_runtime_ref_present`` skips when
-    gondolin's store doesn't have the tag (CI without a build step),
-    otherwise just asserts the actual resolved value.
+    Skips when gondolin's store doesn't have the tag (CI without a build
+    step); on dev hosts that have run ``hermes gondolin build`` it
+    exercises the real resolution path.
     """
-    from tools.terminal_tool import _get_env_config
+    from tools.terminal_tool import (
+        _DEFAULT_GONDOLIN_IMAGE,
+        _resolve_gondolin_image_or_raise,
+    )
     from hermes_cli.gondolin_image import HERMES_RUNTIME_TAG
 
-    monkeypatch.delenv("TERMINAL_GONDOLIN_IMAGE", raising=False)
-    monkeypatch.setenv("TERMINAL_ENV", "gondolin")
+    assert _resolve_gondolin_image_or_raise(_DEFAULT_GONDOLIN_IMAGE) == HERMES_RUNTIME_TAG
 
-    cfg = _get_env_config()
-    assert cfg["gondolin"]["image"] == HERMES_RUNTIME_TAG
+
+def test_resolve_gondolin_image_raises_when_not_built(
+    monkeypatch, _no_hermes_runtime_ref
+):
+    """When the hermes-runtime tag isn't built and the user hasn't
+    overridden it, resolution raises with the actionable build command
+    instead of silently falling back to a python-less image.
+
+    Real-world test: ``_no_hermes_runtime_ref`` moves any existing ref
+    aside for the duration of the test, then restores it. No mocking —
+    we exercise the actual resolution path against the actual store.
+    """
+    from tools.terminal_tool import (
+        _DEFAULT_GONDOLIN_IMAGE,
+        _resolve_gondolin_image_or_raise,
+    )
+    from hermes_cli.gondolin_image import HERMES_RUNTIME_TAG
+
+    with pytest.raises(RuntimeError) as exc:
+        _resolve_gondolin_image_or_raise(_DEFAULT_GONDOLIN_IMAGE)
+    msg = str(exc.value)
+    # Must name the missing tag and the exact build command.
+    assert HERMES_RUNTIME_TAG in msg
+    assert "hermes gondolin build" in msg
+    # Must point at the override knob so a user who wants alpine-base
+    # or ubuntu-noble has a way out.
+    assert "terminal.gondolin.image" in msg
+
+
+def test_resolve_gondolin_image_passes_through_user_override():
+    """A user-pinned image (string) flows through untouched — no
+    presence check, no build prompt. They typed it; we trust it.
+    """
+    from tools.terminal_tool import _resolve_gondolin_image_or_raise
+
+    assert _resolve_gondolin_image_or_raise("ubuntu-noble:latest") == "ubuntu-noble:latest"
+    assert _resolve_gondolin_image_or_raise("/path/to/built/assets") == "/path/to/built/assets"
+
+
+def test_resolve_gondolin_image_rejects_garbage():
+    """Empty string or None as image is a misconfiguration; raise rather
+    than silently pick something.
+    """
+    from tools.terminal_tool import _resolve_gondolin_image_or_raise
+
+    with pytest.raises(RuntimeError, match="Invalid gondolin image"):
+        _resolve_gondolin_image_or_raise("")
+    with pytest.raises(RuntimeError, match="Invalid gondolin image"):
+        _resolve_gondolin_image_or_raise(None)
 
 
 def test_get_env_config_default_cwd_for_gondolin(monkeypatch):
@@ -264,6 +306,7 @@ def test_create_environment_propagates_lock_dir_for_cross_process_cap(tmp_path, 
         gondolin_config={
             "sandbox_dir": str(tmp_path / "vm-sandbox"),
             "stub_vm": True,
+            "image": "ubuntu-noble:latest",
         },
         task_id="test-lockdir",
     )
@@ -299,6 +342,7 @@ def test_create_environment_propagates_max_concurrent_vms_knob(tmp_path, monkeyp
             "sandbox_dir": str(tmp_path / "vm-sandbox"),
             "stub_vm": True,
             "max_concurrent_vms": 3,
+            "image": "ubuntu-noble:latest",
         },
         task_id="test-cap-knob",
     )

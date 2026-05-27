@@ -1097,9 +1097,14 @@ def _get_env_config() -> Dict[str, Any]:
         # Gondolin-specific config — surfaces TERMINAL_GONDOLIN_* env vars into
         # a structured block that _create_environment forwards to
         # GondolinEnvironment. allowed_hosts defaults to ["*"] (open with
-        # credential isolation) to match the design doc; tightening is opt-in.
-        # image=None means "let Gondolin use its own default
-        # (GONDOLIN_DEFAULT_IMAGE, currently alpine-base:latest)".
+        # Image resolution: explicit user override (TERMINAL_GONDOLIN_IMAGE
+        # or terminal.gondolin.image in config) wins; otherwise we resolve
+        # to the hermes-runtime tag. There is no "fall back to gondolin's
+        # own alpine-base default" path — alpine-base ships no python3,
+        # no bash, no node, which silently breaks execute_code and most
+        # skills downstream. If the tag isn't built, _create_environment
+        # raises with the actionable build command before we boot a VM.
+        # See docs/design/gondolin-terminal-backend.md § "Default image".
         "gondolin": {
             "allowed_hosts": _parse_env_var(
                 "TERMINAL_GONDOLIN_ALLOWED_HOSTS", '["*"]', json.loads, "valid JSON"
@@ -1109,20 +1114,7 @@ def _get_env_config() -> Dict[str, Any]:
             ),
             "policy_script": os.getenv("TERMINAL_GONDOLIN_POLICY_SCRIPT") or None,
             "sandbox_dir": os.getenv("TERMINAL_GONDOLIN_SANDBOX_DIR") or None,
-            # Image resolution: explicit user override (env / config) wins;
-            # otherwise default to the hermes-runtime tag IF it's built. If
-            # it isn't built, leave `image` as None so the daemon falls
-            # back to gondolin's own default (alpine-base) — same behavior
-            # as before this change, no regression. The doctor surfaces a
-            # one-line build prompt when the tag is missing; we don't
-            # auto-build here because that's a side-effect-bearing host
-            # operation (network, ~330 MB on disk) and gondolin's contract
-            # is opt-in. See docs/design/gondolin-terminal-backend.md
-            # § "Default image: first-run local build".
-            "image": (
-                os.getenv("TERMINAL_GONDOLIN_IMAGE")
-                or _resolve_default_gondolin_image()
-            ),
+            "image": os.getenv("TERMINAL_GONDOLIN_IMAGE") or _DEFAULT_GONDOLIN_IMAGE,
             # Per-VM resource caps; None means "let Gondolin use defaults
             # (1G memory, 2 cpus)". The knob exists so a user running many
             # parallel sessions on a memory-constrained host can dial these
@@ -1136,52 +1128,91 @@ def _get_env_config() -> Dict[str, Any]:
     }
 
 
-def _resolve_default_gondolin_image() -> str | None:
-    """Resolve the default gondolin image when no explicit override is set.
+# Sentinel for the gondolin image config: "use the hermes-runtime tag for
+# this Hermes version." Distinguishes "user explicitly set image to None"
+# (which we treat as "use default") from "user pinned a specific image"
+# (which skips the build check in _create_environment).
+class _DefaultGondolinImage:
+    def __repr__(self) -> str:
+        return "<default hermes-runtime>"
 
-    Returns the ``hermes-runtime:<version>`` tag iff it's currently
-    present in gondolin's local image store. Otherwise returns ``None``
-    so the daemon falls back to gondolin's own default (alpine-base).
+    def __bool__(self) -> bool:
+        # Falsy so any `if image:` check still sees "no explicit override".
+        return False
 
-    This matches today's behavior for a fresh install where the user
-    hasn't run ``hermes gondolin build`` yet: the daemon boots
-    alpine-base, ``execute_code`` surfaces its actionable error,
-    ``hermes doctor`` shows the build prompt. Once the user runs
-    ``hermes gondolin build``, the next session picks up
-    hermes-runtime automatically — no config edit required.
 
-    Defensive: any exception (missing gondolin CLI, missing node,
-    subprocess flake) yields ``None`` so a broken probe degrades to
-    today's fallback rather than blowing up backend construction.
+_DEFAULT_GONDOLIN_IMAGE = _DefaultGondolinImage()
+
+
+def _resolve_gondolin_image_or_raise(image: Any) -> str:
+    """Map the config's gondolin image setting to a concrete tag, or raise.
+
+    The contract is intentionally narrow:
+
+    - If ``image`` is :data:`_DEFAULT_GONDOLIN_IMAGE` (the sentinel set
+      when the user hasn't overridden it), resolve to the
+      ``hermes-runtime:<version>`` tag for the running Hermes. If the
+      tag isn't built in gondolin's local image store, raise
+      :class:`RuntimeError` with the exact build command. We do not
+      fall back to gondolin's own ``alpine-base:latest`` — that image
+      has no ``python3``/``bash``/``node`` and silently breaks
+      ``execute_code`` and most skills.
+    - If ``image`` is a non-empty string, treat it as a user-pinned
+      override and pass it through unchanged. Validation is the user's
+      job; they typed it.
+    - Any other shape (empty string, None passed explicitly, junk) is a
+      misconfiguration and raises.
     """
-    try:
-        from hermes_cli.gondolin_image import (
-            HERMES_RUNTIME_TAG,
-            is_hermes_runtime_present,
-        )
+    if isinstance(image, _DefaultGondolinImage):
+        try:
+            from hermes_cli.gondolin_image import (
+                HERMES_RUNTIME_BUILD_CONFIG,
+                HERMES_RUNTIME_TAG,
+                is_hermes_runtime_present,
+                missing_host_packages,
+            )
+        except ImportError as e:
+            raise RuntimeError(
+                f"Gondolin image helper not importable: {e}. "
+                "This indicates a broken Hermes install; "
+                "reinstall or check sys.path."
+            ) from e
         if is_hermes_runtime_present():
             return HERMES_RUNTIME_TAG
-        # Tag isn't built. Log a one-liner pointing at the fix so a
-        # later execute_code failure ("python3: not found") in the VM
-        # has breadcrumbs in agent.log. Logged at INFO so it shows up
-        # under `hermes logs` without polluting errors.log.
-        if not _GONDOLIN_DEFAULT_IMAGE_HINTED["done"]:
-            _GONDOLIN_DEFAULT_IMAGE_HINTED["done"] = True
-            logger.info(
-                "Gondolin image %s not built; falling back to gondolin's "
-                "alpine-base default (no python3). Run `hermes gondolin build` "
-                "for a python/node/uv-equipped VM.",
-                HERMES_RUNTIME_TAG,
-            )
-    except Exception:  # noqa: BLE001
-        pass
-    return None
-
-
-# Module-level memo so the "image not built" hint logs at most once per
-# process. The check itself is idempotent but a hot-path log spam would
-# bury other signal in agent.log.
-_GONDOLIN_DEFAULT_IMAGE_HINTED: Dict[str, bool] = {"done": False}
+        # Not built. Give the user the exact path forward, with the
+        # apt prereqs they'll hit if they haven't installed them.
+        missing = missing_host_packages()
+        msg_lines = [
+            f"Gondolin terminal backend needs the hermes-runtime image "
+            f"({HERMES_RUNTIME_TAG}), which is not built yet in your "
+            f"local gondolin image store.",
+            "",
+            "Build it with:",
+            "  hermes gondolin build",
+            "",
+            f"Spec: {HERMES_RUNTIME_BUILD_CONFIG}",
+        ]
+        if missing:
+            pkgs = " ".join(missing)
+            msg_lines.extend([
+                "",
+                f"The build also needs these host packages on $PATH: {pkgs}",
+                f"  sudo apt-get install -y {pkgs}",
+            ])
+        msg_lines.extend([
+            "",
+            "To bypass and pin a different image (e.g. ubuntu-noble:latest "
+            "or your own build), set `terminal.gondolin.image` in "
+            "~/.hermes/config.yaml or export TERMINAL_GONDOLIN_IMAGE.",
+        ])
+        raise RuntimeError("\n".join(msg_lines))
+    if isinstance(image, str) and image:
+        return image
+    raise RuntimeError(
+        f"Invalid gondolin image configuration: {image!r}. "
+        "Set `terminal.gondolin.image` to a tag, a path to built assets, "
+        "or leave it unset to use the default hermes-runtime image."
+    )
 
 
 def _get_modal_backend_state(modal_mode: object | None) -> Dict[str, Any]:
@@ -1360,10 +1391,12 @@ def _create_environment(env_type: str, image: str, cwd: str, timeout: int,
             "secrets": gc.get("secrets", {}),
             "policy_script": gc.get("policy_script"),
         }
-        # `image` is optional — only forward when set so the daemon (and
-        # Gondolin) falls back to GONDOLIN_DEFAULT_IMAGE otherwise.
-        if gc.get("image"):
-            daemon_config["image"] = gc["image"]
+        # `image` is required end-to-end: either the user pinned a tag /
+        # path, or _get_env_config left the sentinel in place and we
+        # resolve to the hermes-runtime tag now (raising if it's not
+        # built). The daemon never sees the sentinel; it always gets a
+        # concrete string.
+        daemon_config["image"] = _resolve_gondolin_image_or_raise(gc.get("image"))
         # Per-VM resource caps. Forward only when explicitly configured so
         # Gondolin's defaults (1G / 2 cpus) apply otherwise.
         if gc.get("memory"):

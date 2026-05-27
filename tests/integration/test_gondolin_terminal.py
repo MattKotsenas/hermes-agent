@@ -233,9 +233,8 @@ def test_daemon_socket_not_visible_in_guest_workspace(gondolin_env_workspace):
     reason=(
         "execute_code requires python3 in the guest. The hermes-runtime "
         "image (built via `hermes gondolin build`) ships python3. Without "
-        "that tag, the gondolin backend falls back to alpine-base which "
-        "has no python3 and execute_code refuses. Build the image to "
-        "exercise this test."
+        "that tag, the gondolin backend raises at construction. Build the "
+        "image to exercise this test."
     ),
 )
 def test_execute_code_round_trip(gondolin_env_with_python):

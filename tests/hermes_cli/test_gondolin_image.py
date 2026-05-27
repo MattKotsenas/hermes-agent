@@ -4,10 +4,11 @@ Behavioural-only — no monkey-patching of internal helpers. The defensive
 exception-swallowing branches in ``is_hermes_runtime_present`` and
 ``run_build`` aren't tested because exercising them requires patching
 ``subprocess.run`` or ``shutil.which``, which would test the mock and
-not the code. Those branches exist to make sure a probe failure
-degrades to today's fallback (alpine-base) rather than crashing backend
-construction; that contract is checked end-to-end in the
-``test_execute_code_round_trip`` integration test.
+not the code. Those branches exist so a probe failure raises a clean
+RuntimeError at backend construction (with the build command) rather
+than crashing with a stack trace; that contract is checked end-to-end
+in the ``test_execute_code_round_trip`` integration test and the
+``test_resolve_gondolin_image_raises_when_not_built`` wiring test.
 """
 
 from __future__ import annotations

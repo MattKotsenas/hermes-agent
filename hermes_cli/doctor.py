@@ -1294,14 +1294,12 @@ def run_doctor(args):
         # hermes-runtime image: the gondolin backend's default image.
         # We don't auto-build (the build is a side-effect-bearing host
         # operation that writes ~330 MB to ~/.cache/gondolin/ and pulls
-        # from upstream Alpine + libkrunfw mirrors). Instead surface a
-        # one-line build command if the tag is missing, and the precise
-        # apt-install command if the host packages gondolin needs aren't
-        # present. Both are non-fatal — the gondolin backend falls back
-        # to alpine-base:latest if hermes-runtime isn't built, and the
-        # built-in execute_code tool still surfaces its own actionable
-        # error on the alpine-base fallback. See
-        # docs/design/gondolin-terminal-backend.md § "Default image".
+        # from upstream Alpine + libkrunfw mirrors). Missing host
+        # packages AND a missing image are both errors now: the gondolin
+        # backend raises at construction if the user hasn't pinned an
+        # override, so doctor's job is to flag the misconfiguration up
+        # front rather than wait for the first execute_code attempt.
+        # See docs/design/gondolin-terminal-backend.md § "Default image".
         if not os.getenv("TERMINAL_GONDOLIN_IMAGE", "").strip():
             try:
                 from hermes_cli.gondolin_image import (
@@ -1312,23 +1310,29 @@ def run_doctor(args):
                 missing_pkgs = missing_host_packages()
                 if missing_pkgs:
                     pkgs = " ".join(missing_pkgs)
-                    check_info(
-                        f"gondolin: hermes-runtime image build needs host "
-                        f"packages: {pkgs}. Install with: "
-                        f"sudo apt-get install -y {pkgs}"
+                    _fail_and_issue(
+                        f"gondolin: hermes-runtime image build needs host packages: {pkgs}",
+                        f"sudo apt-get install -y {pkgs}, then: hermes gondolin build",
+                        f"Install gondolin build deps ({pkgs}) and run 'hermes gondolin build'",
+                        issues,
                     )
                 elif not is_hermes_runtime_present():
-                    check_info(
-                        f"gondolin: {HERMES_RUNTIME_TAG} not built. "
-                        f"Run: hermes gondolin build "
-                        f"(~10s, ~330 MB local cache). "
-                        f"Until built, execute_code falls back to "
-                        f"alpine-base (no python3) and will refuse."
+                    _fail_and_issue(
+                        f"gondolin: {HERMES_RUNTIME_TAG} not built",
+                        "Backend raises at construction until built (~10s, ~330 MB)",
+                        "Run 'hermes gondolin build' to build the hermes-runtime image",
+                        issues,
                     )
                 else:
                     check_ok(f"gondolin image", f"({HERMES_RUNTIME_TAG} present)")
             except Exception:  # noqa: BLE001 — defensive: never block doctor
                 pass
+        else:
+            check_info(
+                f"gondolin image: pinned by TERMINAL_GONDOLIN_IMAGE "
+                f"({os.getenv('TERMINAL_GONDOLIN_IMAGE')!r}); hermes-runtime "
+                f"check skipped"
+            )
 
         # Recent gondolin secret resolution warnings — surfaced from
         # errors.log so the user sees init-time and refresh-time failures

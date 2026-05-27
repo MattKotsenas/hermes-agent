@@ -473,11 +473,11 @@ terminal:
     # --- VM resources (forwarded to Gondolin's VMOptions) ---
     memory: null                 # e.g. "256M", "1G"; null = Gondolin default (1G)
     cpus: null                   # integer; null = Gondolin default (2)
-    image: null                  # null = auto-resolve to hermes-runtime:<hermes version>
-                                 #   when present in Gondolin's local image store
-                                 #   (built by `hermes setup` or `hermes gondolin build`),
-                                 #   falling back to Gondolin's own default
-                                 #   ("alpine-base:latest") if not.
+    image: null                  # null = use the default hermes-runtime image
+                                 #   for this Hermes version. Built by
+                                 #   `hermes setup` or `hermes gondolin build`.
+                                 #   Backend construction RAISES if the tag
+                                 #   isn't built — no silent fallback.
                                  # Override with a registry selector
                                  #   ("ubuntu-noble:latest") or an absolute
                                  #   directory of built assets.
@@ -533,7 +533,7 @@ terminal:
 
 Run `hermes doctor` after configuring — it probes all of the above plus the running daemon and surfaces any unresolved or stale secrets it finds in `errors.log`.
 
-**Default image (`hermes-runtime`):** With `image: null` (the default), Hermes resolves to a tag of the form `hermes-runtime:<hermes version>` whenever that image is built in Gondolin's local store (`~/.cache/gondolin/`). The build spec is pinned in `tools/environments/gondolin_host/hermes-runtime.json` (Alpine 3.23 + `python3` + `nodejs` + `npm` + `uv` + `bash` + `curl` + `openssh` + `ca-certs`) and the image is ~330 MB. `hermes setup` offers to build it inline (~10 s on a clean WSL2 host) when you pick the Gondolin backend; if you skip that step or upgrade Hermes (which versions the tag), run `hermes gondolin build` to (re)build. While the tag is missing, Hermes falls back to Gondolin's own `alpine-base:latest` and logs a one-shot hint to `agent.log`. The `alpine-base` fallback has no `python3`, so `execute_code` and Python-based skills will fail inside the VM until the runtime image is built.
+**Default image (`hermes-runtime`):** With `image: null` (the default), Hermes resolves to a tag of the form `hermes-runtime:<hermes version>`. The build spec is pinned in `tools/environments/gondolin_host/hermes-runtime.json` (Alpine 3.23 + `python3` + `nodejs` + `npm` + `uv` + `bash` + `curl` + `openssh` + `ca-certs`) and the image is ~330 MB. `hermes setup` offers to build it inline (~10 s on a clean WSL2 host) when you pick the Gondolin backend; if you skip that step or upgrade Hermes (which versions the tag), run `hermes gondolin build` to (re)build. **If the tag isn't built, the next call into the gondolin backend raises with the exact build command** — there is no silent fallback to a python-less image.
 
 **Custom images:** Two supported paths:
 
@@ -552,7 +552,6 @@ Run `hermes doctor` after configuring — it probes all of the above plus the ru
 
 **Limitations:**
 - Linux/WSL2 only. No native Windows or macOS path.
-- `execute_code` (in-VM Python REPL) and Python-based skills need `python3` inside the VM. The default `hermes-runtime` image ships it; the fallback `alpine-base:latest` does not. See the "Default image" subsection above.
 - VM-internal state (installed packages, running daemons) does NOT survive across `hermes --resume`. Sandbox-dir files do.
 - `delegate_task` subagents always get their own VM (isolation contract, same as other backends).
 

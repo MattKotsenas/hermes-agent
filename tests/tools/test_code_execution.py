@@ -177,9 +177,11 @@ class TestExecuteCodeRemoteTempDir(unittest.TestCase):
 
 class TestExecuteCodeMissingPython(unittest.TestCase):
     """When the remote backend's `command -v python3` returns nothing, we
-    surface a backend-specific actionable error. Gondolin's default
-    alpine-base image has no python3, so the error must point at the
-    config knob, not just say 'install python'."""
+    surface a backend-specific actionable error. For gondolin this branch
+    only fires when the user has pinned `terminal.gondolin.image` to a
+    python-less image (the default hermes-runtime ships python3, and an
+    unbuilt default raises at backend construction). The error must
+    point at the override they set."""
 
     def _run_remote_without_python(self, env_type):
         class FakeEnv:
@@ -201,18 +203,21 @@ class TestExecuteCodeMissingPython(unittest.TestCase):
 
     def test_gondolin_error_mentions_image_config(self):
         """Gondolin path must mention `terminal.gondolin.image` so the user
-        knows the config knob. Regression for the smoke that revealed this."""
+        can fix the pinned image. Regression for the smoke that revealed
+        this on alpine-base."""
         result = self._run_remote_without_python("gondolin")
         self.assertEqual(result["status"], "error")
-        self.assertIn("alpine-base", result["error"])
         self.assertIn("terminal.gondolin.image", result["error"])
+        # And point at the working default so a user who pinned out of
+        # desperation has the "unset and you get python" off-ramp.
+        self.assertIn("hermes-runtime", result["error"])
 
     def test_generic_backend_falls_through_to_generic_hint(self):
         """Non-gondolin backends keep the original 'install Python' guidance."""
         result = self._run_remote_without_python("docker")
         self.assertEqual(result["status"], "error")
         self.assertIn("Install Python", result["error"])
-        self.assertNotIn("alpine-base", result["error"])
+        self.assertNotIn("terminal.gondolin.image", result["error"])
 
 
 @unittest.skipIf(sys.platform == "win32", "UDS not available on Windows")

@@ -881,16 +881,17 @@ def _execute_remote(
             cwd="/", timeout=15,
         )
         if "OK" not in py_check.get("output", ""):
-            # Backend-specific actionable hint. For gondolin, the default
-            # alpine-base image ships without python3 — pointing the user
-            # at the right config knob saves a doc dive.
+            # Backend-specific actionable hint. For gondolin, hitting this
+            # branch implies the user pinned `terminal.gondolin.image` to
+            # something without python3 (the default hermes-runtime ships
+            # it, and an unbuilt default would have raised at backend
+            # construction). Point them at the override they set.
             if env_type == "gondolin":
                 hint = (
-                    " The default Gondolin image (alpine-base) does not "
-                    "include python3. Build a custom image with python3 "
-                    "installed and point `terminal.gondolin.image` at it, "
-                    "or use the `terminal` tool instead of execute_code "
-                    "for shell-based work."
+                    " The image pinned at `terminal.gondolin.image` has no "
+                    "python3. Unset the override to use the default "
+                    "hermes-runtime image (ships python3 + node + uv), or "
+                    "rebuild your custom image with python3 installed."
                 )
             else:
                 hint = " Install Python to use execute_code with remote backends."
