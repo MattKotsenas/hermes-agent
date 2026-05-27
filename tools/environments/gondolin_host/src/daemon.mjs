@@ -104,6 +104,47 @@ const handlers = {
       workspaceMount = { guestPath, hostPath };
     }
 
+    // Optional additional host->guest mounts. Each entry is
+    // { guest_path, host_path, readonly }. Used by Hermes to project
+    // ~/.hermes/skills/ and individual credential files into the guest
+    // (matches what docker/singularity already do via
+    // tools/credential_files.py). Validation here is identical to
+    // workspace_mount: paths are checked at init so config bugs surface
+    // before the VM boots.
+    const extraMounts = [];
+    if (Array.isArray(config.extra_mounts)) {
+      for (const entry of config.extra_mounts) {
+        const guestPath = entry?.guest_path;
+        const hostPath = entry?.host_path;
+        const readonly = entry?.readonly !== false;  // default true
+        if (typeof guestPath !== "string" || !guestPath.startsWith("/")) {
+          throw new Error(
+            "extra_mounts[].guest_path must be an absolute path string",
+          );
+        }
+        if (typeof hostPath !== "string" || hostPath.length === 0) {
+          throw new Error("extra_mounts[].host_path must be a non-empty string");
+        }
+        try {
+          const stat = fs.statSync(hostPath);
+          // Allow files too — credential files mount as individual files.
+          if (!stat.isDirectory() && !stat.isFile()) {
+            throw new Error(
+              `extra_mounts[].host_path is not a file or directory: ${hostPath}`,
+            );
+          }
+        } catch (e) {
+          if (e.code === "ENOENT") {
+            throw new Error(
+              `extra_mounts[].host_path does not exist: ${hostPath}`,
+            );
+          }
+          throw e;
+        }
+        extraMounts.push({ guestPath, hostPath, readonly });
+      }
+    }
+
     if (STUB_VM) {
       vm = {
         async exec(cmd) {
@@ -207,7 +248,7 @@ const handlers = {
       imagePath,
       workspaceMount,
     });
-    const { VM, createHttpHooks, RealFSProvider } = await loadGondolin();
+    const { VM, createHttpHooks, RealFSProvider, ReadonlyProvider } = await loadGondolin();
     const hooksResult = createHttpHooks(hooksInput);
     const { httpHooks, env } = hooksResult;
     secretManager = hooksResult.secretManager;
@@ -216,6 +257,7 @@ const handlers = {
       // SandboxServerOptions hangs off VMOptions.sandbox.
       vmOptions.sandbox = { imagePath };
     }
+    const mounts = {};
     if (workspaceMount != null) {
       // vfs.mounts is a Record<guestPath, VirtualProvider>. RealFSProvider
       // exposes a host directory directly. Gondolin's sandboxfs init script
@@ -224,11 +266,18 @@ const handlers = {
       // and SandboxFsConfig.fuseBinds). For the agent, this means files
       // written under workspaceMount.guestPath inside the VM appear under
       // workspaceMount.hostPath on the host, and vice versa.
-      vmOptions.vfs = {
-        mounts: {
-          [workspaceMount.guestPath]: new RealFSProvider(workspaceMount.hostPath),
-        },
-      };
+      mounts[workspaceMount.guestPath] = new RealFSProvider(workspaceMount.hostPath);
+    }
+    for (const em of extraMounts) {
+      // ReadonlyProvider wraps a RealFSProvider and rejects writes with
+      // EROFS. The guest can read but not modify host content — matches
+      // the read-only bind mounts docker/singularity use for skills/
+      // credential files.
+      const real = new RealFSProvider(em.hostPath);
+      mounts[em.guestPath] = em.readonly ? new ReadonlyProvider(real) : real;
+    }
+    if (Object.keys(mounts).length > 0) {
+      vmOptions.vfs = { mounts };
     }
     if (memory != null) vmOptions.memory = memory;
     if (cpus != null) vmOptions.cpus = cpus;

@@ -663,3 +663,91 @@ def test_run_bash_can_opt_out_of_streaming(tmp_path):
         assert proc.returncode == 0
     finally:
         env.cleanup()
+
+
+# ---- Skill + credential file projection ----------------------------------
+#
+# docker/singularity/modal bind-mount ~/.hermes/skills/ and individual
+# credential files (OAuth tokens, etc.) read-only into the sandbox via
+# tools/credential_files.py.  GondolinEnvironment must do the same via
+# extra_mounts so terminal.backend=gondolin reaches parity with the other
+# remote backends without per-skill changes.
+
+@requires_node
+def test_skill_directory_mounts_are_projected_by_default(stub_env_factory, monkeypatch, tmp_path):
+    """get_skills_directory_mount() entries land in extra_mounts as
+    read-only directory mounts."""
+    skills_host = tmp_path / "skills"; skills_host.mkdir()
+    ext_host = tmp_path / "external_skills" / "0"; ext_host.mkdir(parents=True)
+    fake_skill_mounts = [
+        {"host_path": str(skills_host), "container_path": "/root/.hermes/skills"},
+        {"host_path": str(ext_host), "container_path": "/root/.hermes/external_skills/0"},
+    ]
+    monkeypatch.setattr(
+        "tools.credential_files.get_skills_directory_mount",
+        lambda **kw: fake_skill_mounts,
+    )
+    monkeypatch.setattr(
+        "tools.credential_files.get_credential_file_mounts",
+        lambda: [],
+    )
+    env = stub_env_factory()
+    mounts = env.config.get("extra_mounts") or []
+    guest_paths = sorted(m["guest_path"] for m in mounts)
+    assert guest_paths == ["/root/.hermes/external_skills/0", "/root/.hermes/skills"]
+    assert all(m["readonly"] is True for m in mounts)
+
+
+@requires_node
+def test_credential_files_grouped_by_parent_dir(stub_env_factory, monkeypatch, tmp_path):
+    """Individual credential files mount as their parent directory.
+
+    Gondolin's RealFSProvider takes a directory rootPath, so a per-file
+    bind-mount á la docker -v $f:$g:ro doesn't translate. GondolinEnvironment
+    groups credentials by guest parent path and mounts that directory
+    read-only.
+    """
+    gcloud_dir = tmp_path / "gcloud"; gcloud_dir.mkdir()
+    (gcloud_dir / "credentials.json").write_text("{}")
+    (gcloud_dir / "access_tokens.db").write_text("")
+    op_dir = tmp_path / "op"; op_dir.mkdir()
+    (op_dir / "session.json").write_text("{}")
+    fake_credentials = [
+        {"host_path": str(gcloud_dir / "credentials.json"), "container_path": "/root/.config/gcloud/credentials.json"},
+        # A second file under the same guest parent — should collapse to one mount.
+        {"host_path": str(gcloud_dir / "access_tokens.db"), "container_path": "/root/.config/gcloud/access_tokens.db"},
+        # Different guest parent — gets its own mount.
+        {"host_path": str(op_dir / "session.json"), "container_path": "/root/.op/session.json"},
+    ]
+    monkeypatch.setattr(
+        "tools.credential_files.get_skills_directory_mount",
+        lambda **kw: [],
+    )
+    monkeypatch.setattr(
+        "tools.credential_files.get_credential_file_mounts",
+        lambda: fake_credentials,
+    )
+    env = stub_env_factory()
+    mounts = env.config.get("extra_mounts") or []
+    guest_paths = sorted(m["guest_path"] for m in mounts)
+    assert guest_paths == ["/root/.config/gcloud", "/root/.op"]
+    assert all(m["readonly"] is True for m in mounts)
+
+
+@requires_node
+def test_projection_can_be_disabled(stub_env_factory, monkeypatch, tmp_path):
+    """Setting project_skills/project_credentials to False suppresses
+    the auto-projection — useful for paranoid configs."""
+    skills_host = tmp_path / "skills"; skills_host.mkdir()
+    cred_dir = tmp_path / "creds"; cred_dir.mkdir()
+    (cred_dir / "f").write_text("")
+    monkeypatch.setattr(
+        "tools.credential_files.get_skills_directory_mount",
+        lambda **kw: [{"host_path": str(skills_host), "container_path": "/y"}],
+    )
+    monkeypatch.setattr(
+        "tools.credential_files.get_credential_file_mounts",
+        lambda: [{"host_path": str(cred_dir / "f"), "container_path": "/c/d"}],
+    )
+    env = stub_env_factory(config={"project_skills": False, "project_credentials": False})
+    assert "extra_mounts" not in env.config

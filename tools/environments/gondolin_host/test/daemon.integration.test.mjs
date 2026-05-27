@@ -169,3 +169,104 @@ test("daemon: credential injection works through the RPC layer", { skip: skipRea
     await h.stop();
   }
 });
+
+test("daemon: read-only extra_mounts let the guest read host files but reject writes", { skip: skipReason }, async () => {
+  // Spike for the skill-projection problem: docker/singularity bind-mount
+  // ~/.hermes/skills/ read-only into the sandbox. Does gondolin's
+  // ReadonlyProvider(RealFSProvider(host)) layered into vfs.mounts give
+  // us the same property?  Two assertions matter:
+  //   1. The guest can stat + cat host files at the mount point.
+  //   2. Write attempts surface as EROFS (Read-only file system).
+
+  const tmpHost = mkdtempSync(path.join(os.tmpdir(), "gondolin-ro-mount-"));
+  // Drop a file in the host directory before boot.
+  const fs2 = await import("node:fs");
+  fs2.writeFileSync(path.join(tmpHost, "hello.txt"), "from-host-readonly\n", "utf8");
+
+  const h = new DaemonHarness();
+  await h.start();
+  try {
+    const init = await h.call("init", {
+      config: {
+        extra_mounts: [
+          { guest_path: "/mnt/ro", host_path: tmpHost, readonly: true },
+        ],
+      },
+    }, 120_000);
+    assert.equal(init.error, undefined, `init failed: ${JSON.stringify(init.error)}`);
+
+    // (1) Read the host file from the guest.
+    const r1 = await h.call("exec", {
+      cmd: "cat /mnt/ro/hello.txt",
+    }, 60_000);
+    assert.equal(r1.error, undefined);
+    assert.equal(r1.result.exit_code, 0, `cat stderr: ${r1.result.stderr}`);
+    assert.match(r1.result.stdout, /from-host-readonly/);
+
+    // (2) Attempt to write at the same mount — must fail.
+    const r2 = await h.call("exec", {
+      cmd: "echo guest-write > /mnt/ro/hello.txt; echo rc=$?",
+    }, 60_000);
+    assert.equal(r2.error, undefined);
+    // The shell's `>` redirect fails; echo rc=N reports the failure.
+    // Different kernels/libcs map EROFS to slightly different shell
+    // messages, but `rc=0` would mean the write succeeded — that's what
+    // we mainly want to disprove.
+    assert.doesNotMatch(r2.result.stdout, /^rc=0$/m, "write to ro mount should fail");
+
+    // (3) Confirm the host file is unchanged.
+    const onHost = fs2.readFileSync(path.join(tmpHost, "hello.txt"), "utf8");
+    assert.equal(onHost, "from-host-readonly\n", "host file must be unchanged");
+
+    await h.call("shutdown", {}, 30_000);
+  } finally {
+    await h.stop();
+    rmSync(tmpHost, { recursive: true, force: true });
+  }
+});
+
+test("daemon: multiple extra_mounts coexist with workspace_mount", { skip: skipReason }, async () => {
+  // The mount infrastructure must support layering many mounts at
+  // different guest paths (skills/ plus the writable workspace).  This
+  // test boots with two mounts active.  Individual-file mounts are
+  // covered in a separate test — they may need different handling
+  // depending on what Gondolin's VFS supports.
+
+  const fs2 = await import("node:fs");
+  const tmpWs = mkdtempSync(path.join(os.tmpdir(), "gondolin-mm-ws-"));
+  const tmpSkills = mkdtempSync(path.join(os.tmpdir(), "gondolin-mm-skills-"));
+  fs2.writeFileSync(path.join(tmpSkills, "marker.md"), "skills-marker\n", "utf8");
+
+  const h = new DaemonHarness();
+  await h.start();
+  try {
+    const init = await h.call("init", {
+      config: {
+        workspace_mount: { guest_path: "/workspace", host_path: tmpWs },
+        extra_mounts: [
+          { guest_path: "/root/.hermes/skills", host_path: tmpSkills, readonly: true },
+        ],
+      },
+    }, 120_000);
+    assert.equal(init.error, undefined, `init failed: ${JSON.stringify(init.error)}`);
+
+    // Skills dir reads.
+    const r1 = await h.call("exec", { cmd: "cat /root/.hermes/skills/marker.md" }, 60_000);
+    assert.equal(r1.result.exit_code, 0, `stderr: ${r1.result.stderr}`);
+    assert.match(r1.result.stdout, /skills-marker/);
+
+    // Workspace stays writable.
+    const r3 = await h.call("exec", { cmd: "echo workspace-write > /workspace/test.txt && cat /workspace/test.txt" }, 60_000);
+    assert.equal(r3.result.exit_code, 0);
+    assert.match(r3.result.stdout, /workspace-write/);
+    // And the file landed on the host.
+    const onHost = fs2.readFileSync(path.join(tmpWs, "test.txt"), "utf8");
+    assert.equal(onHost, "workspace-write\n");
+
+    await h.call("shutdown", {}, 30_000);
+  } finally {
+    await h.stop();
+    rmSync(tmpWs, { recursive: true, force: true });
+    rmSync(tmpSkills, { recursive: true, force: true });
+  }
+});

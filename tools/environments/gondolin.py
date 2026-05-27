@@ -372,6 +372,82 @@ class GondolinEnvironment(BaseEnvironment):
             # non-dict and trip its validation.
             self.config.pop("workspace_mount")
 
+        # Hermes-wide skill + credential projection. docker/singularity
+        # bind-mount these into the sandbox so skills can reference their
+        # own scripts and authenticated CLIs (gh, gcloud, op) find the
+        # credential files they expect. Gondolin's vfs.mounts gives us
+        # the same primitive via ReadonlyProvider(RealFSProvider(path)).
+        # The daemon-side `extra_mounts` config key takes a list of
+        # {guest_path, host_path, readonly} entries; we populate it from
+        # tools/credential_files.py here so a user setting
+        # `terminal.backend: gondolin` gets parity with the other
+        # sandbox backends without further config.
+        #
+        # Users can opt out by setting `project_skills: False` or
+        # `project_credentials: False` in the gondolin config — useful
+        # for paranoid setups where the sandbox should be as bare as
+        # possible.
+        project_skills = self.config.pop("project_skills", True)
+        project_credentials = self.config.pop("project_credentials", True)
+        extra_mounts = list(self.config.get("extra_mounts") or [])
+        if project_skills or project_credentials:
+            try:
+                from tools.credential_files import (
+                    get_credential_file_mounts,
+                    get_skills_directory_mount,
+                )
+            except ImportError:
+                # Hermes core may not be importable in unusual test
+                # configs (e.g. running the daemon standalone). Fall
+                # through without skills/credentials — the agent still
+                # has a working VM.
+                get_credential_file_mounts = lambda: []
+                get_skills_directory_mount = lambda: []
+            if project_skills:
+                for m in get_skills_directory_mount():
+                    extra_mounts.append({
+                        "guest_path": m["container_path"],
+                        "host_path": m["host_path"],
+                        "readonly": True,
+                    })
+            if project_credentials:
+                # Credential files are individual files. Gondolin's
+                # RealFSProvider takes a directory rootPath, so mounting
+                # a single file via vfs.mounts doesn't work the way
+                # docker's -v $f:$g:ro does — the daemon-side validation
+                # accepts files, but gondolin's RealFSProvider does not.
+                # As a workaround, group credential files by their
+                # parent directory: mount the parent read-only and the
+                # file is reachable through it. Most credential files
+                # live in dedicated config dirs (~/.config/gcloud/,
+                # ~/.config/gh/, ~/.op/) so this works out cleanly. For
+                # entries where parent grouping would cause path
+                # collisions, the per-credential mount is skipped and a
+                # WARN is logged — the user can mount that credential
+                # via wire-injected `secrets:` instead.
+                seen_parents: dict[str, str] = {}
+                for m in get_credential_file_mounts():
+                    host_parent = os.path.dirname(m["host_path"])
+                    guest_parent = os.path.dirname(m["container_path"])
+                    if not host_parent or not guest_parent:
+                        continue
+                    if guest_parent in seen_parents and seen_parents[guest_parent] != host_parent:
+                        logger.warning(
+                            "gondolin: skipping credential mount %s (guest parent %s already maps to %s)",
+                            m["container_path"], guest_parent, seen_parents[guest_parent],
+                        )
+                        continue
+                    if guest_parent in seen_parents:
+                        continue
+                    seen_parents[guest_parent] = host_parent
+                    extra_mounts.append({
+                        "guest_path": guest_parent,
+                        "host_path": host_parent,
+                        "readonly": True,
+                    })
+        if extra_mounts:
+            self.config["extra_mounts"] = extra_mounts
+
         # Captured from the init response; useful for tests and for
         # higher-level code that wants to know where the workspace lives.
         # None when workspace_mount is disabled.

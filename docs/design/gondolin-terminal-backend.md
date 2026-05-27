@@ -209,21 +209,53 @@ daemon skips VFS wiring entirely — useful for power users whose
 
 ### Hermes runtime files
 
-Hermes's own runtime (`~/.hermes/skills/`, `~/.hermes/state.db`,
-`~/.hermes/config.yaml`, etc.) is NOT inside the sandbox. The agent
-cannot reach it via file tools when `terminal.backend: gondolin`,
-because file tools route through the environment.
+`~/.hermes/skills/` and individual credential files (OAuth tokens,
+session DBs, CLI config) ARE projected into the guest, read-only, at the
+same paths docker/singularity use (`/root/.hermes/skills/`, etc.). This
+matches the cross-sandbox convention defined by
+`tools/credential_files.py`:
 
-This is correct: skills, memory, and session state are Hermes-managed
-surfaces with their own tools (`skill_view`, `memory`, `session_search`)
-that run host-side. The agent gets to them via dedicated tools, not via
-filesystem.
+- **`get_skills_directory_mount()`** returns the host paths for
+  `~/.hermes/skills/` and any external skill directories the user has
+  configured. Gondolin mounts each as a `ReadonlyProvider(RealFSProvider)`
+  at the matching guest path. Symlinks are sanitized into a temp copy by
+  `tools/credential_files.py` before mounting, so a malicious symlink in
+  the skills tree can't exfil arbitrary host files.
+- **`get_credential_file_mounts()`** returns individual credential files
+  registered by skills (Google OAuth, 1Password CLI session, `gh` auth
+  config, etc.) or declared by the user in `terminal.credential_files:`.
 
-Open question: does this break any existing skill that does
-`read_file('~/.hermes/skills/foo/SKILL.md')`? Audit needed. Most skills
-use `skill_view` which is host-side. If any skills directly access
-`~/.hermes/`, they'll need updating or the user accepts that those
-skills require `terminal.backend: local`.
+  Gondolin's `RealFSProvider` takes a directory `rootPath`, not a single
+  file — so unlike docker's `-v $f:$g:ro`, we can't mount a credential
+  file directly. The Python wrapper groups credential files by their
+  guest parent directory and mounts that parent read-only. Most
+  credential files already live in dedicated config dirs
+  (`~/.config/gcloud/`, `~/.config/gh/`, `~/.op/`) so this works out
+  cleanly. If two credentials share a guest parent path but resolve to
+  different host parents, the second is skipped with a WARN — the user
+  can route that credential via wire-injected `secrets:` instead.
+
+The writable workspace at `cwd` is unchanged: a `RealFSProvider` bind
+mount (no readonly wrap) on the per-session sandbox subdir.
+
+State that intentionally stays host-side (and is reachable only via the
+respective Hermes-managed tools, not the guest filesystem):
+`~/.hermes/state.db` (`session_search`), `~/.hermes/config.yaml`
+(host-side config), `~/.hermes/memory.json` and friends (`memory` tool),
+`~/.hermes/.env` (host environment / wire-injection source).
+
+Config knobs:
+
+- `terminal.gondolin.project_skills` (default `true`) — set false to
+  suppress the skills-directory mount. Useful for paranoid setups where
+  the sandbox should be as bare as possible.
+- `terminal.gondolin.project_credentials` (default `true`) — set false
+  to suppress credential-file projection.
+- `terminal.gondolin.extra_mounts: [{guest_path, host_path, readonly}]`
+  — explicit additional mounts for arbitrary host directories. Each
+  entry is validated at init (path must exist, guest_path must be
+  absolute); `readonly: true` is default, wrap in
+  `ReadonlyProvider(RealFSProvider)` on the daemon side.
 
 ### Persistence semantics
 
@@ -647,18 +679,34 @@ injected into the sandbox if configured.
    directly will break under gondolin backend. Either patch those
    skills to use `skill_view`, or document the incompatibility.
 
-   **Deferred to backend-switch time (2026-05-26).** Two broad
-   categories surface today: (a) skill-bundled scripts referenced
-   as `~/.hermes/skills/<name>/scripts/...` which won't be present
-   in the guest filesystem, and (b) the github-skill family's
-   `~/.hermes/.env` bootstrap which silently falls through to
-   `AUTH_METHOD=none` instead of relying on wire-injection. Both
-   are blocked on (3) landing: (a) needs a story for how skill
-   scripts get into the guest (auto-mounted under
-   `/etc/hermes/skills/`? rewritten in the system prompt? individual
-   per-skill copy?), and (b) needs env-var binding + multi-identity
-   so the github bootstrap can produce `AUTH_METHOD=gh` with a
-   wire-injected placeholder. Re-open this item alongside (3).
+   **Closed (2026-05-27).** Originally framed as "audit and patch
+   each skill"; on review, the actual gap was infrastructural — the
+   gondolin backend was missing a piece every other sandbox backend
+   already has. `tools/credential_files.py` exposes
+   `get_skills_directory_mount()` and `get_credential_file_mounts()`,
+   both already consumed by `docker.py`, `singularity.py`,
+   `modal.py`, and `managed_modal.py` to bind-mount `~/.hermes/skills/`
+   and individual credential files read-only into the sandbox.
+   Gondolin was wired for the workspace mount only.
+
+   Fix: validated that Gondolin's
+   `ReadonlyProvider(RealFSProvider(hostPath))` layered into
+   `vfs.mounts` gives the same read-only semantics as docker's
+   `:ro` (KVM integration tests prove read works, write rejected
+   with EROFS, host file unchanged). Added a daemon-side
+   `extra_mounts` config key and a Python-side wiring that
+   populates it from the two existing helpers. See §Hermes runtime
+   files above for the user-facing config surface and §Skill
+   compatibility note below for what this means for the categories
+   originally flagged in the deferral.
+
+   The `~/.hermes/.env` credential fallthrough (the original (b)
+   case) is a cross-sandbox bug, not gondolin-specific — `.env`
+   isn't in `get_credential_file_mounts()` under docker either. The
+   correct fix is wire-injection via `terminal.gondolin.secrets:`
+   (or equivalent per-backend mechanism). Tracked as a follow-up to
+   the github-skill family specifically; doesn't gate the gondolin
+   PR.
 5. ~~**Memory cost at scale.**~~ **Closed (2026-05-26).** Two knobs
    landed:
    - Per-VM `terminal.gondolin.memory` (qemu syntax, e.g. `"256M"`)
@@ -700,6 +748,40 @@ injected into the sandbox if configured.
   sibling backend, since the abstraction is now proven to work.
   Also: bundling a python-enabled default image so `execute_code`
   works out of the box.
+
+## Skill compatibility note (2026-05-27)
+
+Two patterns were flagged during the pre-merge audit as potentially
+broken under `terminal.backend: gondolin`. Both are mitigated by the
+skill + credential-file projection landed in this phase, with one
+follow-up for the github-skill family. None gate the upstream PR.
+
+- **Skill-bundled scripts referenced as
+  `~/.hermes/skills/<name>/scripts/...`**: covered by the
+  `get_skills_directory_mount()` projection. Same fix as
+  docker/singularity. Works under gondolin without per-skill edits as
+  long as the user keeps `terminal.gondolin.project_skills: true`
+  (the default).
+
+- **`~/.hermes/.env` credential fallthrough** (`github/github-auth`
+  and its sibling skills): this is a cross-sandbox bug — `.env` isn't
+  in `get_credential_file_mounts()` under any current backend, so the
+  in-VM `[ -f ~/.hermes/.env ] && export GITHUB_TOKEN=...` branch
+  silently falls through to `AUTH_METHOD=none` whether the user is on
+  gondolin, docker, modal, or any other remote backend. The right fix
+  is wire-injected `GITHUB_TOKEN` via `terminal.gondolin.secrets:` (or
+  the analogous per-backend mechanism). Tracked as a follow-up to the
+  github-skill family; not gondolin-specific and not a regression
+  introduced by this PR.
+
+A few skills (`devops/docker-management`, `mlops/inference/vllm`,
+`research/blogwatcher`) issue `docker run` from inside the sandbox.
+Running them under a microVM-bearing backend is a category mismatch
+("don't use those under gondolin") — not a skill change.
+
+Network-allowlist surprises (a skill hits a host not in
+`allowed_hosts`) are caught at runtime by the existing `policy_denied`
+sentinel and surfaced through the tool result — no pre-audit needed.
 
 ## Activity log
 
@@ -812,3 +894,20 @@ injected into the sandbox if configured.
   pattern). 12 RPC tests + 14 socket tests + 13 wrapper tests +
   2 KVM integration tests + 8 sandbox/doctor/inventory ripple tests
   all green on the new wire.
+- **2026-05-27** — Skill + credential-file projection landed. Closes
+  open question (4). Daemon-side `extra_mounts` config key takes
+  `{guest_path, host_path, readonly}` entries and layers them into
+  `vfs.mounts` as `ReadonlyProvider(RealFSProvider)` when `readonly:
+  true` (default). Python-side `GondolinEnvironment` populates
+  `extra_mounts` from `tools/credential_files.py`'s
+  `get_skills_directory_mount()` and `get_credential_file_mounts()`
+  helpers — the same helpers `docker.py`, `singularity.py`,
+  `modal.py`, and `managed_modal.py` already use. Credential files
+  group by guest parent directory (Gondolin's `RealFSProvider` takes
+  a directory rootPath, not a single file); collisions skip with a
+  WARN and the user can route those via wire-injected `secrets:`
+  instead. Config knobs: `project_skills` (default true),
+  `project_credentials` (default true), or explicit `extra_mounts:`
+  for arbitrary host directories. 4 KVM integration tests + 3 Python
+  unit tests + 76/76 existing gondolin tests green, 8/8 KVM
+  end-to-end still green.
