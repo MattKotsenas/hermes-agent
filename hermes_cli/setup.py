@@ -1388,6 +1388,125 @@ def setup_tts(config: dict):
 # =============================================================================
 
 
+def _setup_gondolin_backend(config: dict):
+    """Configure the gondolin microVM backend: host deps, daemon deps, image build.
+
+    Three things have to be true for ``execute_code`` (and skills that
+    shell out to python) to work out of the box on gondolin:
+
+    1. ``node`` is on ``$PATH`` and the daemon's ``npm install`` has run
+       (gives us the gondolin CLI we shell out to).
+    2. ``cpio`` and ``lz4`` are on ``$PATH`` (gondolin's build pipeline
+       shells out to them when packaging the initramfs).
+    3. The ``hermes-runtime:<version>`` image is built in gondolin's
+       local image store. Auto-resolution in tools/terminal_tool.py
+       picks it up; without it, the daemon falls back to alpine-base
+       and execute_code fails with a python-not-found error deep in
+       the VM. Surfacing this here, in setup, beats surfacing it on
+       first ``execute_code`` call.
+
+    All three are best-effort: we report what's missing with the exact
+    fix command and let the user decide. We don't run ``sudo apt`` for
+    them (host-state side effect), but we do offer to run the image
+    build inline because that's a pure user-scoped operation
+    (~10 seconds, ~330 MB in ``~/.cache/gondolin/``).
+    """
+    print_success("Terminal backend: Gondolin")
+    print_info("Local microVM (QEMU/KVM) with wire-level credential isolation.")
+    print_info("Each session boots a fresh VM; outbound HTTPS swaps in real")
+    print_info("tokens at the network boundary so the agent inside the VM")
+    print_info("never sees them.")
+
+    # 1. node + daemon deps
+    print()
+    node_bin = shutil.which("node")
+    if not node_bin:
+        print_warning("node not found in PATH!")
+        print_info("Install Node.js 20+ first: https://nodejs.org/")
+        print_info("Then re-run 'hermes setup' to finish gondolin configuration.")
+        return
+    print_info(f"node found: {node_bin}")
+
+    try:
+        from hermes_cli.gondolin_image import (
+            HERMES_RUNTIME_TAG,
+            _resolve_gondolin_cli,
+            is_hermes_runtime_present,
+            missing_host_packages,
+            run_build,
+        )
+    except ImportError as e:
+        print_warning(f"Cannot import gondolin_image helper: {e}")
+        return
+
+    daemon_cli = _resolve_gondolin_cli()
+    if daemon_cli is None:
+        print_warning("Gondolin daemon dependencies not installed.")
+        print_info("Run this to install them, then re-run 'hermes setup':")
+        print_info("  cd tools/environments/gondolin_host && npm install")
+        return
+    print_info("Gondolin daemon CLI: present")
+
+    # 2. host packages (cpio, lz4)
+    missing = missing_host_packages()
+    if missing:
+        pkgs = " ".join(missing)
+        print()
+        print_warning(f"Missing host packages: {pkgs}")
+        print_info("Gondolin's build pipeline needs these on $PATH. Install with:")
+        print_info(f"  sudo apt-get install -y {pkgs}")
+        print_info("Then re-run 'hermes setup' to finish gondolin configuration.")
+        return
+    print_info("Host packages (cpio, lz4): present")
+
+    # 3. hermes-runtime image
+    print()
+    if is_hermes_runtime_present():
+        print_success(f"Image {HERMES_RUNTIME_TAG}: already built")
+    else:
+        print_info(f"Image {HERMES_RUNTIME_TAG} is not built yet.")
+        print_info("Without it, the VM defaults to alpine-base, which has no")
+        print_info("python3, so execute_code and python-based skills will fail.")
+        print_info("Build takes ~10 seconds and lands ~330 MB in ~/.cache/gondolin/.")
+        if prompt_yes_no("  Build hermes-runtime image now?", True):
+            print()
+            print_info("Running: gondolin build")
+            rc = run_build()
+            print()
+            if rc == 0 and is_hermes_runtime_present():
+                print_success(f"Image {HERMES_RUNTIME_TAG} built.")
+            else:
+                print_warning(f"Build failed (exit {rc}).")
+                print_info("Re-run later with: hermes gondolin build")
+        else:
+            print_info("Skipped. Run later with: hermes gondolin build")
+
+    # 4. VM resource caps (optional; null = gondolin defaults)
+    print()
+    print_info("VM resource caps (leave blank to use gondolin defaults: 1G/2 cpus):")
+    terminal = config.setdefault("terminal", {})
+    gondolin_cfg = terminal.setdefault("gondolin", {})
+
+    current_mem = gondolin_cfg.get("memory") or ""
+    mem = prompt("  Memory per VM (e.g. 1G, 512M)", current_mem)
+    if mem.strip():
+        gondolin_cfg["memory"] = mem.strip()
+        save_env_value("TERMINAL_GONDOLIN_MEMORY", mem.strip())
+    elif "memory" in gondolin_cfg:
+        gondolin_cfg.pop("memory", None)
+
+    current_cpus = str(gondolin_cfg.get("cpus", "")) if gondolin_cfg.get("cpus") else ""
+    cpus = prompt("  CPUs per VM (integer)", current_cpus)
+    if cpus.strip():
+        try:
+            gondolin_cfg["cpus"] = int(cpus.strip())
+            save_env_value("TERMINAL_GONDOLIN_CPUS", cpus.strip())
+        except ValueError:
+            print_warning(f"  Ignored non-integer cpus value: {cpus!r}")
+    elif "cpus" in gondolin_cfg:
+        gondolin_cfg.pop("cpus", None)
+
+
 def setup_terminal_backend(config: dict):
     """Configure the terminal execution backend."""
     import platform as _platform
@@ -1417,6 +1536,13 @@ def setup_terminal_backend(config: dict):
         terminal_choices.append("Singularity/Apptainer - HPC-friendly container")
         idx_to_backend[next_idx] = "singularity"
         backend_to_idx["singularity"] = next_idx
+        next_idx += 1
+
+        terminal_choices.append(
+            "Gondolin - local microVM (QEMU/KVM) with wire-level credential isolation"
+        )
+        idx_to_backend[next_idx] = "gondolin"
+        backend_to_idx["gondolin"] = next_idx
         next_idx += 1
 
     # Add keep current option
@@ -1501,6 +1627,9 @@ def setup_terminal_backend(config: dict):
         save_env_value("TERMINAL_SINGULARITY_IMAGE", image)
 
         _prompt_container_resources(config)
+
+    elif selected_backend == "gondolin":
+        _setup_gondolin_backend(config)
 
     elif selected_backend == "modal":
         print_success("Terminal backend: Modal")

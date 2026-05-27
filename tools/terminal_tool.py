@@ -1161,9 +1161,27 @@ def _resolve_default_gondolin_image() -> str | None:
         )
         if is_hermes_runtime_present():
             return HERMES_RUNTIME_TAG
+        # Tag isn't built. Log a one-liner pointing at the fix so a
+        # later execute_code failure ("python3: not found") in the VM
+        # has breadcrumbs in agent.log. Logged at INFO so it shows up
+        # under `hermes logs` without polluting errors.log.
+        if not _GONDOLIN_DEFAULT_IMAGE_HINTED["done"]:
+            _GONDOLIN_DEFAULT_IMAGE_HINTED["done"] = True
+            logger.info(
+                "Gondolin image %s not built; falling back to gondolin's "
+                "alpine-base default (no python3). Run `hermes gondolin build` "
+                "for a python/node/uv-equipped VM.",
+                HERMES_RUNTIME_TAG,
+            )
     except Exception:  # noqa: BLE001
         pass
     return None
+
+
+# Module-level memo so the "image not built" hint logs at most once per
+# process. The check itself is idempotent but a hot-path log spam would
+# bury other signal in agent.log.
+_GONDOLIN_DEFAULT_IMAGE_HINTED: Dict[str, bool] = {"done": False}
 
 
 def _get_modal_backend_state(modal_mode: object | None) -> Dict[str, Any]:
