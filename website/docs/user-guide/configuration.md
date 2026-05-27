@@ -478,9 +478,12 @@ terminal:
                                  #   `hermes setup` or `hermes gondolin build`.
                                  #   Backend construction RAISES if the tag
                                  #   isn't built — no silent fallback.
-                                 # Override with a registry selector
-                                 #   ("ubuntu-noble:latest") or an absolute
-                                 #   directory of built assets.
+                                 # Override with a built tag (currently
+                                 #   "alpine-base:latest" is the only image
+                                 #   in gondolin's built-in registry; build
+                                 #   your own with `gondolin build`) or an
+                                 #   absolute path to a directory of built
+                                 #   assets.
 
     # --- Concurrency caps ---
     max_concurrent_vms: 0        # 0 = disabled. Cap is enforced by fcntl flock
@@ -537,8 +540,8 @@ Run `hermes doctor` after configuring — it probes all of the above plus the ru
 
 **Custom images:** Two supported paths:
 
-1. **Registry selector.** Set `image: "ubuntu-noble:latest"` (or any tag Gondolin can resolve via its registry config) to use a pre-built image instead of `hermes-runtime`. Use this when you need a distro or toolchain `hermes-runtime` doesn't ship.
-2. **Build your own.** Copy `tools/environments/gondolin_host/hermes-runtime.json` to your own spec file, edit packages / base / kernel as needed, then `cd tools/environments/gondolin_host && node node_modules/@earendil-works/gondolin/dist/bin/gondolin.js build --config /path/to/yourspec.json --tag my-image:1`. Point `image: "my-image:1"`. Hermes does not wrap this path — it's Gondolin's own pipeline; `hermes gondolin build` is just the convenience case that runs it against the pinned `hermes-runtime` spec.
+1. **Gondolin's stock minimal image.** Set `image: "alpine-base:latest"` if you specifically want gondolin's BusyBox-only base (no python, no node, no bash — `execute_code` and most skills will not work, but it boots in a few hundred milliseconds and uses ~50 MB). Currently the only ref in [gondolin's built-in registry](https://github.com/earendil-works/gondolin/blob/main/builtin-image-registry.json) besides what you build yourself.
+2. **Build your own.** Copy `tools/environments/gondolin_host/hermes-runtime.json` to your own spec file, edit the Alpine packages / kernel / krunfw version as needed, then `cd tools/environments/gondolin_host && node node_modules/@earendil-works/gondolin/dist/bin/gondolin.js build --config /path/to/yourspec.json --tag my-image:1`. Point `image: "my-image:1"`. Hermes does not wrap this path — it's Gondolin's own pipeline; `hermes gondolin build` is just the convenience case that runs it against the pinned `hermes-runtime` spec. Note: Gondolin's build pipeline is Alpine-only (`distro: "alpine"`); there is no OCI-image-import path in upstream gondolin today, so "use the MCR universal devcontainer as my VM image" is not a supported option.
 
 **Architecture:** Hermes spawns one Node.js "gondolin-host" daemon per session that owns exactly one VM. Each terminal/file-tool call sends a JSON-RPC request to the daemon over an AF_UNIX socket; the daemon runs the command in the VM and streams stdout/stderr back. From Hermes's perspective it looks like an ordinary subprocess. See `docs/design/gondolin-terminal-backend.md` for the full design rationale.
 

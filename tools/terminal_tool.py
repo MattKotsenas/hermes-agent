@@ -1201,8 +1201,9 @@ def _resolve_gondolin_image_or_raise(image: Any) -> str:
             ])
         msg_lines.extend([
             "",
-            "To bypass and pin a different image (e.g. ubuntu-noble:latest "
-            "or your own build), set `terminal.gondolin.image` in "
+            "To bypass and pin a different image (gondolin's stock "
+            "`alpine-base:latest`, or a path to a directory of assets you "
+            "built yourself), set `terminal.gondolin.image` in "
             "~/.hermes/config.yaml or export TERMINAL_GONDOLIN_IMAGE.",
         ])
         raise RuntimeError("\n".join(msg_lines))
