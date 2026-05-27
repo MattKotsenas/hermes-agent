@@ -396,7 +396,16 @@ terminal:
     - ANOTHER_TOKEN
 ```
 
-### Credential File Passthrough (OAuth tokens, etc.) {#credential-file-passthrough}
+### Credential Delivery: Files and Wire Injection {#credential-delivery}
+
+Hermes has two ways to make a credential reachable from inside a sandbox. They answer the same question — "how does an in-sandbox process authenticate to an external service?" — but at different layers, with different trust properties:
+
+- **File projection** — Hermes mounts a host credential file (read-only) at a known path inside the sandbox. The in-sandbox process reads the file the same way it would on the host. The real credential bytes do reach the guest, but on a read-only filesystem.
+- **Wire injection** *(gondolin only, today)* — the guest gets a placeholder string in an env var. The real credential is spliced into outbound HTTP requests at the network boundary, only for allow-listed hosts. The guest process never has the real bytes in memory, so it can't exfiltrate what it doesn't have.
+
+Pick **wire injection** when the credential travels as an HTTP header (`Authorization: Bearer …`, `X-API-Key:`, etc.) and your backend supports it. Pick **file projection** when the credential is read off disk by a CLI you don't control (`gh`, `gcloud`, `kubectl` certs, SSH private keys, etc.).
+
+#### File projection
 
 Some skills need **files** (not just env vars) in the sandbox — for example, Google Workspace stores OAuth tokens as `google_token.json` under the active profile's `HERMES_HOME`. Skills declare these in frontmatter:
 
@@ -408,11 +417,13 @@ required_credential_files:
     description: Google OAuth2 client credentials
 ```
 
-When loaded, Hermes checks if these files exist in the active profile's `HERMES_HOME` and registers them for mounting:
+When loaded, Hermes checks if these files exist in the active profile's `HERMES_HOME` and registers them for mounting. Each backend wires the mounts in its own native shape, all read-only:
 
-- **Docker**: Read-only bind mounts (`-v host:container:ro`)
-- **Modal**: Mounted at sandbox creation + synced before each command (handles mid-session OAuth setup)
-- **Local**: No action needed (files already accessible)
+- **Docker**: Read-only bind mounts (`-v host:container:ro`).
+- **Modal**: Mounted at sandbox creation + synced before each command (handles mid-session OAuth setup).
+- **Singularity**: `--bind host:container:ro`.
+- **Gondolin**: `ReadonlyProvider(RealFSProvider(host))` in the guest VFS at the matching guest path; same `~/.hermes/skills/` tree is also projected by the same mechanism.
+- **Local**: No action needed (files already accessible).
 
 You can also list credential files manually in `config.yaml`:
 
@@ -423,7 +434,46 @@ terminal:
     - my_custom_oauth_token.json
 ```
 
-Paths are relative to `~/.hermes/`. Files are mounted to `/root/.hermes/` inside the container.
+Paths are relative to `~/.hermes/`. Files appear at `/root/.hermes/` inside the sandbox.
+
+#### Wire injection (gondolin)
+
+Configured under `terminal.gondolin.secrets:` in `config.yaml`. Each entry pairs a credential source (env var, shell command, or literal) with a list of hosts where the real value may appear:
+
+```yaml
+terminal:
+  backend: gondolin
+  gondolin:
+    secrets:
+      GITHUB_TOKEN:
+        hosts: [api.github.com, github.com]
+        from_env: GITHUB_TOKEN
+      AZURE_DEVOPS_TOKEN:
+        hosts: [dev.azure.com]
+        from_command: "az account get-access-token --resource ... -o tsv"
+        refresh: true
+```
+
+Inside the VM, `$GITHUB_TOKEN` reads back as a placeholder string. Any outbound HTTPS request to `api.github.com` or `github.com` gets the placeholder rewritten to the real token by the gondolin HTTP hooks layer. Requests to any other host see only the placeholder — the guest cannot egress the real credential to an attacker-controlled host.
+
+See [Configuration → Gondolin Backend](../user-guide/configuration.md#gondolin-backend-experimental-linuxwsl2) for the full secret schema (`from_command`, `refresh`, `timeout_ms`, etc.).
+
+#### Which backend supports which delivery mode
+
+| Backend          | File projection | Wire injection |
+|------------------|:---------------:|:--------------:|
+| local            | n/a (host fs)   | ❌             |
+| ssh              | ✅ (via file_sync) | ❌          |
+| docker           | ✅              | ❌             |
+| singularity      | ✅              | ❌             |
+| modal            | ✅              | ❌             |
+| daytona          | ✅              | ❌             |
+| vercel_sandbox   | ✅              | ❌             |
+| gondolin         | ✅              | ✅             |
+
+Wire injection only exists on gondolin today because it relies on a built-in HTTP hooks layer that intercepts the guest VM's egress at the host network boundary. Adding it to docker/modal/etc. would require an HTTP proxy plus per-backend integration (TLS handling, name resolution); it's on the roadmap, not shipping.
+
+If you configure `terminal.gondolin.secrets:` and then switch `terminal.backend:` to a backend without wire-injection support, the secrets are silently ignored. Either move the credential to `terminal.credential_files:` (file projection, cross-backend), or keep both forms populated so the credential follows you across backends.
 
 ### What Each Sandbox Filters
 

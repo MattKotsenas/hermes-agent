@@ -490,7 +490,13 @@ terminal:
 
     # --- Network policy (wide-open default + credential isolation) ---
     allowed_hosts: ["*"]         # Tighten by listing specific hosts
-    secrets:
+    secrets:                     # Wire-injection mode for credentials that
+                                 #   travel as HTTP headers. Alternative:
+                                 #   file projection via terminal.credential_files
+                                 #   (works on every backend). See the
+                                 #   "Credential Delivery" section of
+                                 #   docs/user-guide/security.md for guidance on
+                                 #   which mode to pick.
       # GITHUB_TOKEN:
       #   hosts: [api.github.com, github.com]
       #   from_env: GITHUB_TOKEN

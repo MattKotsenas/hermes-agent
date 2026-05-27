@@ -911,3 +911,45 @@ sentinel and surfaced through the tool result — no pre-audit needed.
   for arbitrary host directories. 4 KVM integration tests + 3 Python
   unit tests + 76/76 existing gondolin tests green, 8/8 KVM
   end-to-end still green.
+
+## Note for upstream: unify the credential surface
+
+This phase landed two credential delivery paths that, from a user's
+perspective, answer the same question — "how does an in-sandbox process
+authenticate to an external service?" — at different layers:
+
+1. **File projection** (`terminal.credential_files:`, the existing
+   cross-backend mechanism) — host file → read-only mount inside the
+   sandbox.
+2. **Wire injection** (`terminal.gondolin.secrets:`, gondolin-only) —
+   placeholder in the guest's env, real value spliced into outbound
+   HTTPS for allow-listed hosts.
+
+Configuring both surfaces is confusing because:
+- they live at different config sites (`terminal.credential_files:` at
+  the terminal level, `terminal.gondolin.secrets:` nested under one
+  backend);
+- there's no per-credential guidance baked into the docs about which
+  mode to pick (e.g. `GITHUB_TOKEN` is naturally wire-inject; an
+  `~/.ssh/id_ed25519` is naturally file projection);
+- switching backends silently changes whether `terminal.gondolin.secrets:`
+  has any effect.
+
+**Recommended upstream direction**: unify under a single top-level
+`terminal.credentials:` block. Each entry declares a source (`from_env`
+/ `from_command` / `from_file` / `value:`) and a delivery mode
+(`wire_inject` with `hosts:`, or `file` with `guest_path:`). Hermes
+validates the (backend × delivery mode) pair at startup against a
+shipped support matrix and warns on unsupported combinations.
+
+Crucially, the design should explicitly accept that **not every backend
+supports every delivery mode** — wire injection requires an HTTP hooks
+layer that only gondolin ships today (other backends would need a
+proxy). The user-facing config stays single-shape; the
+backend-capability matrix is the validation surface.
+
+This is intentionally **not** part of the phase-2 PR — that PR
+introduces `secrets:` as it stands today to keep the diff scoped to
+gondolin. Unification is a follow-up RFC against
+`NousResearch/hermes-agent` once gondolin is upstream and the wire
+injection mechanism has a second consumer to justify the abstraction.
