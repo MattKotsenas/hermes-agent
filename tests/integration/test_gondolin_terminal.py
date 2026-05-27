@@ -36,6 +36,22 @@ requires_gondolin = pytest.mark.skipif(
 )
 
 
+def _hermes_runtime_image_present() -> bool:
+    """Module-import-safe probe for the hermes-runtime tag.
+
+    Used by ``test_execute_code_round_trip`` to decide whether to run
+    (image built) or skip (image not built — CI without the build step
+    won't fail the test). Swallows all exceptions because pytest runs
+    this at collection time and a broken probe must not fail the whole
+    test run.
+    """
+    try:
+        from hermes_cli.gondolin_image import is_hermes_runtime_present
+        return is_hermes_runtime_present()
+    except Exception:  # noqa: BLE001
+        return False
+
+
 @pytest.fixture
 def gondolin_env(tmp_path):
     """A real GondolinEnvironment with a real VM. ~16s cold boot."""
@@ -124,6 +140,33 @@ def gondolin_env_workspace(tmp_path):
         env.cleanup()
 
 
+@pytest.fixture
+def gondolin_env_with_python(tmp_path):
+    """Real Gondolin VM with the hermes-runtime image (ships python3).
+
+    Separate from ``gondolin_env_workspace`` because the default
+    alpine-base image is faster to boot but has no python3, and most
+    integration tests don't need an interpreter. This fixture is for
+    tests that exercise the in-VM Python runtime (``execute_code``,
+    ``hermes_tools``-shipped scripts, etc.) and is automatically skipped
+    by the test's own ``skipif(not _hermes_runtime_image_present())``.
+    """
+    from hermes_cli.gondolin_image import HERMES_RUNTIME_TAG
+    from tools.environments.gondolin import GondolinEnvironment
+    env = GondolinEnvironment(
+        sandbox_dir=str(tmp_path / "sandbox"),
+        cwd="/workspace",
+        timeout=60,
+        init_timeout=180.0,  # bigger image, longer cold boot budget
+        stub_vm=False,
+        config={"image": HERMES_RUNTIME_TAG},
+    )
+    try:
+        yield env
+    finally:
+        env.cleanup()
+
+
 @requires_gondolin
 def test_host_write_visible_in_guest(gondolin_env_workspace):
     """A file written on the host under workspace_dir/ appears at the
@@ -185,17 +228,17 @@ def test_daemon_socket_not_visible_in_guest_workspace(gondolin_env_workspace):
 
 
 @requires_gondolin
-@pytest.mark.xfail(
+@pytest.mark.skipif(
+    not _hermes_runtime_image_present(),
     reason=(
-        "execute_code requires python3 in the guest image. The default "
-        "alpine-base gondolin image has no python3. Users who need "
-        "execute_code must point terminal.gondolin.image at a custom image "
-        "(e.g. one built from alpine-base with `apk add python3`). When "
-        "we ship a python-enabled image, flip this to a passing test."
+        "execute_code requires python3 in the guest. The hermes-runtime "
+        "image (built via `hermes gondolin build`) ships python3. Without "
+        "that tag, the gondolin backend falls back to alpine-base which "
+        "has no python3 and execute_code refuses. Build the image to "
+        "exercise this test."
     ),
-    strict=True,
 )
-def test_execute_code_round_trip(gondolin_env_workspace):
+def test_execute_code_round_trip(gondolin_env_with_python):
     """End-to-end ``execute_code`` against a real Gondolin VM.
 
     The flow:
@@ -224,7 +267,7 @@ def test_execute_code_round_trip(gondolin_env_workspace):
     """
     from tools.code_execution_tool import execute_code
 
-    env = gondolin_env_workspace
+    env = gondolin_env_with_python
     code = (
         "import json\n"
         "from hermes_tools import terminal\n"

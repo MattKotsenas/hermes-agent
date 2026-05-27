@@ -6146,6 +6146,41 @@ def cmd_webhook(args):
     webhook_command(args)
 
 
+def cmd_gondolin(args):
+    """Gondolin terminal-backend management (currently: image build).
+
+    Dispatches the ``hermes gondolin <action>`` subcommand. Only valid
+    action today is ``build`` (builds the hermes-runtime image via
+    gondolin's own build pipeline). Kept as a subcommand for forward
+    compatibility with future actions (``gc``, ``inspect``, etc.) —
+    matches the pattern used by ``cron``, ``webhook``, and ``kanban``.
+    """
+    action = getattr(args, "gondolin_action", None)
+    if action == "build":
+        from hermes_cli.gondolin_image import (
+            HERMES_RUNTIME_TAG,
+            HERMES_RUNTIME_BUILD_CONFIG,
+            run_build,
+        )
+        tag = getattr(args, "tag", None) or HERMES_RUNTIME_TAG
+        config = getattr(args, "config", None) or HERMES_RUNTIME_BUILD_CONFIG
+        print(f"Building gondolin image {tag} from {config}...")
+        rc = run_build(tag=tag, config_path=Path(config))
+        if rc != 0:
+            print(f"build failed (exit {rc})", file=sys.stderr)
+            sys.exit(rc)
+        print(f"OK — image tagged {tag}")
+        return
+    # No action / unknown action → show help and exit non-zero so scripts
+    # can detect the misuse.
+    print(
+        "usage: hermes gondolin build [--tag TAG] [--config FILE]\n"
+        "       (build the hermes-runtime gondolin image)",
+        file=sys.stderr,
+    )
+    sys.exit(2)
+
+
 def cmd_portal(args):
     """Nous Portal status and Tool Gateway routing surface."""
     from hermes_cli.portal_cli import portal_command
@@ -10759,7 +10794,7 @@ _BUILTIN_SUBCOMMANDS = frozenset(
         "acp", "auth", "backup", "bundles", "checkpoints", "claw", "completion",
         "computer-use",
         "config", "cron", "curator", "dashboard", "debug", "doctor",
-        "dump", "fallback", "gateway", "hooks", "import", "insights",
+        "dump", "fallback", "gateway", "gondolin", "hooks", "import", "insights",
         "kanban", "login", "logout", "logs", "lsp", "mcp", "memory", "migrate",
         "model", "pairing", "plugins", "portal", "postinstall", "profile", "proxy",
         "send", "sessions", "setup",
@@ -11979,6 +12014,51 @@ def main():
     )
 
     webhook_parser.set_defaults(func=cmd_webhook)
+
+    # =========================================================================
+    # gondolin command — terminal-backend image management
+    # =========================================================================
+    # Currently a single action (`build`) but kept as a subcommand for
+    # forward compatibility with future actions (gc old tags, inspect a
+    # tag, etc.) — same shape as cron/webhook/kanban.
+    gondolin_parser = subparsers.add_parser(
+        "gondolin",
+        help="Gondolin terminal-backend image management",
+        description=(
+            "Manage the hermes-runtime image used by the gondolin "
+            "terminal backend. The build runs gondolin's own pipeline "
+            "(Alpine + python3 + node + uv) locally — no Hermes-published "
+            "artifacts."
+        ),
+    )
+    gondolin_subparsers = gondolin_parser.add_subparsers(dest="gondolin_action")
+    gondolin_build = gondolin_subparsers.add_parser(
+        "build",
+        help="Build the hermes-runtime gondolin image",
+        description=(
+            "Run `gondolin build` against the bundled hermes-runtime spec "
+            "and tag the result as hermes-runtime:<hermes-version>. "
+            "Requires cpio + lz4 on the host (apt install cpio lz4 on "
+            "Ubuntu/Debian)."
+        ),
+    )
+    gondolin_build.add_argument(
+        "--tag",
+        default=None,
+        help=(
+            "Image tag to apply. Default: hermes-runtime:<hermes-version>. "
+            "Override only if you know why."
+        ),
+    )
+    gondolin_build.add_argument(
+        "--config",
+        default=None,
+        help=(
+            "Path to a gondolin build config JSON. Default: the bundled "
+            "tools/environments/gondolin_host/hermes-runtime.json."
+        ),
+    )
+    gondolin_parser.set_defaults(func=cmd_gondolin)
 
     # =========================================================================
     # portal command — Nous Portal status + Tool Gateway routing

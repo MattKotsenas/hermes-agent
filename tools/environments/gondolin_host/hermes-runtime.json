@@ -1,0 +1,28 @@
+{
+  "_comment": "Pinned build spec for the hermes-runtime gondolin image. Bumping any value here is a deliberate Hermes-side supply-chain change — see docs/design/gondolin-terminal-backend.md § 'Default image: first-run local build'. Built with `hermes gondolin build` (or `gondolin build --config <this-file> --tag hermes-runtime:<version>`).",
+  "arch": "x86_64",
+  "distro": "alpine",
+  "alpine": {
+    "version": "3.23.0",
+    "kernelPackage": "linux-virt",
+    "kernelImage": "vmlinuz-virt",
+    "rootfsPackages": [
+      "linux-virt",
+      "rng-tools",
+      "bash",
+      "ca-certificates",
+      "curl",
+      "e2fsprogs",
+      "nodejs",
+      "npm",
+      "uv",
+      "python3",
+      "openssh"
+    ],
+    "initramfsPackages": [],
+    "krunfwVersion": "v5.2.1"
+  },
+  "rootfs": {
+    "label": "gondolin-root"
+  }
+}

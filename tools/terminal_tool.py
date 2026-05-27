@@ -1109,7 +1109,20 @@ def _get_env_config() -> Dict[str, Any]:
             ),
             "policy_script": os.getenv("TERMINAL_GONDOLIN_POLICY_SCRIPT") or None,
             "sandbox_dir": os.getenv("TERMINAL_GONDOLIN_SANDBOX_DIR") or None,
-            "image": os.getenv("TERMINAL_GONDOLIN_IMAGE") or None,
+            # Image resolution: explicit user override (env / config) wins;
+            # otherwise default to the hermes-runtime tag IF it's built. If
+            # it isn't built, leave `image` as None so the daemon falls
+            # back to gondolin's own default (alpine-base) — same behavior
+            # as before this change, no regression. The doctor surfaces a
+            # one-line build prompt when the tag is missing; we don't
+            # auto-build here because that's a side-effect-bearing host
+            # operation (network, ~330 MB on disk) and gondolin's contract
+            # is opt-in. See docs/design/gondolin-terminal-backend.md
+            # § "Default image: first-run local build".
+            "image": (
+                os.getenv("TERMINAL_GONDOLIN_IMAGE")
+                or _resolve_default_gondolin_image()
+            ),
             # Per-VM resource caps; None means "let Gondolin use defaults
             # (1G memory, 2 cpus)". The knob exists so a user running many
             # parallel sessions on a memory-constrained host can dial these
@@ -1121,6 +1134,36 @@ def _get_env_config() -> Dict[str, Any]:
             ),
         },
     }
+
+
+def _resolve_default_gondolin_image() -> str | None:
+    """Resolve the default gondolin image when no explicit override is set.
+
+    Returns the ``hermes-runtime:<version>`` tag iff it's currently
+    present in gondolin's local image store. Otherwise returns ``None``
+    so the daemon falls back to gondolin's own default (alpine-base).
+
+    This matches today's behavior for a fresh install where the user
+    hasn't run ``hermes gondolin build`` yet: the daemon boots
+    alpine-base, ``execute_code`` surfaces its actionable error,
+    ``hermes doctor`` shows the build prompt. Once the user runs
+    ``hermes gondolin build``, the next session picks up
+    hermes-runtime automatically — no config edit required.
+
+    Defensive: any exception (missing gondolin CLI, missing node,
+    subprocess flake) yields ``None`` so a broken probe degrades to
+    today's fallback rather than blowing up backend construction.
+    """
+    try:
+        from hermes_cli.gondolin_image import (
+            HERMES_RUNTIME_TAG,
+            is_hermes_runtime_present,
+        )
+        if is_hermes_runtime_present():
+            return HERMES_RUNTIME_TAG
+    except Exception:  # noqa: BLE001
+        pass
+    return None
 
 
 def _get_modal_backend_state(modal_mode: object | None) -> Dict[str, Any]:

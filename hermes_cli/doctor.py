@@ -1291,16 +1291,44 @@ def run_doctor(args):
                 issues,
             )
 
-        # execute_code requires python3 inside the guest. The default
-        # alpine-base image doesn't ship it. Surface this as a non-fatal
-        # info line — execute_code is an optional tool and the user may
-        # not care; if they do, they need to know about the config knob.
+        # hermes-runtime image: the gondolin backend's default image.
+        # We don't auto-build (the build is a side-effect-bearing host
+        # operation that writes ~330 MB to ~/.cache/gondolin/ and pulls
+        # from upstream Alpine + libkrunfw mirrors). Instead surface a
+        # one-line build command if the tag is missing, and the precise
+        # apt-install command if the host packages gondolin needs aren't
+        # present. Both are non-fatal — the gondolin backend falls back
+        # to alpine-base:latest if hermes-runtime isn't built, and the
+        # built-in execute_code tool still surfaces its own actionable
+        # error on the alpine-base fallback. See
+        # docs/design/gondolin-terminal-backend.md § "Default image".
         if not os.getenv("TERMINAL_GONDOLIN_IMAGE", "").strip():
-            check_info(
-                "gondolin: default image (alpine-base) lacks python3 — "
-                "execute_code will refuse. Build a python-enabled image and "
-                "set terminal.gondolin.image, or use the terminal tool instead."
-            )
+            try:
+                from hermes_cli.gondolin_image import (
+                    HERMES_RUNTIME_TAG,
+                    is_hermes_runtime_present,
+                    missing_host_packages,
+                )
+                missing_pkgs = missing_host_packages()
+                if missing_pkgs:
+                    pkgs = " ".join(missing_pkgs)
+                    check_info(
+                        f"gondolin: hermes-runtime image build needs host "
+                        f"packages: {pkgs}. Install with: "
+                        f"sudo apt-get install -y {pkgs}"
+                    )
+                elif not is_hermes_runtime_present():
+                    check_info(
+                        f"gondolin: {HERMES_RUNTIME_TAG} not built. "
+                        f"Run: hermes gondolin build "
+                        f"(~10s, ~330 MB local cache). "
+                        f"Until built, execute_code falls back to "
+                        f"alpine-base (no python3) and will refuse."
+                    )
+                else:
+                    check_ok(f"gondolin image", f"({HERMES_RUNTIME_TAG} present)")
+            except Exception:  # noqa: BLE001 — defensive: never block doctor
+                pass
 
         # Recent gondolin secret resolution warnings — surfaced from
         # errors.log so the user sees init-time and refresh-time failures

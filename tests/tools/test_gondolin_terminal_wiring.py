@@ -22,6 +22,59 @@ NODE_DAEMON = REPO_ROOT / "tools" / "environments" / "gondolin_host" / "src" / "
 NODE_AVAILABLE = shutil.which("node") is not None and NODE_DAEMON.exists()
 
 
+def _hermes_runtime_ref_path() -> Path:
+    """Path to gondolin's local image-store ref for the hermes-runtime tag.
+
+    Gondolin stores refs as files under ``~/.cache/gondolin/images/refs/``
+    (directory hierarchy mirroring the ``name/tag`` shape). Looking
+    directly at the filesystem is intentional — we want the test to
+    exercise the real resolution path against the real store, not a
+    mock of it. If gondolin's storage layout ever changes, this helper
+    needs updating; that's a deliberate coupling to a stable interface.
+    """
+    from hermes_cli.gondolin_image import HERMES_RUNTIME_TAG
+    name, _, version = HERMES_RUNTIME_TAG.partition(":")
+    return Path.home() / ".cache" / "gondolin" / "images" / "refs" / name / version
+
+
+@pytest.fixture
+def _no_hermes_runtime_ref(tmp_path):
+    """Ensure the hermes-runtime tag is NOT present in gondolin's image
+    store for the duration of the test.
+
+    If the ref exists, move it aside into a tmp path and restore on
+    teardown. If it doesn't, no-op. Either way, the resolution path
+    inside the test sees an empty store and yields image=None.
+    """
+    ref = _hermes_runtime_ref_path()
+    moved = None
+    if ref.exists():
+        moved = tmp_path / "saved-ref"
+        ref.rename(moved)
+    try:
+        yield
+    finally:
+        if moved is not None and moved.exists():
+            ref.parent.mkdir(parents=True, exist_ok=True)
+            moved.rename(ref)
+
+
+@pytest.fixture
+def _hermes_runtime_ref_present():
+    """Skip the test unless the hermes-runtime tag is already in
+    gondolin's local image store.
+
+    Building the image takes ~10 s and ~330 MB of disk, so we don't do
+    it at test time. CI without a build step will skip; dev hosts that
+    have run ``hermes gondolin build`` will exercise the test.
+    """
+    if not _hermes_runtime_ref_path().exists():
+        pytest.skip(
+            "hermes-runtime image not built; run `hermes gondolin build`"
+        )
+    yield
+
+
 def test_get_env_config_reads_gondolin_keys(monkeypatch):
     """All gondolin env vars surface as a structured config block under
     a 'gondolin' key, with sane defaults when nothing is set."""
@@ -57,10 +110,17 @@ def test_get_env_config_reads_gondolin_keys(monkeypatch):
     assert g["cpus"] == 1
 
 
-def test_get_env_config_defaults_for_gondolin(monkeypatch):
-    """When no gondolin env vars are set, the block is present but empty
-    so downstream code can use ``.get()`` uniformly. image=None means
-    'let Gondolin use its own default (alpine-base:latest)'."""
+def test_get_env_config_defaults_for_gondolin(monkeypatch, _no_hermes_runtime_ref):
+    """When no gondolin env vars are set AND no hermes-runtime image is
+    built, the gondolin block is present but empty so downstream code
+    can use ``.get()`` uniformly. image=None means 'let Gondolin use
+    its own default (alpine-base:latest)'.
+
+    Real-world test: the ``_no_hermes_runtime_ref`` fixture moves any
+    existing ref aside for the duration of the test, then restores it.
+    No internal mocking — we exercise the actual resolution path
+    against gondolin's actual image store.
+    """
     from tools.terminal_tool import _get_env_config
 
     # Make sure no gondolin vars leak in from the surrounding shell.
@@ -85,6 +145,29 @@ def test_get_env_config_defaults_for_gondolin(monkeypatch):
     assert g["image"] is None
     assert g["memory"] is None
     assert g["cpus"] is None
+
+
+def test_get_env_config_resolves_hermes_runtime_when_built(
+    monkeypatch, _hermes_runtime_ref_present
+):
+    """When no explicit image override is set AND the hermes-runtime
+    image is present in gondolin's local store, _get_env_config picks
+    it up automatically. This is the user-facing payoff of
+    `hermes gondolin build`: build once, every session boots into the
+    image without a config edit.
+
+    Real-world test: ``_hermes_runtime_ref_present`` skips when
+    gondolin's store doesn't have the tag (CI without a build step),
+    otherwise just asserts the actual resolved value.
+    """
+    from tools.terminal_tool import _get_env_config
+    from hermes_cli.gondolin_image import HERMES_RUNTIME_TAG
+
+    monkeypatch.delenv("TERMINAL_GONDOLIN_IMAGE", raising=False)
+    monkeypatch.setenv("TERMINAL_ENV", "gondolin")
+
+    cfg = _get_env_config()
+    assert cfg["gondolin"]["image"] == HERMES_RUNTIME_TAG
 
 
 def test_get_env_config_default_cwd_for_gondolin(monkeypatch):
