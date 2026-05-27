@@ -525,3 +525,88 @@ def test_secret_diagnostics_empty_when_all_resolved(tmp_path):
         assert env.secret_diagnostics == []
     finally:
         env.cleanup()
+
+
+# ---- Refresh-loop wiring -----------------------------------------------
+#
+# When a secret config has `refresh: true`, the env spins up a
+# SecretRefresher to call set_secret() on schedule (JWT exp / configured
+# ttl_seconds). Without `refresh: true` (default), no refresher is spawned.
+
+@requires_node
+def test_refresh_loop_spawns_when_secret_has_refresh_true(tmp_path):
+    """`refresh: true` on a secret config spawns a SecretRefresher thread
+    and stores it on the env. `cleanup()` stops it cleanly."""
+    env = GondolinEnvironment(
+        sandbox_dir=str(tmp_path / "refresh-on"),
+        stub_vm=True,
+        config={
+            "secrets": {
+                "AAD_TOKEN": {
+                    "hosts": ["login.microsoftonline.com"],
+                    "value": "initial-opaque-token",
+                    "refresh": True,
+                    "refresh_command": "echo new-aad-token",
+                    "ttl_seconds": 3600,
+                },
+            },
+        },
+    )
+    try:
+        assert env.secret_refresher is not None
+        assert env.secret_refresher.is_running()
+    finally:
+        env.cleanup()
+        # cleanup stops the refresher.
+        assert env.secret_refresher is None or not env.secret_refresher.is_running()
+
+
+@requires_node
+def test_refresh_loop_not_spawned_without_refresh_flag(tmp_path):
+    """The default (no `refresh:` key) is no refresher — avoids the cost
+    and the per-process thread for the 99% case where the user just wants
+    a one-shot wire-injected credential."""
+    env = GondolinEnvironment(
+        sandbox_dir=str(tmp_path / "refresh-off"),
+        stub_vm=True,
+        config={
+            "secrets": {
+                "STATIC": {"hosts": ["x"], "value": "permanent-pat"},
+            },
+        },
+    )
+    try:
+        assert env.secret_refresher is None
+    finally:
+        env.cleanup()
+
+
+@requires_node
+def test_refresh_loop_warns_when_refresh_true_but_no_command(tmp_path, caplog):
+    """If `refresh: true` is set on a literal-`value` secret with no
+    `refresh_command` or `from_command`, the env warns and refresh stays
+    disabled — better than silently doing nothing."""
+    import logging as _logging
+    env = GondolinEnvironment(
+        sandbox_dir=str(tmp_path / "refresh-misconfig"),
+        stub_vm=True,
+        config={
+            "secrets": {
+                "BAD": {
+                    "hosts": ["x"],
+                    "value": "literal",
+                    "refresh": True,
+                    # no refresh_command, no from_command
+                },
+            },
+        },
+    )
+    try:
+        assert env.secret_refresher is None
+        warnings = [r for r in caplog.records if r.levelno >= _logging.WARNING]
+        assert any("refresh_command" in r.getMessage() for r in warnings), (
+            f"expected WARN mentioning refresh_command, got "
+            f"{[r.getMessage() for r in warnings]}"
+        )
+    finally:
+        env.cleanup()

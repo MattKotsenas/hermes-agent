@@ -38,6 +38,7 @@ from pathlib import Path
 from typing import Any
 
 from tools.environments.base import BaseEnvironment, _popen_bash
+from tools.environments.gondolin_secret_refresh import SecretRefresher
 
 logger = logging.getLogger(__name__)
 
@@ -336,6 +337,10 @@ class GondolinEnvironment(BaseEnvironment):
         # resolved cleanly. Surfaced by `hermes doctor` and logged at WARN
         # so unattended cron jobs don't silently run without credentials.
         self.secret_diagnostics: list[dict] = []
+        # Background loop that re-runs `refresh_command` for any secret
+        # configured with `refresh: true`. None when no secret needs
+        # refresh (the common case). Started after init succeeds.
+        self.secret_refresher: SecretRefresher | None = None
 
         daemon_js = Path(daemon_path) if daemon_path else _DAEMON_JS
         if not daemon_js.exists():
@@ -393,6 +398,11 @@ class GondolinEnvironment(BaseEnvironment):
                         "gondolin secret %s (%s) unresolved: %s%s",
                         name, src, err, extra,
                     )
+
+            # Spin up the secret refresh loop for any secret configured
+            # with `refresh: true`. Done after init succeeds so we never
+            # leak a thread on a failed daemon init.
+            self._start_secret_refresher_if_needed()
         except Exception:
             self._terminate_daemon()
             raise
@@ -428,6 +438,54 @@ class GondolinEnvironment(BaseEnvironment):
             str(timeout * 1000),
         ]
         return _popen_bash(argv, stdin_data)
+
+    def _start_secret_refresher_if_needed(self) -> None:
+        """Spawn a SecretRefresher if any configured secret has `refresh: true`.
+
+        Refresh config (per-secret) — opt-in:
+          refresh: true                     # required to enable refresh
+          ttl_seconds: 3600                 # fallback when value isn't a JWT
+          refresh_before_expiry_seconds: 300  # optional, default 300
+
+        The refresh command defaults to the secret's ``from_command``. If
+        the secret only has ``value`` or ``from_env``, refresh requires an
+        explicit ``refresh_command`` (otherwise there's nothing to re-run).
+        """
+        secrets = self.config.get("secrets") or {}
+        refresh_entries: list[dict] = []
+        for name, cfg in secrets.items():
+            if not isinstance(cfg, dict) or not cfg.get("refresh"):
+                continue
+            refresh_command = cfg.get("refresh_command") or cfg.get("from_command")
+            if not refresh_command:
+                logger.warning(
+                    "gondolin secret %s: refresh: true but no refresh_command "
+                    "or from_command to re-run — refresh disabled",
+                    name,
+                )
+                continue
+            refresh_entries.append({
+                "name": name,
+                "refresh_command": refresh_command,
+                "ttl_seconds": cfg.get("ttl_seconds"),
+                "refresh_before_expiry_seconds": int(
+                    cfg.get("refresh_before_expiry_seconds", 300)
+                ),
+                "initial_value": cfg.get("value") if isinstance(cfg.get("value"), str) else None,
+            })
+
+        if not refresh_entries:
+            return
+
+        self.secret_refresher = SecretRefresher(env_set_secret=self.set_secret)
+        for entry in refresh_entries:
+            self.secret_refresher.add_secret(**entry)
+        self.secret_refresher.start()
+        logger.info(
+            "gondolin secret refresher started for %d secret(s): %s",
+            len(refresh_entries),
+            ", ".join(e["name"] for e in refresh_entries),
+        )
 
     def set_secret(
         self,
@@ -467,6 +525,15 @@ class GondolinEnvironment(BaseEnvironment):
 
     def cleanup(self) -> None:
         """Send shutdown RPC, wait for daemon exit, kill if it hangs."""
+        # Stop the refresh loop FIRST — it calls set_secret, and once the
+        # daemon's torn down those calls would surface as scary RPC errors.
+        if self.secret_refresher is not None:
+            try:
+                self.secret_refresher.stop()
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("gondolin secret refresher stop error: %s", exc)
+            self.secret_refresher = None
+
         if not self._daemon_proc:
             return
 
