@@ -83,7 +83,7 @@ Leaving these unset keeps the legacy defaults (`HERMES_API_TIMEOUT=1800`s, `HERM
 
 ## Terminal Backend Configuration
 
-Hermes supports seven terminal backends. Each determines where the agent's shell commands actually execute — your local machine, a Docker container, a remote server via SSH, a Modal cloud sandbox (direct or via the Nous-managed gateway), a Daytona workspace, a Vercel Sandbox, or a Singularity/Apptainer container.
+Hermes supports eight terminal backends. Each determines where the agent's shell commands actually execute — your local machine, a Docker container, a remote server via SSH, a Modal cloud sandbox (direct or via the Nous-managed gateway), a Daytona workspace, a Vercel Sandbox, a Singularity/Apptainer container, or a Gondolin micro-VM (Linux/WSL2 with KVM).
 
 ```yaml
 terminal:
@@ -109,6 +109,7 @@ For cloud sandboxes such as Modal, Daytona, and Vercel Sandbox, `container_persi
 | **daytona** | Daytona workspace | Full (cloud container) | Managed cloud dev environments |
 | **vercel_sandbox** | Vercel Sandbox | Full (cloud microVM) | Cloud execution with snapshot-backed filesystem persistence |
 | **singularity** | Singularity/Apptainer container | Namespaces (--containall) | HPC clusters, shared machines |
+| **gondolin** | Local micro-VM (QEMU/KVM) | Full (hardware virt) + wire-level credential isolation | Strong isolation on Linux/WSL2 with KVM; credential-safe network egress |
 
 ### Local Backend
 
@@ -458,6 +459,82 @@ export TERMINAL_LOCAL_PERSISTENT=true
 :::note
 Commands that require `stdin_data` or sudo automatically fall back to one-shot mode, since the persistent shell's stdin is already occupied by the IPC protocol.
 :::
+
+### Gondolin Backend (experimental, Linux/WSL2)
+
+Runs commands inside a [Gondolin](https://github.com/earendil-works/gondolin) micro-VM (QEMU + KVM). Provides hardware-virtualization isolation plus a wire-level credential isolation model: real tokens stay on the host and are swapped into outbound HTTP requests at the network boundary only for hosts you allow, so the agent inside the VM cannot exfiltrate them.
+
+```yaml
+terminal:
+  backend: gondolin
+  cwd: /workspace                # In-VM path; defaults to /workspace
+  timeout: 180                   # Per-command timeout in seconds
+  gondolin:
+    # --- VM resources (forwarded to Gondolin's VMOptions) ---
+    memory: null                 # e.g. "256M", "1G"; null = Gondolin default (1G)
+    cpus: null                   # integer; null = Gondolin default (2)
+    image: null                  # null = Gondolin default ("alpine-base:latest"),
+                                 #   or pass a registry selector ("ubuntu-noble:latest"),
+                                 #   or an absolute directory of built assets.
+
+    # --- Concurrency caps ---
+    max_concurrent_vms: 0        # 0 = disabled. Cap is enforced by fcntl flock
+                                 #   on slot files in lock_dir, so it works across
+                                 #   subagents, gateway, and standalone CLIs.
+    lock_dir: null               # Default: ${HERMES_HOME}/sandboxes/gondolin/.locks/
+
+    # --- Filesystem ---
+    sandbox_dir: null            # Override host bind-mount root
+                                 #   (default ${HERMES_HOME}/sandboxes/<session>/)
+    workspace_mount: true        # false = skip VFS wiring (for policy_script users)
+
+    # --- Network policy (wide-open default + credential isolation) ---
+    allowed_hosts: ["*"]         # Tighten by listing specific hosts
+    secrets:
+      # GITHUB_TOKEN:
+      #   hosts: [api.github.com, github.com]
+      #   from_env: GITHUB_TOKEN
+      # AZURE_DEVOPS_TOKEN:
+      #   hosts: [dev.azure.com]
+      #   from_command: "az account get-access-token --resource ... -o tsv"
+      #   refresh: true          # Re-run from_command on JWT exp or TTL
+      #   timeout_ms: 30000      # Per-secret resolution timeout
+
+    # Escape hatch: full Gondolin TS API
+    policy_script: null          # Path to a .mjs that exports getHooks(yaml)
+
+    # --- Daemon plumbing ---
+    daemon_path: null            # Override path to gondolin-host.mjs
+    boot_timeout_ms: 30000       # Fail VM init if it takes longer
+    stream: true                 # Stream stdout/stderr from VM commands
+                                 #   in real time. Set false for the older
+                                 #   buffer-and-return-once shape.
+```
+
+**Requirements:**
+- Linux or WSL2 host with `/dev/kvm` accessible (group `kvm`, usually).
+- QEMU 9+ (`apt install qemu-system-x86 qemu-utils` on Debian/Ubuntu).
+- Node.js 20+ on the host.
+- The Gondolin npm package installed under Hermes (`npm install` in
+  `tools/environments/gondolin_host/`).
+
+Run `hermes doctor` after configuring — it probes all of the above plus the running daemon and surfaces any unresolved or stale secrets it finds in `errors.log`.
+
+**Architecture:** Hermes spawns one Node.js "gondolin-host" daemon per session that owns exactly one VM. Each terminal/file-tool call sends a JSON-RPC request to the daemon over an AF_UNIX socket; the daemon runs the command in the VM and streams stdout/stderr back. From Hermes's perspective it looks like an ordinary subprocess. See `docs/design/gondolin-terminal-backend.md` for the full design rationale.
+
+**Workspace bind-mount:** The host directory `${HERMES_HOME}/sandboxes/<session_id>/workspace/` is bind-mounted into the VM at the configured `cwd` (default `/workspace`), read-write. Files written inside the VM are immediately visible on the host and vice versa. Sandbox dirs persist across `--resume` of the same session; different session ids get fresh dirs. Hermes's own runtime files (`~/.hermes/skills/`, `~/.hermes/state.db`, etc.) are NOT visible inside the VM — use `skill_view`, `memory`, and `session_search` to reach those.
+
+**Network policy:** The default is open egress (`allowed_hosts: ["*"]`) with credential isolation as the safety floor — without `secrets:` configured, the VM has no privileged tokens to exfiltrate. Configuring a secret with a `hosts:` allowlist makes Hermes inject the real value into outbound requests to those hosts only; for any other destination the VM sees the placeholder. Multi-identity per host works by giving each identity a distinct secret name and placeholder (e.g. `GITHUB_TOKEN_PERSONAL` vs `GITHUB_TOKEN_WORK`). For policies beyond the YAML schema (request rewriting, conditional injection, chained policies), point `policy_script` at a `.mjs` file that returns hooks built directly against the Gondolin TS API.
+
+**Credential refresh:** Secrets with `refresh: true` (combined with `from_command`) get a background refresh loop. If the resolved value is a JWT, Hermes parses the `exp` claim and re-runs `from_command` before expiry; otherwise it falls back to a configurable TTL. Refresh failures land in `errors.log` and `hermes doctor` surfaces them.
+
+**Streaming:** stdout/stderr stream in real time during command execution (the daemon and wrapper exchange chunk frames). Set `terminal.gondolin.stream: false` to opt out and get the older "buffer until completion" shape if streaming causes issues.
+
+**Limitations:**
+- Linux/WSL2 only. No native Windows or macOS path.
+- `execute_code` (in-VM Python REPL) needs an image that ships `python3`. The default `alpine-base:latest` does not — switch `image:` to one that does, or build a custom image.
+- VM-internal state (installed packages, running daemons) does NOT survive across `hermes --resume`. Sandbox-dir files do.
+- `delegate_task` subagents always get their own VM (isolation contract, same as other backends).
 
 See [Code Execution](features/code-execution.md) and the [Terminal section of the README](features/tools.md) for details on each backend.
 
