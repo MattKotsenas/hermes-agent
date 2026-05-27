@@ -1,37 +1,54 @@
-// Test: line-delimited JSON-RPC framing.
+// Test: length-prefixed msgpack JSON-RPC framing.
 //
-// The daemon reads requests (one JSON object per line) from a stream and
-// writes responses (one JSON object per line) to another stream. It must:
+// The daemon reads requests (one frame = u32 BE length + msgpack payload)
+// from a stream and writes responses in the same shape to another stream.
+// It must:
 //   1. Pair requests and responses by id.
-//   2. Handle multiple requests in flight (though MVP can be serial).
+//   2. Handle multiple requests in flight (though MVP is serial).
 //   3. Report unknown method as a JSON-RPC error response.
-//   4. Reject malformed JSON with an error response (no id available -> id=null).
+//   4. Reject malformed payloads with a parse-error response (id=null).
 //
-// We don't boot a VM here — we inject a fake method handler so framing
+// We don't boot a VM here — we inject fake method handlers so framing
 // is testable in isolation.
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import { Buffer } from "node:buffer";
 import { PassThrough } from "node:stream";
+import { encode, decode } from "@msgpack/msgpack";
 import { runRpcServer } from "../src/rpc.mjs";
 
 function writeReq(stream, obj) {
-  stream.write(JSON.stringify(obj) + "\n");
+  const payload = encode(obj);
+  const header = Buffer.alloc(4);
+  header.writeUInt32BE(payload.length, 0);
+  stream.write(header);
+  stream.write(Buffer.from(payload.buffer, payload.byteOffset, payload.byteLength));
 }
 
+// Read exactly N framed msgpack responses from a stream.
 async function readNResponses(stream, n) {
   return new Promise((resolve, reject) => {
     const out = [];
-    let buf = "";
+    let buf = Buffer.alloc(0);
     stream.on("data", (chunk) => {
-      buf += chunk.toString("utf8");
-      let idx;
-      while ((idx = buf.indexOf("\n")) >= 0) {
-        const line = buf.slice(0, idx);
-        buf = buf.slice(idx + 1);
-        if (!line.trim()) continue;
-        out.push(JSON.parse(line));
-        if (out.length === n) resolve(out);
+      buf = Buffer.concat([buf, chunk]);
+      while (true) {
+        if (buf.length < 4) break;
+        const len = buf.readUInt32BE(0);
+        if (buf.length < 4 + len) break;
+        const payload = buf.subarray(4, 4 + len);
+        buf = buf.subarray(4 + len);
+        try {
+          out.push(decode(payload));
+        } catch (e) {
+          reject(e);
+          return;
+        }
+        if (out.length === n) {
+          resolve(out);
+          return;
+        }
       }
     });
     stream.on("error", reject);
@@ -73,18 +90,45 @@ test("returns method-not-found for unknown methods", async () => {
   await serverDone;
 });
 
-test("returns parse-error with id=null for malformed JSON", async () => {
+test("returns parse-error with id=null for malformed msgpack payload", async () => {
   const inp = new PassThrough();
   const outp = new PassThrough();
   const serverDone = runRpcServer({ input: inp, output: outp, handlers: {} });
 
-  inp.write("this is not json\n");
+  // Frame a chunk of bytes that isn't valid msgpack. Use a length prefix
+  // that matches the payload length so the framing parser proceeds to
+  // decode, hits a decode error, and replies with -32700.
+  const junk = Buffer.from("this is not msgpack", "utf8");
+  const header = Buffer.alloc(4);
+  header.writeUInt32BE(junk.length, 0);
+  inp.write(Buffer.concat([header, junk]));
   const [resp] = await readNResponses(outp, 1);
   assert.equal(resp.id, null);
   assert.equal(resp.error.code, -32700); // JSON-RPC parse error
 
   inp.end();
   await serverDone;
+});
+
+test("returns parse-error and tears down when a frame claims more bytes than the cap", async () => {
+  const inp = new PassThrough();
+  const outp = new PassThrough();
+  const serverDone = runRpcServer({ input: inp, output: outp, handlers: {} });
+
+  // Header claims 1 GiB. The cap is 64 MiB; the framer should reject
+  // before allocating anything.
+  const header = Buffer.alloc(4);
+  header.writeUInt32BE(1024 * 1024 * 1024, 0);
+  inp.write(header);
+  const [resp] = await readNResponses(outp, 1);
+  assert.equal(resp.id, null);
+  assert.equal(resp.error.code, -32700);
+  assert.match(resp.error.message, /frame too large/);
+
+  // The framer destroys the input on cap violation; serverDone resolves
+  // or rejects depending on whether destroy() lands as 'end' or 'error'.
+  // Either way we don't want this test to hang.
+  await serverDone.catch(() => {});
 });
 
 test("returns internal-error if a handler throws", async () => {
@@ -124,12 +168,92 @@ test("handles multiple sequential requests in order", async () => {
   await serverDone;
 });
 
+test("framer reassembles a payload split across multiple data chunks", async () => {
+  // Real TCP/AF_UNIX delivery often splits a frame across multiple
+  // 'data' events. The framer's accumulating-buffer pattern is the load
+  // bearing piece — this test pokes it directly.
+  const inp = new PassThrough();
+  const outp = new PassThrough();
+  const handlers = { echo: async (p) => ({ got: p }) };
+  const serverDone = runRpcServer({ input: inp, output: outp, handlers });
+
+  const payload = encode({ id: 17, method: "echo", params: { x: "split-me" } });
+  const header = Buffer.alloc(4);
+  header.writeUInt32BE(payload.length, 0);
+  const wire = Buffer.concat([header, Buffer.from(payload.buffer, payload.byteOffset, payload.byteLength)]);
+
+  // Send byte by byte. Slowest possible delivery, exercises the framer
+  // every single read.
+  for (let i = 0; i < wire.length; i++) {
+    inp.write(wire.subarray(i, i + 1));
+  }
+
+  const [resp] = await readNResponses(outp, 1);
+  assert.equal(resp.id, 17);
+  assert.deepEqual(resp.result, { got: { x: "split-me" } });
+
+  inp.end();
+  await serverDone;
+});
+
+test("framer handles two back-to-back frames glued into one chunk", async () => {
+  // Inverse of the previous test: TCP coalesces and we get two frames in
+  // a single 'data' event. The while-loop in the framer must drain both.
+  const inp = new PassThrough();
+  const outp = new PassThrough();
+  const handlers = { echo: async (p) => ({ got: p }) };
+  const serverDone = runRpcServer({ input: inp, output: outp, handlers });
+
+  const pieces = [
+    { id: 1, method: "echo", params: { x: "first" } },
+    { id: 2, method: "echo", params: { x: "second" } },
+  ].map((req) => {
+    const payload = encode(req);
+    const header = Buffer.alloc(4);
+    header.writeUInt32BE(payload.length, 0);
+    return Buffer.concat([header, Buffer.from(payload.buffer, payload.byteOffset, payload.byteLength)]);
+  });
+
+  inp.write(Buffer.concat(pieces));
+
+  const responses = await readNResponses(outp, 2);
+  assert.deepEqual(responses.map((r) => [r.id, r.result.got.x]), [[1, "first"], [2, "second"]]);
+
+  inp.end();
+  await serverDone;
+});
+
+test("carries binary payloads verbatim through the framer (no UTF-8 corruption)", async () => {
+  // Bytes 0x80-0xFF are not valid lone UTF-8 sequences. JSON+UTF-8 would
+  // either reject or replace them with U+FFFD; msgpack bin8 carries them
+  // unmodified. This test is the contract that stream chunks from
+  // vm.exec (test fixtures, compiled output, etc.) round-trip cleanly.
+  const inp = new PassThrough();
+  const outp = new PassThrough();
+  const handlers = {
+    bounce: async (params) => ({ data: params.data }),
+  };
+  const serverDone = runRpcServer({ input: inp, output: outp, handlers });
+
+  const bin = Buffer.from([0xff, 0xfe, 0xfd, 0x00, 0x80, 0xc0, 0x01, 0x02]);
+  writeReq(inp, { id: 1, method: "bounce", params: { data: bin } });
+
+  const [resp] = await readNResponses(outp, 1);
+  // msgpack decodes bin payloads to Uint8Array on the decode side.
+  const got = resp.result.data;
+  assert.ok(got instanceof Uint8Array, `got ${got?.constructor?.name}`);
+  assert.deepEqual(Buffer.from(got), bin);
+
+  inp.end();
+  await serverDone;
+});
+
 // ---- streamWriter: intermediate frames before the final response -----------
 //
 // For streaming exec, the handler needs to push stdout chunks as they arrive
 // from the VM rather than buffering everything until the command exits.
 // We extend the RPC contract: handlers receive a `streamWriter` second arg.
-// Calling streamWriter(obj) emits `{ id, stream: obj }` lines. The handler's
+// Calling streamWriter(obj) emits `{ id, stream: obj }` frames. The handler's
 // eventual return value becomes the final `{ id, result }` frame as before.
 // Handlers that don't use streamWriter behave exactly like today (back-compat).
 
@@ -138,9 +262,9 @@ test("streamWriter emits intermediate {stream} frames tagged with the request id
   const outp = new PassThrough();
   const handlers = {
     chunked: async (_params, ctx) => {
-      ctx.streamWriter({ kind: "stdout", data: "hello\n" });
-      ctx.streamWriter({ kind: "stdout", data: "world\n" });
-      ctx.streamWriter({ kind: "stderr", data: "warn\n" });
+      ctx.streamWriter({ kind: "stdout", data: Buffer.from("hello\n", "utf8") });
+      ctx.streamWriter({ kind: "stdout", data: Buffer.from("world\n", "utf8") });
+      ctx.streamWriter({ kind: "stderr", data: Buffer.from("warn\n", "utf8") });
       return { exit_code: 0 };
     },
   };
@@ -149,10 +273,15 @@ test("streamWriter emits intermediate {stream} frames tagged with the request id
   writeReq(inp, { id: 99, method: "chunked", params: {} });
   const frames = await readNResponses(outp, 4);  // 3 stream + 1 final
 
-  // First three are stream frames in order.
-  assert.deepEqual(frames[0], { id: 99, stream: { kind: "stdout", data: "hello\n" } });
-  assert.deepEqual(frames[1], { id: 99, stream: { kind: "stdout", data: "world\n" } });
-  assert.deepEqual(frames[2], { id: 99, stream: { kind: "stderr", data: "warn\n" } });
+  // First three are stream frames in order. Data is carried as bin (decoded
+  // as Uint8Array); compare bytes, not strings, so this stays binary-safe.
+  assert.equal(frames[0].id, 99);
+  assert.equal(frames[0].stream.kind, "stdout");
+  assert.deepEqual(Buffer.from(frames[0].stream.data), Buffer.from("hello\n", "utf8"));
+  assert.equal(frames[1].stream.kind, "stdout");
+  assert.deepEqual(Buffer.from(frames[1].stream.data), Buffer.from("world\n", "utf8"));
+  assert.equal(frames[2].stream.kind, "stderr");
+  assert.deepEqual(Buffer.from(frames[2].stream.data), Buffer.from("warn\n", "utf8"));
   // Fourth is the final result.
   assert.equal(frames[3].id, 99);
   assert.deepEqual(frames[3].result, { exit_code: 0 });
@@ -189,7 +318,7 @@ test("streamWriter frames emitted after handler error are dropped (no result fra
   const outp = new PassThrough();
   const handlers = {
     boom: async (_params, ctx) => {
-      ctx.streamWriter({ kind: "stdout", data: "partial\n" });
+      ctx.streamWriter({ kind: "stdout", data: Buffer.from("partial\n", "utf8") });
       throw new Error("mid-stream failure");
     },
   };
@@ -197,7 +326,9 @@ test("streamWriter frames emitted after handler error are dropped (no result fra
 
   writeReq(inp, { id: 5, method: "boom" });
   const frames = await readNResponses(outp, 2);
-  assert.deepEqual(frames[0], { id: 5, stream: { kind: "stdout", data: "partial\n" } });
+  assert.equal(frames[0].id, 5);
+  assert.equal(frames[0].stream.kind, "stdout");
+  assert.deepEqual(Buffer.from(frames[0].stream.data), Buffer.from("partial\n", "utf8"));
   assert.equal(frames[1].id, 5);
   assert.equal(frames[1].result, undefined);
   assert.equal(frames[1].error.code, -32603);

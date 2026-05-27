@@ -193,8 +193,9 @@ def test_set_secret_routes_through_daemon_rpc(stub_env_factory):
     a set_secret RPC to the daemon's secretManager. Use case: a credential
     refresh loop (e.g. AAD token) updates the wire-injection value without
     restarting the VM."""
-    import json
     import socket as _socket
+
+    import msgpack
 
     env = stub_env_factory(config={
         "secrets": {
@@ -206,19 +207,27 @@ def test_set_secret_routes_through_daemon_rpc(stub_env_factory):
     env.set_secret("GITHUB_TOKEN", value="refreshed")
 
     # Confirm via the daemon's stub-mode debug RPC (raw socket to avoid
-    # circular dependency on the helper we just tested).
+    # circular dependency on the helper we just tested). Wire is
+    # length-prefixed msgpack — see tools/environments/gondolin_host/src/rpc.mjs.
     def rpc(req):
         s = _socket.socket(_socket.AF_UNIX, _socket.SOCK_STREAM)
         s.connect(env.sock_path)
-        s.sendall((json.dumps(req) + "\n").encode())
-        buf = b""
-        while b"\n" not in buf:
-            chunk = s.recv(4096)
+        payload = msgpack.packb(req, use_bin_type=True)
+        assert payload is not None
+        s.sendall(len(payload).to_bytes(4, "big") + payload)
+        buf = bytearray()
+        while True:
+            if len(buf) >= 4:
+                n = int.from_bytes(buf[:4], "big")
+                if len(buf) >= 4 + n:
+                    break
+            chunk = s.recv(65536)
             if not chunk:
                 break
-            buf += chunk
+            buf.extend(chunk)
         s.close()
-        return json.loads(buf.split(b"\n", 1)[0])
+        n = int.from_bytes(buf[:4], "big")
+        return msgpack.unpackb(bytes(buf[4:4 + n]), raw=False)
 
     peek = rpc({"id": 1, "method": "_debug_get_secret", "params": {"name": "GITHUB_TOKEN"}})
     assert peek.get("error") is None

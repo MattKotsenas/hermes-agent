@@ -115,6 +115,10 @@ const handlers = {
         // The real Gondolin vm.exec returns an ExecProcess that's awaitable
         // AND async-iterable; this stub mimics just the iterable surface
         // needed by exec_stream's chunk pump.
+        //
+        // Stub chunks are emitted as Buffers (binary-safe), mirroring the
+        // real path where Gondolin yields Buffer chunks. Tests that
+        // assert on the data payload should compare bytes, not strings.
         execStreaming(cmd) {
           // The daemon wraps every cmd in `bash -c '...'`. Strip that wrap
           // so the STREAM: marker still works for tests that drive the
@@ -127,7 +131,7 @@ const handlers = {
           return {
             async *chunks() {
               for (const p of parts) {
-                yield { kind: "stdout", data: p };
+                yield { kind: "stdout", data: Buffer.from(p, "utf8") };
               }
             },
             async exitCode() { return 0; },
@@ -284,7 +288,11 @@ const handlers = {
     } else {
       // Real Gondolin: vm.exec with { stdout: "pipe" } returns an
       // ExecProcess that's async-iterable per chunk. The iterator yields
-      // raw chunks (strings); we re-wrap each as {kind: "stdout", data}.
+      // raw chunks (Buffers); we re-wrap each as {kind: "stdout", data}
+      // with the bytes passed through unmodified. msgpack carries binary
+      // data natively (bin8/bin32), so no encoding step is needed —
+      // arbitrary process output (test fixtures with non-UTF-8 bytes,
+      // compiled artefacts piped to stdout, etc.) survives the wire.
       const real = vm.exec(wrapped, { timeout: timeoutMs, stdout: "pipe", stderr: "pipe" });
       proc = {
         async *chunks() {
@@ -295,7 +303,14 @@ const handlers = {
           // "pipe"; users who want a strict split can use the non-stream
           // exec call.)
           for await (const chunk of real) {
-            const data = typeof chunk === "string" ? chunk : String(chunk);
+            // Pass through Buffers verbatim. If Gondolin ever hands us
+            // a string (back-compat), wrap it in a Buffer so the wire
+            // shape is consistent.
+            const data = Buffer.isBuffer(chunk)
+              ? chunk
+              : chunk instanceof Uint8Array
+                ? Buffer.from(chunk.buffer, chunk.byteOffset, chunk.byteLength)
+                : Buffer.from(String(chunk), "utf8");
             yield { kind: "stdout", data };
           }
         },

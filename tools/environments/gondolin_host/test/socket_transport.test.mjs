@@ -14,37 +14,61 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import { Buffer } from "node:buffer";
 import { spawn } from "node:child_process";
 import net from "node:net";
 import os from "node:os";
 import path from "node:path";
 import { mkdtempSync, mkdirSync, rmSync } from "node:fs";
 import { fileURLToPath } from "node:url";
+import { encode, decode } from "@msgpack/msgpack";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const DAEMON = path.resolve(__dirname, "../src/daemon.mjs");
+
+// Encode a single request as a length-prefixed msgpack frame.
+function encodeFrame(obj) {
+  const payload = encode(obj);
+  const header = Buffer.alloc(4);
+  header.writeUInt32BE(payload.length, 0);
+  return Buffer.concat([
+    header,
+    Buffer.from(payload.buffer, payload.byteOffset, payload.byteLength),
+  ]);
+}
+
+// Iteratively pop complete frames out of a growing byte buffer. Returns
+// { frames, rest } so the caller can keep accumulating leftover bytes.
+function drainFrames(buf) {
+  const frames = [];
+  let rest = buf;
+  while (rest.length >= 4) {
+    const n = rest.readUInt32BE(0);
+    if (rest.length < 4 + n) break;
+    const payload = rest.subarray(4, 4 + n);
+    frames.push(decode(payload));
+    rest = rest.subarray(4 + n);
+  }
+  return { frames, rest };
+}
 
 // One JSON-RPC roundtrip over a fresh AF_UNIX connection.
 function rpcCall(sockPath, request, { timeoutMs = 5000 } = {}) {
   return new Promise((resolve, reject) => {
     const sock = net.createConnection(sockPath);
-    let buf = "";
+    let buf = Buffer.alloc(0);
     const timer = setTimeout(() => {
       sock.destroy();
       reject(new Error(`rpc timeout after ${timeoutMs}ms`));
     }, timeoutMs);
     sock.on("data", (chunk) => {
-      buf += chunk.toString("utf8");
-      const idx = buf.indexOf("\n");
-      if (idx >= 0) {
+      buf = Buffer.concat([buf, chunk]);
+      const { frames, rest } = drainFrames(buf);
+      buf = rest;
+      if (frames.length > 0) {
         clearTimeout(timer);
-        const line = buf.slice(0, idx);
         sock.end();
-        try {
-          resolve(JSON.parse(line));
-        } catch (e) {
-          reject(e);
-        }
+        resolve(frames[0]);
       }
     });
     sock.on("error", (err) => {
@@ -52,7 +76,7 @@ function rpcCall(sockPath, request, { timeoutMs = 5000 } = {}) {
       reject(err);
     });
     sock.on("connect", () => {
-      sock.write(JSON.stringify(request) + "\n");
+      sock.write(encodeFrame(request));
     });
   });
 }
@@ -62,22 +86,24 @@ function rpcCall(sockPath, request, { timeoutMs = 5000 } = {}) {
 function rpcCallStreaming(sockPath, request, { timeoutMs = 10000 } = {}) {
   return new Promise((resolve, reject) => {
     const sock = net.createConnection(sockPath);
-    let buf = "";
+    let buf = Buffer.alloc(0);
     const streamFrames = [];
     const timer = setTimeout(() => {
       sock.destroy();
       reject(new Error(`streaming rpc timeout after ${timeoutMs}ms`));
     }, timeoutMs);
     sock.on("data", (chunk) => {
-      buf += chunk.toString("utf8");
-      let idx;
-      while ((idx = buf.indexOf("\n")) >= 0) {
-        const line = buf.slice(0, idx);
-        buf = buf.slice(idx + 1);
-        if (!line.trim()) continue;
-        let frame;
-        try { frame = JSON.parse(line); }
-        catch (e) { clearTimeout(timer); sock.destroy(); reject(e); return; }
+      buf = Buffer.concat([buf, chunk]);
+      let frames;
+      try {
+        ({ frames, rest: buf } = drainFrames(buf));
+      } catch (e) {
+        clearTimeout(timer);
+        sock.destroy();
+        reject(e);
+        return;
+      }
+      for (const frame of frames) {
         if (frame.stream !== undefined) {
           streamFrames.push(frame.stream);
         } else {
@@ -90,7 +116,7 @@ function rpcCallStreaming(sockPath, request, { timeoutMs = 10000 } = {}) {
     });
     sock.on("error", (err) => { clearTimeout(timer); reject(err); });
     sock.on("connect", () => {
-      sock.write(JSON.stringify(request) + "\n");
+      sock.write(encodeFrame(request));
     });
   });
 }
@@ -697,12 +723,14 @@ test("daemon: exec_stream emits chunked stdout frames then a final result", asyn
     params: { cmd: "STREAM:hello|world|done" },
   });
 
-  // Each segment should arrive as its own frame.
-  assert.equal(streamFrames.length, 3, `got frames: ${JSON.stringify(streamFrames)}`);
+  // Each segment should arrive as its own frame. Stream data is now
+  // carried as msgpack bin (decoded to Uint8Array); decode to string to
+  // assert against the stub's per-segment payload.
+  assert.equal(streamFrames.length, 3, `got frames: ${JSON.stringify(streamFrames.map((f) => ({ kind: f.kind, len: f.data?.length })))}`);
   assert.equal(streamFrames[0].kind, "stdout");
-  assert.equal(streamFrames[0].data, "hello");
-  assert.equal(streamFrames[1].data, "world");
-  assert.equal(streamFrames[2].data, "done");
+  assert.equal(Buffer.from(streamFrames[0].data).toString("utf8"), "hello");
+  assert.equal(Buffer.from(streamFrames[1].data).toString("utf8"), "world");
+  assert.equal(Buffer.from(streamFrames[2].data).toString("utf8"), "done");
 
   // Final frame: exit_code only (stdout/stderr accumulated by the wrapper).
   assert.equal(final.id, 42);
@@ -743,6 +771,6 @@ test("daemon: exec_stream falls back to a single chunk for non-STREAM stub comma
     params: { cmd: "echo hello" },
   });
   assert.equal(streamFrames.length, 1);
-  assert.match(streamFrames[0].data, /echo hello/);
+  assert.match(Buffer.from(streamFrames[0].data).toString("utf8"), /echo hello/);
   assert.equal(final.result.exit_code, 0);
 });

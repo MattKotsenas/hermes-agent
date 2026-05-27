@@ -11,12 +11,14 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import { Buffer } from "node:buffer";
 import { spawn } from "node:child_process";
 import net from "node:net";
 import { existsSync, mkdtempSync, rmSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import os from "node:os";
 import path from "node:path";
+import { encode, decode } from "@msgpack/msgpack";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const DAEMON = path.resolve(__dirname, "../src/daemon.mjs");
@@ -35,24 +37,31 @@ async function canRunVm() {
 function rpcCall(sockPath, request, { timeoutMs = 120_000 } = {}) {
   return new Promise((resolve, reject) => {
     const sock = net.createConnection(sockPath);
-    let buf = "";
+    let buf = Buffer.alloc(0);
     const timer = setTimeout(() => {
       sock.destroy();
       reject(new Error(`rpc timeout after ${timeoutMs}ms`));
     }, timeoutMs);
     sock.on("data", (chunk) => {
-      buf += chunk.toString("utf8");
-      const idx = buf.indexOf("\n");
-      if (idx >= 0) {
-        clearTimeout(timer);
-        sock.end();
-        try { resolve(JSON.parse(buf.slice(0, idx))); }
-        catch (e) { reject(e); }
+      buf = Buffer.concat([buf, chunk]);
+      if (buf.length < 4) return;
+      const n = buf.readUInt32BE(0);
+      if (buf.length < 4 + n) return;
+      clearTimeout(timer);
+      sock.end();
+      try {
+        resolve(decode(buf.subarray(4, 4 + n)));
+      } catch (e) {
+        reject(e);
       }
     });
     sock.on("error", (err) => { clearTimeout(timer); reject(err); });
     sock.on("connect", () => {
-      sock.write(JSON.stringify(request) + "\n");
+      const payload = encode(request);
+      const header = Buffer.alloc(4);
+      header.writeUInt32BE(payload.length, 0);
+      sock.write(header);
+      sock.write(Buffer.from(payload.buffer, payload.byteOffset, payload.byteLength));
     });
   });
 }

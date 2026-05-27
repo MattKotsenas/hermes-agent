@@ -2,9 +2,9 @@
 
 This module is the Popen-shaped bridge between BaseEnvironment._run_bash
 (which expects a subprocess it can drain) and the gondolin-host daemon
-(which speaks line-delimited JSON-RPC over AF_UNIX). Per-call invocation:
-the wrapper is stateless — connect, send one exec, write result back,
-exit. Daemon crashes don't poison the next call.
+(which speaks length-prefixed msgpack JSON-RPC over AF_UNIX). Per-call
+invocation: the wrapper is stateless — connect, send one exec, write
+result back, exit. Daemon crashes don't poison the next call.
 
 These tests stand up a Python AF_UNIX server that mimics the daemon's
 JSON-RPC contract so the wrapper can be exercised without booting a VM.
@@ -12,7 +12,6 @@ A separate end-to-end test launches the real Node daemon in stub mode
 to verify both halves agree on the wire format.
 """
 
-import json
 import os
 import shutil
 import socket
@@ -23,6 +22,7 @@ import threading
 import time
 from pathlib import Path
 
+import msgpack
 import pytest
 
 
@@ -31,17 +31,39 @@ REPO_ROOT = HERE.parent.parent
 WRAPPER = REPO_ROOT / "tools" / "environments" / "gondolin_rpc_call.py"
 
 
-class FakeDaemon:
-    """Minimal AF_UNIX JSON-RPC server that scripts a single exec response.
+def _encode_frame(obj: dict) -> bytes:
+    """Encode a request/response as a length-prefixed msgpack frame."""
+    payload = msgpack.packb(obj, use_bin_type=True)
+    assert payload is not None
+    return len(payload).to_bytes(4, "big") + payload
 
-    Accepts one connection, reads one newline-delimited JSON-RPC request,
-    writes back the configured response (also newline-delimited), then
-    closes the connection. Designed to be one-shot per test.
+
+def _decode_frame_from_socket(conn: socket.socket) -> dict | None:
+    """Read one full msgpack frame off ``conn`` or return None on EOF."""
+    buf = bytearray()
+    while True:
+        if len(buf) >= 4:
+            n = int.from_bytes(buf[:4], "big")
+            if len(buf) >= 4 + n:
+                payload = bytes(buf[4:4 + n])
+                return msgpack.unpackb(payload, raw=False)
+        chunk = conn.recv(65536)
+        if not chunk:
+            return None
+        buf.extend(chunk)
+
+
+class FakeDaemon:
+    """Minimal AF_UNIX msgpack JSON-RPC server that scripts a single exec response.
+
+    Accepts one connection, reads one length-prefixed msgpack request,
+    writes back the configured response (also length-prefixed msgpack),
+    then closes the connection. Designed to be one-shot per test.
 
     For streaming: pass `stream_frames=[...]` and the server will write
     each frame followed by `response` as the final terminator. Frames are
     wrapped as `{"id": <req-id>, "stream": <frame>}` to match the wire
-    contract; pass them as plain dicts (e.g. {"kind": "stdout", "data": "x"}).
+    contract; pass them as plain dicts (e.g. {"kind": "stdout", "data": b"x"}).
     """
 
     def __init__(self, response: dict, stream_frames: list[dict] | None = None):
@@ -81,23 +103,17 @@ class FakeDaemon:
         except OSError:
             return
         with conn:
-            buf = b""
-            while b"\n" not in buf:
-                chunk = conn.recv(4096)
-                if not chunk:
-                    return
-                buf += chunk
-            line, _, _ = buf.partition(b"\n")
-            req = json.loads(line.decode("utf-8"))
+            req = _decode_frame_from_socket(conn)
+            if req is None:
+                return
             self.received_request = req
-            req_id = req.get("id")
+            req_id = req.get("id") if isinstance(req, dict) else None
             # Emit any streaming frames first.
             for frame in self.stream_frames:
-                msg = {"id": req_id, "stream": frame}
-                conn.sendall((json.dumps(msg) + "\n").encode("utf-8"))
+                conn.sendall(_encode_frame({"id": req_id, "stream": frame}))
             resp = dict(self.response)
             resp.setdefault("id", req_id)
-            conn.sendall((json.dumps(resp) + "\n").encode("utf-8"))
+            conn.sendall(_encode_frame(resp))
 
 
 def _run_wrapper(sock_path: str, cmd: str, *, timeout_ms: int | None = None, env: dict | None = None, stream: bool = False):
@@ -281,8 +297,11 @@ def stubbed_daemon(tmp_path):
         # Init the daemon (stub VM) so exec calls work.
         s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         s.connect(sock_path)
-        s.sendall(b'{"id":1,"method":"init","params":{"config":{}}}\n')
-        s.recv(4096)  # drain init response
+        s.sendall(_encode_frame({"id": 1, "method": "init", "params": {"config": {}}}))
+        # Drain init response (one full msgpack frame). We don't need
+        # the contents; just make sure the daemon has fully booted into
+        # its initialized state before yielding the socket to the test.
+        _decode_frame_from_socket(s)
         s.close()
         yield sock_path
     finally:

@@ -42,6 +42,33 @@ from tools.environments.gondolin_secret_refresh import SecretRefresher
 
 logger = logging.getLogger(__name__)
 
+
+def _ensure_msgpack() -> None:
+    """Lazy-install msgpack on demand. Idempotent — fast no-op once installed.
+
+    The gondolin wire format is length-prefixed msgpack between the Python
+    wrapper and the Node daemon. msgpack is declared as the
+    `terminal.gondolin` extra in `pyproject.toml` and `tools/lazy_deps.py`,
+    so users who never select the gondolin backend never pay for it. On
+    first GondolinEnvironment use we route the install through the normal
+    lazy-install policy (venv-scoped, allowlisted, respects
+    `security.allow_lazy_installs`). Mirrors the modal/daytona/vercel
+    backends.
+    """
+    try:
+        from tools.lazy_deps import ensure as _lazy_ensure
+        _lazy_ensure("terminal.gondolin", prompt=False)
+    except ImportError:
+        # No lazy_deps available (very old / stripped install). Fall
+        # through and let the import below produce its own diagnostic.
+        pass
+    except Exception as e:
+        raise ImportError(str(e))
+
+
+_ensure_msgpack()
+import msgpack  # noqa: E402  — must follow _ensure_msgpack() above
+
 # Location of the Node daemon source file relative to this module.
 _HERE = Path(__file__).resolve().parent
 _DAEMON_JS = _HERE / "gondolin_host" / "src" / "daemon.mjs"
@@ -205,22 +232,40 @@ def _wait_for_socket(sock_path: str, timeout: float = 10.0) -> None:
 
 
 def _rpc_call(sock_path: str, request: dict[str, Any], timeout: float = 30.0) -> dict[str, Any]:
-    """One JSON-RPC roundtrip over a fresh AF_UNIX connection."""
+    """One JSON-RPC roundtrip over a fresh AF_UNIX connection.
+
+    Wire format: length-prefixed msgpack frames (u32 BE length + payload).
+    Matches ``tools/environments/gondolin_host/src/rpc.mjs``.
+    """
     s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     s.settimeout(timeout)
     try:
         s.connect(sock_path)
-        s.sendall((json.dumps(request) + "\n").encode("utf-8"))
+        payload: bytes = msgpack.packb(request, use_bin_type=True)  # type: ignore[assignment]
+        header = len(payload).to_bytes(4, "big")
+        s.sendall(header + payload)
         buf = bytearray()
-        while b"\n" not in buf:
+        # Read until we have at least one complete frame (4-byte header
+        # + payload). The daemon writes exactly one response frame and
+        # closes its end of the socket, so we just drain until EOF or
+        # until we've seen the full frame.
+        while True:
+            if len(buf) >= 4:
+                n = int.from_bytes(buf[:4], "big")
+                if len(buf) >= 4 + n:
+                    break
             chunk = s.recv(65536)
             if not chunk:
                 break
             buf.extend(chunk)
-        if not buf:
+        if len(buf) < 4:
             raise RuntimeError("daemon closed connection without response")
-        line = bytes(buf).split(b"\n", 1)[0]
-        return json.loads(line.decode("utf-8"))
+        n = int.from_bytes(buf[:4], "big")
+        if len(buf) < 4 + n:
+            raise RuntimeError(
+                f"daemon response truncated: expected {n} bytes, got {len(buf) - 4}"
+            )
+        return msgpack.unpackb(bytes(buf[4:4 + n]), raw=False)
     finally:
         try:
             s.close()

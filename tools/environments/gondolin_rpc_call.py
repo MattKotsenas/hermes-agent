@@ -19,42 +19,64 @@ A ``policy_denied: true`` flag on the RPC result is surfaced to stderr as
 a ``GONDOLIN_POLICY_DENIED`` sentinel line so the env wrapper can mark
 the tool result as a policy denial (vs. a network failure).
 
-Wire format: one JSON object per line, both directions. Matches
-``tools/environments/gondolin_host/src/rpc.mjs``.
+Wire format: length-prefixed msgpack frames (u32 BE length + payload),
+both directions. Matches ``tools/environments/gondolin_host/src/rpc.mjs``.
+Switched from line-delimited JSON in May 2026 (a) so stream chunks carry
+raw bytes through msgpack bin8/bin32 instead of being coerced via
+``String(chunk)`` on the daemon side and (b) for the ~5-7x encode/decode
+speedup on multi-megabyte payloads (see bench/protocol_compare.py).
 """
 
 from __future__ import annotations
 
 import argparse
-import json
 import socket
 import sys
 from typing import Any
+
+import msgpack
 
 
 # Sentinel emitted to stderr when the daemon flags a policy denial.
 # GondolinEnvironment greps for this string in tool-result post-processing.
 POLICY_DENIED_SENTINEL = "GONDOLIN_POLICY_DENIED"
 
+# Hard cap on the size of any single frame payload (must match the daemon
+# side). Defence-in-depth against a hostile / buggy peer claiming a huge
+# frame length and making us allocate gigabytes. The daemon enforces the
+# same cap, so a legitimate peer never trips this.
+_MAX_FRAME_BYTES = 64 * 1024 * 1024
 
-def _recv_line(sock: socket.socket, *, max_bytes: int = 64 * 1024 * 1024) -> bytes:
-    """Read until the first ``\\n`` or until the daemon closes the socket.
 
-    Hard cap of 64 MB prevents a runaway daemon from blowing host memory.
-    The cap is generous — typical agent terminal output is well under 1 MB,
-    and the daemon already enforces its own per-exec output limits.
+def _encode_frame(obj: dict[str, Any]) -> bytes:
+    """Encode a single request as a length-prefixed msgpack frame."""
+    payload: bytes = msgpack.packb(obj, use_bin_type=True)  # type: ignore[assignment]
+    return len(payload).to_bytes(4, "big") + payload
+
+
+def _read_frame(buf: bytearray, sock: socket.socket) -> tuple[Any, bytearray]:
+    """Read one full frame off ``sock`` (consuming bytes from ``buf`` first).
+
+    Returns ``(decoded_object, remaining_bytes)``. Raises ``SystemExit`` on
+    EOF before a frame is complete, or on a frame size that exceeds the
+    cap.
     """
-    buf = bytearray()
-    while b"\n" not in buf:
+    while True:
+        if len(buf) >= 4:
+            n = int.from_bytes(buf[:4], "big")
+            if n > _MAX_FRAME_BYTES:
+                raise SystemExit(
+                    f"gondolin: daemon claimed a frame of {n} bytes "
+                    f"(cap {_MAX_FRAME_BYTES}); refusing to read"
+                )
+            if len(buf) >= 4 + n:
+                payload = bytes(buf[4:4 + n])
+                rest = bytearray(buf[4 + n:])
+                return msgpack.unpackb(payload, raw=False), rest
         chunk = sock.recv(65536)
         if not chunk:
-            break
+            raise SystemExit("gondolin: daemon closed connection mid-frame")
         buf.extend(chunk)
-        if len(buf) > max_bytes:
-            raise RuntimeError(
-                f"gondolin daemon response exceeded {max_bytes} bytes without a newline"
-            )
-    return bytes(buf).split(b"\n", 1)[0]
 
 
 def _connect_with_diagnostic(sock_path: str) -> socket.socket:
@@ -79,14 +101,12 @@ def _connect_with_diagnostic(sock_path: str) -> socket.socket:
 
 def _send_request(sock: socket.socket, request: dict[str, Any]) -> dict[str, Any]:
     """Send a single JSON-RPC request, read a single JSON-RPC response."""
-    sock.sendall((json.dumps(request) + "\n").encode("utf-8"))
-    raw = _recv_line(sock)
-    if not raw:
-        raise SystemExit("gondolin: daemon closed connection without responding")
-    try:
-        return json.loads(raw.decode("utf-8"))
-    except json.JSONDecodeError as exc:
-        raise SystemExit(f"gondolin: malformed daemon response: {exc}")
+    sock.sendall(_encode_frame(request))
+    buf = bytearray()
+    frame, _rest = _read_frame(buf, sock)
+    if not isinstance(frame, dict):
+        raise SystemExit(f"gondolin: daemon returned non-dict frame: {type(frame).__name__}")
+    return frame
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -127,7 +147,7 @@ def main(argv: list[str] | None = None) -> int:
 
     if "error" in response and response["error"] is not None:
         err = response["error"]
-        msg = err.get("message", str(err))
+        msg = err.get("message", str(err)) if isinstance(err, dict) else str(err)
         sys.stderr.write(f"gondolin: rpc error: {msg}\n")
         return 1
 
@@ -138,10 +158,10 @@ def main(argv: list[str] | None = None) -> int:
     policy_denied = bool(result.get("policy_denied", False))
 
     if stdout:
-        sys.stdout.write(stdout)
+        _write_text(sys.stdout, stdout)
         sys.stdout.flush()
     if stderr:
-        sys.stderr.write(stderr)
+        _write_text(sys.stderr, stderr)
     if policy_denied:
         # Sentinel goes after the VM stderr so the original message is
         # preserved verbatim; GondolinEnvironment matches on the marker.
@@ -150,49 +170,62 @@ def main(argv: list[str] | None = None) -> int:
     return exit_code
 
 
-def _run_streaming(sock: socket.socket, request: dict[str, Any]) -> int:
-    """Send `exec_stream` and pump frames live to our stdout/stderr.
+def _write_text(stream, data: Any) -> None:
+    """Write a value coming off the wire to a text stream.
 
-    Frame shapes (one JSON object per line):
-      {"id", "stream": {"kind": "stdout"|"stderr", "data": "..."}}
-      {"id", "result": {"exit_code": N, ...}}   ← final
-      {"id", "error": {...}}                     ← final on error
+    msgpack's ``raw=False`` decode hands us ``str`` for msgpack ``str``
+    frames and ``bytes`` for msgpack ``bin`` frames. Daemon's non-stream
+    exec path returns Gondolin's already-string stdout/stderr, so this is
+    typically a no-op string write — but we handle bytes too in case the
+    daemon's protocol layer changes.
+    """
+    if isinstance(data, (bytes, bytearray, memoryview)):
+        # Tagged 'binary' on the wire — write the raw bytes to the
+        # underlying buffer to preserve byte-for-byte content. Falls back
+        # to the text write path for streams without .buffer (e.g. tests).
+        try:
+            stream.buffer.write(bytes(data))
+            return
+        except AttributeError:
+            stream.write(bytes(data).decode("utf-8", errors="replace"))
+            return
+    stream.write(data)
+
+
+def _run_streaming(sock: socket.socket, request: dict[str, Any]) -> int:
+    """Send ``exec_stream`` and pump frames live to our stdout/stderr.
+
+    Frame shapes (each frame is a length-prefixed msgpack object):
+      ``{id, stream: {kind: "stdout"|"stderr", data}}``
+      ``{id, result: {exit_code: N, ...}}``   ← final
+      ``{id, error: {...}}``                  ← final on error
 
     Each stream frame is written to its respective pipe immediately so
     BaseEnvironment's select() drain can hand chunks to the agent UI as
     the command runs, rather than waiting for the whole exec to finish.
     """
-    sock.sendall((json.dumps(request) + "\n").encode("utf-8"))
+    sock.sendall(_encode_frame(request))
     buf = bytearray()
     while True:
-        # Read until next newline. We can't use _recv_line() because that
-        # reads exactly one line and discards the rest of the buffer — we
-        # need to preserve unread bytes across iterations.
-        while b"\n" not in buf:
-            chunk = sock.recv(65536)
-            if not chunk:
-                # Daemon closed without a final frame.
-                sys.stderr.write("gondolin: daemon closed connection mid-stream\n")
-                return 1
-            buf.extend(chunk)
-        line_bytes, _, rest = bytes(buf).partition(b"\n")
-        buf = bytearray(rest)
         try:
-            frame = json.loads(line_bytes.decode("utf-8"))
-        except json.JSONDecodeError as exc:
-            sys.stderr.write(f"gondolin: malformed daemon frame: {exc}\n")
+            frame, buf = _read_frame(buf, sock)
+        except SystemExit as exc:
+            sys.stderr.write(f"{exc}\n")
+            return 1
+
+        if not isinstance(frame, dict):
+            sys.stderr.write(
+                f"gondolin: daemon sent non-dict frame: {type(frame).__name__}\n"
+            )
             return 1
 
         if "stream" in frame:
             payload = frame["stream"] or {}
             kind = payload.get("kind", "stdout")
-            data = payload.get("data", "")
-            if kind == "stderr":
-                sys.stderr.write(data)
-                sys.stderr.flush()
-            else:
-                sys.stdout.write(data)
-                sys.stdout.flush()
+            data = payload.get("data", b"")
+            stream = sys.stderr if kind == "stderr" else sys.stdout
+            _write_text(stream, data)
+            stream.flush()
             continue
 
         # Final frame.
