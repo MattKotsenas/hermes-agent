@@ -647,12 +647,18 @@ injected into the sandbox if configured.
    directly will break under gondolin backend. Either patch those
    skills to use `skill_view`, or document the incompatibility.
 
-   **Audited (2026-05-27).** See §Skill compatibility audit below.
-   Net: 9 Category A (blocking) skills + 19 Category B (degraded
-   credential lookup) skills + the long tail (Category C) which is
-   unaffected. Neither category gates landing the gondolin backend
-   on `main`. Both are tracked as follow-up work with the fix shape
-   spelled out per-category in the audit section.
+   **Deferred to backend-switch time (2026-05-26).** Two broad
+   categories surface today: (a) skill-bundled scripts referenced
+   as `~/.hermes/skills/<name>/scripts/...` which won't be present
+   in the guest filesystem, and (b) the github-skill family's
+   `~/.hermes/.env` bootstrap which silently falls through to
+   `AUTH_METHOD=none` instead of relying on wire-injection. Both
+   are blocked on (3) landing: (a) needs a story for how skill
+   scripts get into the guest (auto-mounted under
+   `/etc/hermes/skills/`? rewritten in the system prompt? individual
+   per-skill copy?), and (b) needs env-var binding + multi-identity
+   so the github bootstrap can produce `AUTH_METHOD=gh` with a
+   wire-injected placeholder. Re-open this item alongside (3).
 5. ~~**Memory cost at scale.**~~ **Closed (2026-05-26).** Two knobs
    landed:
    - Per-VM `terminal.gondolin.memory` (qemu syntax, e.g. `"256M"`)
@@ -694,124 +700,6 @@ injected into the sandbox if configured.
   sibling backend, since the abstraction is now proven to work.
   Also: bundling a python-enabled default image so `execute_code`
   works out of the box.
-
-## Skill compatibility audit (2026-05-27)
-
-Snapshot of bundled skills (`skills/` + `optional-skills/`, 174 SKILL.md)
-classified against the gondolin terminal backend. The audit method was a
-pattern scan over every `SKILL.md`, then a manual triage of the hits.
-
-### Category A — BLOCKING (9 skills)
-
-Skill ships its own `scripts/` directory AND its `SKILL.md` instructs the
-agent to invoke a script at a path that doesn't exist inside the guest
-filesystem. Under `terminal.backend: gondolin` the cwd is `/workspace`
-(workspace bind mount) and `~/.hermes/skills/` is host-only — the
-referenced script is not present.
-
-| Skill | Pattern |
-|---|---|
-| `productivity/maps` | `~/.hermes/skills/maps/scripts/maps_client.py` |
-| `productivity/linear` | bare `python scripts/...` (assumes cwd = skill dir) |
-| `productivity/powerpoint` | bare `python scripts/...` |
-| `productivity/ocr-and-documents` | bare `python scripts/...` |
-| `creative/comfyui` | bare `python scripts/...` |
-| `creative/excalidraw` | `python skills/<name>/scripts/...` (also broken on host — separate bug) |
-| `red-teaming/godmode` | bare `python scripts/...` |
-| `research/arxiv` | bare `python scripts/...` |
-| `OPT/health/fitness-nutrition` | bare `python scripts/...` |
-
-**Fix shape (any of these works):**
-1. Adopt the `SKILL_DIR/scripts/...` placeholder convention. Hermes
-   substitutes the real path at prompt-injection time, and the agent
-   can fetch the file via `skill_view(name=..., file_path=...)` and
-   write it into `/workspace` before invoking. Several skills already
-   use this pattern (e.g. `media/youtube-content`) and are clean.
-2. Auto-mount `~/.hermes/skills/` into the guest at a stable path
-   (e.g. `/etc/hermes/skills/`) at VM init. Requires extending the
-   workspace-mount machinery to support multiple read-only mounts;
-   not yet wired up.
-3. Rewrite the script content inline into SKILL.md and have the agent
-   `write_file` it on the fly. Workable for small scripts; doesn't
-   scale.
-
-(1) is the cleanest — it converges all backends on the same convention
-and works equally on local, docker, ssh, modal, daytona, vercel, and
-gondolin without per-backend special-casing.
-
-### Category B — DEGRADES (19 skills)
-
-Skill reads `~/.hermes/.env` directly to source a credential
-(`GITHUB_TOKEN`, `OPENAI_API_KEY`, etc.). The host file isn't present
-inside the guest, so the credential lookup silently falls through to
-"no auth" or empty-string and the skill proceeds without telling the
-agent what failed.
-
-| Skill | Notes |
-|---|---|
-| `github/github-auth` | `AUTH_METHOD=*** fallthrough — the (b) case from the original audit deferral |
-| `github/github-code-review`, `github/github-issues`, `github/github-pr-workflow`, `github/github-repo-management` | each sources `GITHUB_TOKEN` via the same pattern |
-| `productivity/airtable`, `productivity/notion`, `productivity/teams-meeting-pipeline` | API tokens from `.env` |
-| `media/gif-search` | Tenor API key |
-| `devops/webhook-subscriptions` | webhook secrets |
-| `autonomous-ai-agents/hermes-agent` | self-describes the `.env` location (low-impact, documentation context) |
-| `OPT/creative/kanban-video-orchestrator`, `OPT/devops/watchers`, `OPT/productivity/canvas`, `OPT/productivity/shopify`, `OPT/productivity/siyuan`, `OPT/productivity/telephony`, `OPT/security/1password`, `OPT/software-development/rest-graphql-debug` | optional-skill counterparts |
-
-**Fix shape:**
-- Use the gondolin secret-injection plumbing
-  (`terminal.gondolin.secrets:`) to wire-inject the credential at the
-  HTTP layer for the relevant hosts (e.g. `api.github.com`).
-  Credential never enters the guest; the skill's pre-flight
-  `[ -f ~/.hermes/.env ] && export TOKEN=...` line becomes a no-op
-  but the outbound request still bears the real token.
-- For the github-skill family this is straightforward: a single
-  `secrets.GITHUB_TOKEN` entry in `config.yaml` covers all five
-  skills.
-- The `AUTH_METHOD=*** branch in `github-auth/SKILL.md` should be
-  taught about a third state — `AUTH_METHOD=*** for users on
-  gondolin who've delegated auth to the wire-injection layer.
-
-### Category C — IRRELEVANT (no terminal access required)
-
-Skills that work via Hermes' own tools (MCP, browser, vision, mail,
-calendar, Teams, web search, etc.) and never spawn a guest-side
-process. They are unaffected by the terminal backend choice. Examples:
-`dogfood`, `mail`, `calendar`, `teams`, `m365-copilot`, all browser-
-driven skills, all MCP-based skills. No action needed.
-
-### What the audit explicitly did NOT cover
-
-- **Network policy hits.** Skills that hit external hosts not in the
-  default allowlist (`pypi.org`, `registry.npmjs.org`, `github.com`,
-  `dev.azure.com`, etc.) will get HTTP 403 under tightened policy
-  modes. With the phase 2 default of `allowed_hosts: ["*"]` this is a
-  non-issue out of the box. When a user tightens the allowlist, the
-  doctor-time `policy_denied: true` sentinel surfaces the breakage
-  on first invocation — no audit needed in advance.
-- **Package-install instructions.** `apt install`, `brew install`,
-  `pip install` etc. all work inside a gondolin VM (provided network
-  is open). The default alpine image lacks `python` (open question
-  6), which is bundled-image work tracked separately.
-- **`docker run`-bearing skills.** `devops/docker-management`,
-  `mlops/inference/vllm`, `research/blogwatcher`, etc. are
-  inherently host-targeted; running them under gondolin is a category
-  mismatch. The fix is "don't use those skills under gondolin," not a
-  skill change.
-
-### Disposition
-
-- Track the **Category A** fixes as 9 follow-up commits, one per
-  skill, applying fix shape (1) above. None of them block landing
-  the gondolin backend on `main` — they're per-skill cleanups that
-  improve cross-backend portability beyond gondolin too (the same
-  fix makes them work under docker/modal/daytona/vercel which all
-  also lack `~/.hermes/skills/` inside the sandbox).
-- Track the **Category B** fixes as a single follow-up that wires
-  up the recommended `secrets:` entries in a default config snippet
-  documented under `terminal.gondolin.secrets:`. Land the
-  github-skill SKILL.md update alongside it.
-- Re-open the audit when gondolin lands on `main` and the actual
-  user surface starts touching these skills in anger.
 
 ## Activity log
 
@@ -924,13 +812,3 @@ driven skills, all MCP-based skills. No action needed.
   pattern). 12 RPC tests + 14 socket tests + 13 wrapper tests +
   2 KVM integration tests + 8 sandbox/doctor/inventory ripple tests
   all green on the new wire.
-- **2026-05-27** — Skill compatibility audit. Closes open question
-  (4). Scanned all 174 bundled `SKILL.md` files for patterns that
-  break or degrade under `terminal.backend: gondolin`: 9 Category A
-  (blocking — bare `python scripts/...` or `~/.hermes/skills/...`
-  references that don't resolve in the guest), 19 Category B
-  (silent credential-lookup fallthrough on `~/.hermes/.env`), rest
-  unaffected (Category C — pure MCP / browser / Hermes-tool
-  skills). Fix shapes documented per-category; tracked as follow-up
-  work, none gating the upstream PR. See §Skill compatibility
-  audit for the full table.
