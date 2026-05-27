@@ -153,6 +153,7 @@ LAZY_DEPS: dict[str, tuple[str, ...]] = {
     "terminal.modal": ("modal==1.3.4",),
     "terminal.daytona": ("daytona==0.155.0",),
     "terminal.vercel": ("vercel==0.5.7",),
+    "terminal.gondolin": ("msgpack==1.1.0",),
 
     # ─── Skills ────────────────────────────────────────────────────────────
     "skill.google_workspace": (
