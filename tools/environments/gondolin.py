@@ -43,6 +43,51 @@ from tools.environments.gondolin_secret_refresh import SecretRefresher
 logger = logging.getLogger(__name__)
 
 
+def _start_daemon_stderr_reaper(proc, logger=logger):
+    """Drain the Node daemon's stderr pipe on a background thread.
+
+    The daemon is spawned with ``stderr=subprocess.PIPE`` so the operator
+    can see node-side diagnostics (boot failures, krun errors, V8
+    deprecation warnings). But subprocess.PIPE without an active reader
+    deadlocks: the kernel buffer (~64 KB on Linux) fills, then the
+    daemon's next ``write(2)`` on stderr blocks indefinitely and the
+    daemon's event loop wedges.
+
+    This reaper reads the pipe line-by-line and forwards each line to
+    the Hermes logger at WARNING level (daemon stderr is, by
+    definition, something we want surfaced). The thread exits cleanly
+    on EOF (daemon closed stderr — usually because the daemon process
+    exited).
+
+    Returns the thread handle so cleanup() can join it.
+    """
+    if proc.stderr is None:
+        return None
+
+    def _reap() -> None:
+        try:
+            for raw in iter(proc.stderr.readline, b""):
+                if not raw:
+                    break
+                try:
+                    line = raw.decode("utf-8", errors="replace").rstrip("\r\n")
+                except Exception:  # noqa: BLE001 — never let a log line kill the reaper
+                    line = repr(raw)
+                if line:
+                    logger.warning("gondolin daemon stderr: %s", line)
+        except (OSError, ValueError):
+            # ValueError: I/O on closed file (pipe closed under us during
+            # cleanup). OSError: pipe broken / EBADF on shutdown race.
+            # Either way, the reaper's job is done.
+            pass
+
+    t = threading.Thread(
+        target=_reap, name="gondolin-daemon-stderr-reaper", daemon=True
+    )
+    t.start()
+    return t
+
+
 def _ensure_msgpack() -> None:
     """Lazy-install msgpack on demand. Idempotent — fast no-op once installed.
 
@@ -518,6 +563,12 @@ class GondolinEnvironment(BaseEnvironment):
             stderr=subprocess.PIPE,
             env=env_vars,
         )
+        # Drain the daemon's stderr pipe so the kernel buffer never
+        # fills (B13). Without this, ~64 KB of stderr output is enough
+        # to wedge the daemon's write(2) and stall the whole VM.
+        self._daemon_stderr_reaper = _start_daemon_stderr_reaper(
+            self._daemon_proc, logger=logger
+        )
 
         try:
             _wait_for_socket(self.sock_path, timeout=init_timeout)
@@ -779,6 +830,18 @@ class GondolinEnvironment(BaseEnvironment):
                     proc.wait(timeout=2)
         except OSError as exc:
             logger.debug("gondolin daemon teardown error: %s", exc)
+        # Close the captured stderr pipe so the reaper exits and the
+        # parent's fd doesn't accumulate across long-lived sessions
+        # that create/destroy many envs (B13).
+        if proc.stderr is not None:
+            try:
+                proc.stderr.close()
+            except OSError:
+                pass
+        reaper = getattr(self, "_daemon_stderr_reaper", None)
+        if reaper is not None:
+            reaper.join(timeout=1.0)
+            self._daemon_stderr_reaper = None
         # Clean up any leftover socket file (daemon's own SIGTERM
         # handler also tries, but races with our terminate()).
         try:
