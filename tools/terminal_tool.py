@@ -1017,6 +1017,7 @@ _GONDOLIN_SECRET_ALLOWED_KEYS = frozenset({
     "value",
     "from_env",
     "from_command",
+    "env",
     "placeholder",
     "refresh",
     "refresh_command",
@@ -1150,6 +1151,24 @@ def _validate_gondolin_secrets(secrets):
                     f"gondolin secret {name!r}: 'refresh_command' must be a "
                     f"non-empty string"
                 )
+        if "env" in cfg:
+            user_env = cfg["env"]
+            if not isinstance(user_env, dict):
+                raise ValueError(
+                    f"gondolin secret {name!r}: 'env' must be an object of "
+                    f"{{str: str}} (got {type(user_env).__name__})"
+                )
+            for ek, ev in user_env.items():
+                if not isinstance(ek, str) or not ek:
+                    raise ValueError(
+                        f"gondolin secret {name!r}: 'env' keys must be "
+                        f"non-empty strings (got {ek!r})"
+                    )
+                if not isinstance(ev, str):
+                    raise ValueError(
+                        f"gondolin secret {name!r}: 'env[{ek}]' must be a "
+                        f"string (got {type(ev).__name__})"
+                    )
         for int_key in ("ttl_seconds", "refresh_before_expiry_seconds"):
             if int_key in cfg:
                 v = cfg[int_key]

@@ -470,6 +470,55 @@ not a network error. Path:
 When `allowed_hosts: ["*"]` (the default), there are no policy denials
 to worry about; this UX only matters in tightened mode.
 
+### Trust model: where the host-vs-guest line is drawn
+
+The agent runs in a guest VM with no real credentials and a policy-gated
+network. That's the property the backend exists to guarantee.
+
+The **configuration itself** lives on the host. Two narrow surfaces in
+the config can execute code or shell commands; both are scoped to match
+the rest of Hermes:
+
+1. **`secrets.*.from_command`** (`hooks.mjs`) and
+   **`secrets.*.refresh_command`** (`gondolin_secret_refresh.py`) run on
+   the host as the Hermes user. Both subprocesses get a **filtered
+   environment** — the safe POSIX baseline (`PATH`, `HOME`, `USER`,
+   `LANG`, `LC_ALL`, `TERM`, `SHELL`, `TMPDIR`, `XDG_*`) and nothing
+   else. The Hermes process env (API keys, tokens, secrets the user
+   exported in their shell) is **not** inherited. This matches MCP
+   servers (`tools/mcp_tool.py:_build_safe_env`) and Docker's
+   `docker_forward_env` convention: any extra env var a resolver needs
+   is explicit opt-in.
+
+   ```yaml
+   secrets:
+     OP_TOKEN:
+       hosts: [api.1password.com]
+       from_command: "op read 'op://Personal/Token/credential'"
+       env:
+         OP_SERVICE_ACCOUNT_TOKEN: "${OP_SERVICE_ACCOUNT_TOKEN}"
+   ```
+
+   Values can be literals or `${VAR}` references resolved against the
+   Hermes process env. A shell-injection bug in a user-authored
+   `refresh_command` can still execute arbitrary code under that
+   filtered env, but the blast radius is bounded by what the user opted
+   in to — same shape as a misbehaving MCP server.
+
+2. **`policy_script`** (`hooks.mjs:loadPolicy`) is loaded via dynamic
+   `import()` and runs with full Node API access. **Treat it as a
+   plugin.** Same trust level Hermes already applies to plugin code in
+   `~/.hermes/plugins/`: arbitrary code at host scope, allowed because
+   the user wrote it or installed it deliberately. The daemon logs
+   `loading user policy_script: <abs path>` at INFO so the boot is
+   visible.
+
+The wire-injection model defends the **guest VM** from real credentials.
+Env filtering defends the **host** from a misconfigured resolver
+exfiltrating credentials it wasn't told about. Plugin-trust on
+`policy_script` is the residual surface — same shape Hermes has always
+had elsewhere.
+
 ## Tool routing
 
 Hermes's `agent/prompt_builder.py::build_environment_hints` checks

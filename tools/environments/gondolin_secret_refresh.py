@@ -40,6 +40,7 @@ import binascii
 import json
 import logging
 import os
+import re
 import subprocess
 import threading
 import time
@@ -119,13 +120,88 @@ class _SecretState:
     # Marker for "no strategy available" — the loop reads this once and
     # never schedules another refresh for the secret.
     skip: bool = False
+    # Pre-built explicit env for ``refresh_command`` invocations. None
+    # means "use the safe baseline alone" — the common case. Set by
+    # add_secret() from the per-secret ``env:`` config.
+    env: dict[str, str] | None = None
 
 
-def _default_run_command(cmd: str) -> tuple[int, str, str]:
+def _interpolate_env_vars(value: str) -> str:
+    """Expand ``${VAR}`` references against ``os.environ``.
+
+    Matches ``tools/mcp_tool.py:_interpolate_env_vars`` (and
+    ``hooks.mjs:_interpolateEnvVars``) so the per-secret ``env:`` knob
+    behaves the same way across MCP servers and gondolin secrets.
+    Unset names expand to the empty string (same as MCP).
+    """
+    return _ENV_VAR_PATTERN.sub(lambda m: os.environ.get(m.group(1), ""), value)
+
+
+# Environment variables that are safe to inherit from the host into a
+# refresh_command subprocess. Mirrors
+# ``tools/mcp_tool.py:_SAFE_ENV_KEYS`` and
+# ``tools/environments/gondolin_host/src/hooks.mjs:_SAFE_ENV_KEYS`` —
+# any addition here must land in those files too. Hermes-wide
+# convention: config-driven subprocesses (MCP servers, docker
+# forward_env, gondolin secrets) get a baseline POSIX env and
+# anything else is explicit opt-in. Prevents a malicious config from
+# exfiltrating credentials held in the Hermes process env.
+_SAFE_ENV_KEYS = frozenset({
+    "PATH", "HOME", "USER", "LANG", "LC_ALL", "TERM", "SHELL", "TMPDIR",
+})
+
+_ENV_VAR_PATTERN = re.compile(r"\$\{([^}]+)\}")
+
+
+def _build_safe_env(user_env: dict | None) -> dict[str, str]:
+    """Build the env dict that gets passed to ``subprocess.run`` for a
+    refresh_command.
+
+    Starts from the safe POSIX baseline (PATH, HOME, USER, …, XDG_*) and
+    merges any caller-specified ``env:`` dict on top, with ``${VAR}``
+    interpolation against ``os.environ``. Non-string values are dropped
+    with a WARN so a typo'd YAML number doesn't silently disappear.
+
+    Returned dict is the explicit env for the subprocess — no inheritance.
+    """
+    env: dict[str, str] = {}
+    for key, value in os.environ.items():
+        if key in _SAFE_ENV_KEYS or key.startswith("XDG_"):
+            env[key] = value
+    if user_env:
+        for key, value in user_env.items():
+            if not isinstance(value, str):
+                logger.warning(
+                    "gondolin secret env: ignoring non-string value for %s (got %s)",
+                    key, type(value).__name__,
+                )
+                continue
+            env[key] = _interpolate_env_vars(value)
+    return env
+
+
+def _default_run_command(cmd: str, env: dict | None = None) -> tuple[int, str, str]:
     """Run ``cmd`` via shell, capture stdout/stderr, return (rc, stdout, stderr).
 
     Trim whitespace on stdout (a leading/trailing newline from ``echo`` is
     not meaningful). Stderr is preserved as-is for diagnostic display.
+
+    SECURITY (env isolation): ``cmd`` runs under ``subprocess.run(...,
+    shell=True)`` but with an EXPLICIT env built from the safe baseline
+    (PATH, HOME, USER, …, XDG_*) plus any ``env:`` dict the user opted
+    into per secret. The Hermes process env is NOT inherited, so a
+    refresh_command cannot exfiltrate the host's API keys / tokens by
+    writing ``env | curl ...``. This matches MCP's filtering
+    (``tools/mcp_tool.py:_build_safe_env``) and docker_forward_env's
+    explicit-opt-in shape. The ``shell=True`` is still required so users
+    can write ``op signin && op read 'op://...'`` style chains, but the
+    surface that "shell=True is dangerous" usually defends against —
+    leaking host credentials — no longer applies.
+
+    A shell-injection bug in a user-authored ``refresh_command`` can
+    still execute arbitrary code at host scope under that filtered env,
+    same as a misbehaving MCP server. See
+    docs/design/gondolin-terminal-backend.md "Trust model".
     """
     proc = subprocess.run(
         cmd,
@@ -133,6 +209,7 @@ def _default_run_command(cmd: str) -> tuple[int, str, str]:
         capture_output=True,
         text=True,
         timeout=30.0,
+        env=env if env is not None else _build_safe_env(None),
     )
     return (proc.returncode, (proc.stdout or "").strip(), proc.stderr or "")
 
@@ -159,7 +236,7 @@ class SecretRefresher:
         env_set_secret: Callable[..., None],
         time_source: Callable[[], float] | None = None,
         sleep_fn: Callable[[float], None] | None = None,
-        run_command: Callable[[str], tuple[int, str, str]] | None = None,
+        run_command: Callable[[str, dict | None], tuple[int, str, str]] | None = None,
     ):
         self._env_set_secret = env_set_secret
         self._now = time_source or time.time
@@ -184,8 +261,18 @@ class SecretRefresher:
         ttl_seconds: int | None,
         refresh_before_expiry_seconds: int,
         initial_value: str | None,
+        env: dict | None = None,
     ) -> None:
-        """Register a secret for refresh. Safe to call before ``start()``."""
+        """Register a secret for refresh. Safe to call before ``start()``.
+
+        ``env`` is the per-secret ``env:`` dict from config. It is
+        resolved against the safe POSIX baseline + ${VAR} interpolation
+        once at registration; the resolved dict is what every refresh
+        tick passes to the subprocess. Pass None (or omit) for the
+        common case of "the refresh command needs no extra env beyond
+        PATH/HOME/etc.".
+        """
+        resolved_env = _build_safe_env(env) if env is not None else None
         with self._lock:
             state = _SecretState(
                 name=name,
@@ -193,6 +280,7 @@ class SecretRefresher:
                 ttl_seconds=ttl_seconds,
                 refresh_before_expiry_seconds=refresh_before_expiry_seconds,
                 current_value=initial_value,
+                env=resolved_env,
             )
             state.next_refresh_at = plan_refresh_schedule(
                 value=initial_value,
@@ -263,7 +351,7 @@ class SecretRefresher:
 
     def _refresh_one(self, state: _SecretState) -> None:
         try:
-            rc, stdout, stderr = self._run_command(state.refresh_command)
+            rc, stdout, stderr = self._run_command(state.refresh_command, state.env)
         except subprocess.TimeoutExpired:
             self._schedule_retry(state, "refresh command timed out", stderr="")
             return

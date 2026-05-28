@@ -741,3 +741,50 @@ def test_secrets_validator_error_names_the_secret(monkeypatch):
     with pytest.raises(ValueError) as excinfo:
         _get_env_config()
     assert "BROKEN_TOKEN" in str(excinfo.value)
+
+
+# ---- per-secret env: dict (env-isolation opt-in, G2-revisit) ------------
+
+def test_secrets_validator_accepts_env_dict(monkeypatch):
+    """Per-secret env: dict is the opt-in escape hatch for a from_command
+    that legitimately needs an env var. Schema accepts {str: str}."""
+    from tools.terminal_tool import _get_env_config
+
+    _set_secrets(monkeypatch, {
+        "OP_TOKEN": {
+            "hosts": ["api.1password.com"],
+            "from_command": "op read 'op://Personal/Token/credential'",
+            "env": {
+                "OP_SERVICE_ACCOUNT_TOKEN": "${OP_SERVICE_ACCOUNT_TOKEN}",
+            },
+        },
+    })
+    cfg = _get_env_config()
+    assert cfg["gondolin"]["secrets"]["OP_TOKEN"]["env"] == {
+        "OP_SERVICE_ACCOUNT_TOKEN": "${OP_SERVICE_ACCOUNT_TOKEN}",
+    }
+
+
+def test_secrets_validator_rejects_env_not_dict(monkeypatch):
+    _assert_invalid(
+        monkeypatch,
+        {"X": {"hosts": ["a"], "from_env": "X", "env": ["NOT_A_DICT"]}},
+        fragment="'env' must be an object",
+    )
+
+
+def test_secrets_validator_rejects_env_non_string_value(monkeypatch):
+    """Typo'd YAML number like `env: { TTL: 60 }` (meant as a string)."""
+    _assert_invalid(
+        monkeypatch,
+        {"X": {"hosts": ["a"], "from_env": "X", "env": {"TTL": 60}}},
+        fragment="'env[TTL]' must be a string",
+    )
+
+
+def test_secrets_validator_rejects_env_empty_key(monkeypatch):
+    _assert_invalid(
+        monkeypatch,
+        {"X": {"hosts": ["a"], "from_env": "X", "env": {"": "value"}}},
+        fragment="'env' keys must be non-empty strings",
+    )

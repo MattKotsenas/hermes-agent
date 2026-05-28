@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import base64
 import json
+import logging
 import threading
 import time
 
@@ -205,7 +206,7 @@ def test_refresher_does_not_leak_stderr_in_warn_log_by_default(caplog, monkeypat
     def fake_set_secret(name, *, value):
         push_event.set()
 
-    def fake_run_command(cmd):
+    def fake_run_command(cmd, env=None):
         attempts["n"] += 1
         if attempts["n"] < 2:
             return (1, "", leaked)
@@ -259,7 +260,7 @@ def test_refresher_opts_into_stderr_capture_with_debug_env(caplog, monkeypatch):
     def fake_set_secret(name, *, value):
         push_event.set()
 
-    def fake_run_command(cmd):
+    def fake_run_command(cmd, env=None):
         attempts["n"] += 1
         if attempts["n"] < 2:
             return (1, "", "specific-debug-marker-XYZ")
@@ -309,7 +310,7 @@ def test_refresher_handles_command_failure_with_warn_and_retry():
         push_event.set()
 
     # First two refresh-command invocations fail, third succeeds.
-    def fake_run_command(cmd: str) -> tuple[int, str, str]:
+    def fake_run_command(cmd: str, env: dict | None = None) -> tuple[int, str, str]:
         attempts["n"] += 1
         if attempts["n"] < 3:
             return (1, "", "transient auth blip")
@@ -478,3 +479,211 @@ def test_refresher_default_sleep_is_interruptible_by_stop():
     assert not refresher.is_running(), "thread did not exit after stop()"
     # 0.5s is generous; pre-fix this would have been ~3300s (or never).
     assert elapsed < 0.5, f"stop() took {elapsed:.2f}s — sleep not interruptible"
+
+
+# ---- env isolation (G2-Python: refresh_command does not inherit host env) ----
+
+def test_build_safe_env_filters_arbitrary_host_vars(monkeypatch):
+    """The Hermes process env (API keys, tokens) must NOT leak into a
+    refresh_command subprocess. Only the safe POSIX baseline passes
+    through. Mirrors the JS-side regression in hooks.test.mjs."""
+    from tools.environments.gondolin_secret_refresh import _build_safe_env
+
+    monkeypatch.setenv("PATH", "/usr/bin:/bin")
+    monkeypatch.setenv("HOME", "/home/test")
+    monkeypatch.setenv("HERMES_TEST_NEVER_LEAK", "secret-token-do-not-leak")
+
+    env = _build_safe_env(None)
+    assert env["PATH"] == "/usr/bin:/bin"
+    assert env["HOME"] == "/home/test"
+    assert "HERMES_TEST_NEVER_LEAK" not in env
+
+
+def test_build_safe_env_xdg_prefix_passes_through(monkeypatch):
+    """XDG_* variables are part of the POSIX baseline (XDG Base
+    Directory spec) and pass through alongside PATH/HOME/etc."""
+    from tools.environments.gondolin_secret_refresh import _build_safe_env
+
+    monkeypatch.setenv("XDG_RUNTIME_DIR", "/run/user/1000")
+    env = _build_safe_env(None)
+    assert env["XDG_RUNTIME_DIR"] == "/run/user/1000"
+
+
+def test_build_safe_env_merges_user_env(monkeypatch):
+    """Per-secret env: dict from config merges on top of the baseline.
+    Literal values pass through verbatim."""
+    from tools.environments.gondolin_secret_refresh import _build_safe_env
+
+    monkeypatch.setenv("PATH", "/usr/bin")
+    env = _build_safe_env({"MY_OPT_IN": "value-from-config"})
+    assert env["MY_OPT_IN"] == "value-from-config"
+    assert env["PATH"] == "/usr/bin"  # baseline still present
+
+
+def test_build_safe_env_interpolates_dollar_var(monkeypatch):
+    """${VAR} references in the per-secret env: dict resolve against
+    the Hermes process env. Same syntax as MCP server configs."""
+    from tools.environments.gondolin_secret_refresh import _build_safe_env
+
+    monkeypatch.setenv("HERMES_TEST_SRC", "interp-resolved")
+    env = _build_safe_env({"DERIVED": "${HERMES_TEST_SRC}"})
+    assert env["DERIVED"] == "interp-resolved"
+
+
+def test_build_safe_env_unset_var_expands_to_empty(monkeypatch):
+    """Matches MCP semantics: ${UNSET} → "" rather than raising or
+    leaving the literal ${UNSET} in place. Lets users write defensive
+    configs without env_unset-style guards."""
+    from tools.environments.gondolin_secret_refresh import _build_safe_env
+
+    monkeypatch.delenv("HERMES_TEST_DEFINITELY_UNSET", raising=False)
+    env = _build_safe_env({"MAYBE": "${HERMES_TEST_DEFINITELY_UNSET}"})
+    assert env["MAYBE"] == ""
+
+
+def test_build_safe_env_drops_non_string_values(caplog):
+    """A typo'd YAML number (e.g. `env: { KEY: 42 }`) is dropped with a
+    WARN log so the misconfig is visible without crashing the daemon."""
+    from tools.environments.gondolin_secret_refresh import _build_safe_env
+
+    with caplog.at_level(logging.WARNING, logger="tools.environments.gondolin_secret_refresh"):
+        env = _build_safe_env({"BAD": 42, "GOOD": "ok"})
+    assert "BAD" not in env
+    assert env["GOOD"] == "ok"
+    assert any("ignoring non-string" in r.message for r in caplog.records)
+
+
+def test_default_run_command_does_not_inherit_arbitrary_host_env(monkeypatch):
+    """End-to-end regression: a refresh_command that asks for an env var
+    NOT in the safe baseline and NOT opted in via env: should see it as
+    unset. This is the malicious-config exfiltration shape from G2."""
+    from tools.environments.gondolin_secret_refresh import _default_run_command
+
+    monkeypatch.setenv("HERMES_TEST_LEAK_TARGET", "MUST_NOT_LEAK")
+    # No env= passed to the subprocess explicitly — should default to
+    # the safe baseline (PATH/HOME/etc.) only.
+    rc, stdout, _ = _default_run_command(
+        'echo "${HERMES_TEST_LEAK_TARGET:-NOT_SET}"',
+    )
+    assert rc == 0
+    assert stdout == "NOT_SET", (
+        f"refresh_command saw the host env var — env isolation broken: {stdout!r}"
+    )
+
+
+def test_default_run_command_sees_explicitly_opted_in_env(monkeypatch):
+    """The escape hatch: when the per-secret env: dict opts a var in,
+    the refresh subprocess sees it."""
+    from tools.environments.gondolin_secret_refresh import (
+        _build_safe_env,
+        _default_run_command,
+    )
+
+    monkeypatch.setenv("HERMES_TEST_OPT_IN_SRC", "OPT_IN_VALUE")
+    explicit_env = _build_safe_env({"HERMES_TEST_OPT_IN_SRC": "${HERMES_TEST_OPT_IN_SRC}"})
+    rc, stdout, _ = _default_run_command(
+        'echo "${HERMES_TEST_OPT_IN_SRC:-MISSING}"',
+        env=explicit_env,
+    )
+    assert rc == 0
+    assert stdout == "OPT_IN_VALUE"
+
+
+def test_refresher_threads_per_secret_env_through_to_subprocess(monkeypatch):
+    """End-to-end: a SecretRefresher started with a per-secret env=
+    dict must pass the resolved env to its _run_command callback every
+    refresh tick. Pins the contract that the env: YAML key actually
+    reaches the subprocess."""
+    from tools.environments.gondolin_secret_refresh import SecretRefresher
+
+    monkeypatch.setenv("HERMES_TEST_OPT_IN_SRC", "opt-in-value-789")
+
+    captured_envs: list[dict | None] = []
+    push_event = threading.Event()
+
+    def fake_set_secret(name, *, value):
+        push_event.set()
+
+    def fake_run_command(cmd, env=None):
+        captured_envs.append(env)
+        return (0, "refreshed-token", "")
+
+    clock = _FakeClock(start=1_000_000.0)
+    refresher = SecretRefresher(
+        env_set_secret=fake_set_secret,
+        time_source=clock.now,
+        sleep_fn=clock.sleep,
+        run_command=fake_run_command,
+    )
+    refresher.add_secret(
+        name="OP_TOKEN",
+        refresh_command="op read 'op://Personal/Token/credential'",
+        ttl_seconds=600,
+        refresh_before_expiry_seconds=60,
+        initial_value="initial-v1",
+        env={"OP_SERVICE_ACCOUNT_TOKEN": "${HERMES_TEST_OPT_IN_SRC}"},
+    )
+    refresher.start()
+    try:
+        # First refresh at 540s (ttl - refresh_before).
+        clock.advance(541)
+        assert push_event.wait(timeout=5.0)
+        assert captured_envs, "fake_run_command was never invoked"
+        seen = captured_envs[0]
+        assert seen is not None, "per-secret env: should produce a non-None subprocess env"
+        # Interpolation happened.
+        assert seen.get("OP_SERVICE_ACCOUNT_TOKEN") == "opt-in-value-789"
+        # Baseline still present.
+        assert "PATH" in seen
+        # Arbitrary host vars still filtered.
+        assert "HERMES_TEST_OPT_IN_SRC" not in seen, (
+            "raw source var leaked instead of going through ${} interpolation"
+        )
+    finally:
+        refresher.stop()
+
+
+def test_refresher_no_env_means_safe_baseline_only(monkeypatch):
+    """When add_secret() is called without env=, the subprocess sees the
+    safe baseline only — env is None on the state object and
+    _default_run_command falls back to _build_safe_env(None) at call
+    time. (Existing tests pass run_command= so they don't exercise this
+    contract; pin it explicitly.)"""
+    from tools.environments.gondolin_secret_refresh import SecretRefresher
+
+    captured_envs: list[dict | None] = []
+    push_event = threading.Event()
+
+    def fake_set_secret(name, *, value):
+        push_event.set()
+
+    def fake_run_command(cmd, env=None):
+        captured_envs.append(env)
+        return (0, "refreshed-token", "")
+
+    clock = _FakeClock(start=1_000_000.0)
+    refresher = SecretRefresher(
+        env_set_secret=fake_set_secret,
+        time_source=clock.now,
+        sleep_fn=clock.sleep,
+        run_command=fake_run_command,
+    )
+    refresher.add_secret(
+        name="X",
+        refresh_command="echo y",
+        ttl_seconds=600,
+        refresh_before_expiry_seconds=60,
+        initial_value="x",
+        # no env=
+    )
+    refresher.start()
+    try:
+        clock.advance(541)
+        assert push_event.wait(timeout=5.0)
+        assert captured_envs == [None], (
+            "secret added without env= should produce env=None at the run "
+            f"boundary (so _default_run_command builds the safe baseline); "
+            f"got {captured_envs!r}"
+        )
+    finally:
+        refresher.stop()

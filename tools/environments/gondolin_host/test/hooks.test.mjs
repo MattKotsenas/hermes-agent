@@ -361,3 +361,100 @@ test("buildHooksInput: from_command empty stdout reports it (likely script bug)"
   assert.equal(d.type, "from_command");
   assert.match(d.error, /empty|no output/i);
 });
+
+
+// ---- env isolation (G2: from_command does not inherit host env) --------
+
+import { resolveSecret as _resolveSecret, buildSafeEnv } from "../src/hooks.mjs";
+
+test("buildSafeEnv: PATH/HOME pass through, OPENAI_API_KEY does not", () => {
+  process.env.HERMES_TEST_NEVER_LEAK = "this-is-a-secret-do-not-leak";
+  try {
+    const e = buildSafeEnv(undefined);
+    assert.ok(e.PATH, "PATH must pass through the safe baseline");
+    assert.ok(e.HOME, "HOME must pass through the safe baseline");
+    assert.equal(
+      e.HERMES_TEST_NEVER_LEAK,
+      undefined,
+      "arbitrary host env must NOT leak into from_command",
+    );
+  } finally {
+    delete process.env.HERMES_TEST_NEVER_LEAK;
+  }
+});
+
+test("buildSafeEnv: XDG_* prefix passes through", () => {
+  process.env.XDG_TEST_DIR = "/tmp/xdg-test";
+  try {
+    const e = buildSafeEnv(undefined);
+    assert.equal(e.XDG_TEST_DIR, "/tmp/xdg-test");
+  } finally {
+    delete process.env.XDG_TEST_DIR;
+  }
+});
+
+test("buildSafeEnv: per-secret env merges on top of baseline", () => {
+  const e = buildSafeEnv({ MY_OPT_IN: "value-from-config" });
+  assert.equal(e.MY_OPT_IN, "value-from-config");
+  assert.ok(e.PATH, "baseline still present alongside opt-in keys");
+});
+
+test("buildSafeEnv: ${VAR} interpolates against process.env", () => {
+  process.env.HERMES_TEST_INTERP_SOURCE = "interp-resolved";
+  try {
+    const e = buildSafeEnv({ DERIVED: "${HERMES_TEST_INTERP_SOURCE}" });
+    assert.equal(e.DERIVED, "interp-resolved");
+  } finally {
+    delete process.env.HERMES_TEST_INTERP_SOURCE;
+  }
+});
+
+test("buildSafeEnv: ${VAR} for unset var expands to empty string (MCP parity)", () => {
+  delete process.env.HERMES_TEST_DEFINITELY_UNSET;
+  const e = buildSafeEnv({ MAYBE: "${HERMES_TEST_DEFINITELY_UNSET}" });
+  assert.equal(e.MAYBE, "");
+});
+
+test("buildSafeEnv: non-string env values are dropped (typo'd YAML number)", () => {
+  // Silence the expected warn so test output stays clean.
+  const origWarn = console.warn;
+  console.warn = () => {};
+  try {
+    const e = buildSafeEnv({ BAD: 42, GOOD: "ok" });
+    assert.equal(e.BAD, undefined);
+    assert.equal(e.GOOD, "ok");
+  } finally {
+    console.warn = origWarn;
+  }
+});
+
+test("from_command does NOT see host env vars outside the safe baseline (G2 regression)", () => {
+  // The whole point: a malicious `from_command` like `env | …` must not
+  // be able to read a host-side credential the user happened to export.
+  process.env.HERMES_TEST_LEAK_TARGET = "MUST_NOT_LEAK_TOKEN";
+  try {
+    const v = _resolveSecret({
+      from_command: "echo \"${HERMES_TEST_LEAK_TARGET:-NOT_SET}\"",
+    });
+    assert.equal(
+      v, "NOT_SET",
+      "from_command saw the host env var — env isolation is broken",
+    );
+  } finally {
+    delete process.env.HERMES_TEST_LEAK_TARGET;
+  }
+});
+
+test("from_command sees env vars the user explicitly opted in to (per-secret env)", () => {
+  // The escape hatch: declared env: { KEY: "${HOST_VAR}" } passes through.
+  process.env.HERMES_TEST_OPT_IN_SRC = "OPT_IN_VALUE";
+  try {
+    const v = _resolveSecret({
+      from_command: "echo \"${HERMES_TEST_OPT_IN_SRC:-MISSING}\"",
+      env: { HERMES_TEST_OPT_IN_SRC: "${HERMES_TEST_OPT_IN_SRC}" },
+    });
+    assert.equal(v, "OPT_IN_VALUE");
+  } finally {
+    delete process.env.HERMES_TEST_OPT_IN_SRC;
+  }
+});

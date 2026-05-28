@@ -24,6 +24,54 @@ import { pathToFileURL } from "node:url";
 
 import { makePlaceholderFunc } from "@earendil-works/gondolin";
 
+// Environment variables that are safe to pass to from_command subprocesses.
+// Mirrors tools/mcp_tool.py:_SAFE_ENV_KEYS so config-driven subprocess
+// invocations in gondolin behave the same way Hermes treats every other
+// config-driven subprocess (MCP servers, docker_forward_env): only a
+// baseline POSIX environment is inherited, anything else is opt-in
+// through the per-secret `env:` key. Keep the two lists in sync — any
+// addition here must also land in mcp_tool.py and vice versa.
+const _SAFE_ENV_KEYS = new Set([
+  "PATH", "HOME", "USER", "LANG", "LC_ALL", "TERM", "SHELL", "TMPDIR",
+]);
+
+// Pre-compiled pattern for ${VAR_NAME} style env-var interpolation,
+// matching the MCP server config (mcp_tool.py:_ENV_VAR_PATTERN). Same
+// semantics: `${X}` expands to process.env[X] or "" if unset.
+const _ENV_VAR_PATTERN = /\$\{([^}]+)\}/g;
+
+function _interpolateEnvVars(value) {
+  if (typeof value !== "string") return value;
+  return value.replace(_ENV_VAR_PATTERN, (_, name) => process.env[name] ?? "");
+}
+
+// Build the env dict that gets passed to execSync for a from_command.
+// Starts from the safe POSIX baseline (PATH, HOME, USER, …, XDG_*) and
+// merges any caller-specified `env:` dict on top, with ${VAR}
+// interpolation against process.env. Values that aren't strings are
+// dropped (and a console.warn issued) so a typo'd YAML number doesn't
+// silently disappear.
+export function buildSafeEnv(userEnv) {
+  const env = {};
+  for (const [k, v] of Object.entries(process.env)) {
+    if (_SAFE_ENV_KEYS.has(k) || k.startsWith("XDG_")) {
+      env[k] = v;
+    }
+  }
+  if (userEnv && typeof userEnv === "object") {
+    for (const [k, v] of Object.entries(userEnv)) {
+      if (typeof v !== "string") {
+        console.warn(
+          `secret env: ignoring non-string value for ${k} (got ${typeof v})`,
+        );
+        continue;
+      }
+      env[k] = _interpolateEnvVars(v);
+    }
+  }
+  return env;
+}
+
 // Resolve a single secret config to either a value (string) or a structured
 // diagnostic describing why it couldn't be resolved. The diagnostic includes
 // the secret name, the resolver type that was attempted, an error message,
@@ -55,13 +103,30 @@ export function resolveSecretWithDiagnostics(name, cfg) {
     const timeoutMs = typeof cfg.timeout_ms === "number" && cfg.timeout_ms > 0
       ? cfg.timeout_ms
       : 30_000;
-    // SECURITY: captured stderr/stdout from a failing resolver may contain
-    // partial secrets — a token half-written before exit, a JWT echoed in
-    // a verbose error, the raw response body from a misconfigured auth
-    // endpoint. They DO NOT enter the diagnostic by default. Set
-    // HERMES_GONDOLIN_DEBUG_SECRETS=1 to opt in when debugging a broken
-    // resolver. The flag is host-side only and never propagated to the
-    // guest.
+    // SECURITY (env isolation): from_command runs as the host user via
+    // execSync. We DO NOT inherit the full process.env — instead we
+    // pass a filtered baseline (PATH, HOME, USER, …, XDG_*) plus any
+    // explicit `env:` keys the user opted into. This mirrors how
+    // Hermes treats every other config-driven subprocess (see
+    // tools/mcp_tool.py:_build_safe_env and docker_forward_env). A
+    // malicious config can no longer exfiltrate API keys held in the
+    // Hermes process env by writing `from_command: "env | curl ..."`.
+    // If a resolver legitimately needs an env var (e.g. `op signin`
+    // wanting OP_SERVICE_ACCOUNT_TOKEN), opt in per secret:
+    //   secrets:
+    //     OP_TOKEN:
+    //       hosts: [api.1password.com]
+    //       from_command: "op read 'op://Personal/Token/credential'"
+    //       env:
+    //         OP_SERVICE_ACCOUNT_TOKEN: "${OP_SERVICE_ACCOUNT_TOKEN}"
+    //
+    // SECURITY (diagnostic leak): captured stderr/stdout from a failing
+    // resolver may contain partial secrets — a token half-written before
+    // exit, a JWT echoed in a verbose error, the raw response body from
+    // a misconfigured auth endpoint. They DO NOT enter the diagnostic by
+    // default. Set HERMES_GONDOLIN_DEBUG_SECRETS=1 to opt in when
+    // debugging a broken resolver. The flag is host-side only and never
+    // propagated to the guest.
     const debugCapture = process.env.HERMES_GONDOLIN_DEBUG_SECRETS === "1";
     let stdout;
     try {
@@ -69,6 +134,7 @@ export function resolveSecretWithDiagnostics(name, cfg) {
         encoding: "utf8",
         stdio: ["ignore", "pipe", "pipe"],
         timeout: timeoutMs,
+        env: buildSafeEnv(cfg.env),
       });
     } catch (err) {
       // execSync attaches stderr/stdout/status/signal on the error object.
@@ -180,6 +246,21 @@ export function buildHooksInput(yaml = {}) {
   return { allowedHosts, secrets, secretDiagnostics };
 }
 
+// loadPolicy(scriptPath) returns the function the daemon calls per VM
+// init to convert the YAML config into Gondolin's createHttpHooks input.
+//
+// When scriptPath is null the default in-process buildHooksInput is used.
+// When scriptPath is set, the file at that path is dynamically imported
+// as an ES module and its getHooks(yaml) export is used instead.
+//
+// SECURITY (plugin trust): policy_script is loaded via dynamic import()
+// at session init. The imported module runs with the full Node API
+// (filesystem, network, child processes, env) at host privilege —
+// equivalent to a Hermes plugin. Treat it with the same trust level
+// you'd apply to a plugin under ~/.hermes/plugins/. The daemon emits
+// a "loading user policy_script" log line at INFO so the boot is
+// visible. See docs/design/gondolin-terminal-backend.md
+// "Trust model: where the host-vs-guest line is drawn".
 export async function loadPolicy(scriptPath) {
   if (!scriptPath) {
     return async (yaml) => buildHooksInput(yaml);

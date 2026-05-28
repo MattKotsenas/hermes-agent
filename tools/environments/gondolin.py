@@ -636,6 +636,10 @@ class GondolinEnvironment(BaseEnvironment):
                     cfg.get("refresh_before_expiry_seconds", 300)
                 ),
                 "initial_value": cfg.get("value") if isinstance(cfg.get("value"), str) else None,
+                # Per-secret env: dict that the refresh subprocess sees,
+                # on top of the safe POSIX baseline (PATH, HOME, etc.).
+                # See _build_safe_env in gondolin_secret_refresh.py.
+                "env": cfg.get("env") if isinstance(cfg.get("env"), dict) else None,
             })
 
         if not refresh_entries:

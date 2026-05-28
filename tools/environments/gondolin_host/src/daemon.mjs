@@ -355,6 +355,14 @@ const handlers = {
       return result;
     }
 
+    if (config.policy_script) {
+      // Visible boot signal: the user pinned a custom policy script;
+      // log its absolute path before we run any of its code so a
+      // mis-targeted path (or a surprise script left over from a
+      // different config) shows up in the daemon log instead of
+      // silently executing. SECURITY: see hooks.mjs:loadPolicy.
+      log("loading user policy_script:", config.policy_script);
+    }
     const policy = await loadPolicy(config.policy_script ?? null);
     const hooksInput = await policy(config);
     log("policy resolved:", {
