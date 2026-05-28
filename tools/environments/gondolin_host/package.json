@@ -5,7 +5,7 @@
   "private": true,
   "description": "Per-Hermes-session daemon that owns one Gondolin micro-VM and exposes JSON-RPC over a Unix socket.",
   "scripts": {
-    "test": "node --test --test-reporter=spec test/"
+    "test": "node --test --test-reporter=spec 'test/*.test.mjs'"
   },
   "dependencies": {
     "@earendil-works/gondolin": "^0.12.0",
