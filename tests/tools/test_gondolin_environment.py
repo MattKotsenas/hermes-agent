@@ -133,6 +133,38 @@ def test_daemon_init_failure_is_surfaced(tmp_path, monkeypatch):
 
 
 @requires_node
+def test_rootfs_size_error_gets_actionable_hint(tmp_path, monkeypatch):
+    """When the daemon rejects a rootfs.size config (custom image without
+    e2fsprogs, or rootfs.mode='memory'), the bare gondolin error is not
+    actionable on its own — Python prepends a hint pointing the user at
+    the -1 opt-out sentinel and the docs."""
+    sandbox = tmp_path / "sandbox"
+
+    def fake_rpc(sock_path, request, timeout=30.0):
+        if request.get("method") == "init":
+            return {
+                "id": request.get("id"),
+                "error": {
+                    "message": "rootfs.size requires resize2fs in the guest image (install e2fsprogs)",
+                },
+            }
+        return {"id": request.get("id"), "result": {"ok": True}}
+
+    monkeypatch.setattr(gondolin_mod, "_rpc_call", fake_rpc)
+    with pytest.raises(RuntimeError) as excinfo:
+        GondolinEnvironment(
+            sandbox_dir=str(sandbox),
+            stub_vm=True,
+            config={"rootfs_size_mb": 10240},
+            init_timeout=5.0,
+        )
+    msg = str(excinfo.value)
+    assert "rootfs.size requires resize2fs" in msg
+    assert "rootfs_size_mb: -1" in msg
+    assert "container_disk: -1" in msg
+
+
+@requires_node
 def test_missing_node_binary_raises_clear_error(monkeypatch, tmp_path):
     """If 'node' is not on PATH, GondolinEnvironment construction fails
     with a diagnostic that names the missing dependency."""

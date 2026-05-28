@@ -529,6 +529,23 @@ class GondolinEnvironment(BaseEnvironment):
             if response.get("error") is not None:
                 err = response["error"]
                 msg = err.get("message", str(err)) if isinstance(err, dict) else str(err)
+                # Friendly hint for the rootfs-cap failure modes: a custom
+                # image without e2fsprogs, or rootfs.mode='memory'/'readonly',
+                # surfaces here as a raw gondolin error. Point the user at
+                # the opt-out sentinel instead of leaving them to find the
+                # doc page from a bare "rootfs.size requires..." line.
+                lower = msg.lower()
+                if "rootfs.size" in lower or "resize2fs" in lower:
+                    msg = (
+                        f"{msg}\n\n"
+                        f"This usually means the guest image lacks e2fsprogs or "
+                        f"the rootfs is pinned to a non-resizable mode. To opt "
+                        f"out of the rootfs cap, set "
+                        f"`terminal.gondolin.rootfs_size_mb: -1` (per-backend) "
+                        f"or `terminal.container_disk: -1` (shared). See "
+                        f"website/docs/user-guide/configuration.md "
+                        f"'Rootfs cap' for the trade-off."
+                    )
                 raise RuntimeError(f"gondolin daemon init failed: {msg}")
             result = response.get("result") or {}
             wm = result.get("workspaceMount")
