@@ -391,8 +391,23 @@ class GondolinEnvironment(BaseEnvironment):
             )
         except BaseException:
             # Any failure between slot acquire and successful init must
-            # release the slot, regardless of source (slot logic, daemon
-            # spawn, RPC, KeyboardInterrupt).
+            # release the slot AND terminate the daemon, regardless of
+            # source (slot logic, daemon spawn, RPC, KeyboardInterrupt).
+            #
+            # _init_after_slot's inner `except Exception` handles
+            # ordinary failures (it calls _terminate_daemon then
+            # re-raises). But KeyboardInterrupt / SystemExit slip past
+            # that `Exception` filter and reach us here. Without an
+            # explicit terminate, a Ctrl-C during _wait_for_socket or
+            # the init RPC leaks the 256-512 MB Node+VM allocation
+            # (B16). Same applies to any future BaseException-derived
+            # exception. _terminate_daemon is idempotent (no-op when
+            # _daemon_proc is None or already reaped), so calling it
+            # here can't double-kill the inner handler's work.
+            try:
+                self._terminate_daemon()
+            except Exception:  # noqa: BLE001
+                pass
             if self._slot is not None:
                 _release_vm_slot(self._slot)
                 self._slot = None
@@ -780,13 +795,20 @@ class GondolinEnvironment(BaseEnvironment):
 
         # Best-effort graceful shutdown via RPC. Time-limited so a wedged
         # daemon doesn't block the calling session forever.
+        #
+        # B17: catch any exception (not just OSError/RuntimeError). A
+        # malformed shutdown response — truncated msgpack frame, bad
+        # type, unexpected wire format — raises something outside the
+        # original narrow tuple, and the exception would escape
+        # cleanup(), skipping _terminate_daemon + workspace rmtree +
+        # slot release. Over many bad shutdowns the cap exhausts.
         try:
             _rpc_call(
                 self.sock_path,
                 {"id": 9999, "method": "shutdown", "params": {}},
                 timeout=5.0,
             )
-        except (OSError, RuntimeError) as exc:
+        except Exception as exc:  # noqa: BLE001
             logger.debug("gondolin shutdown rpc failed (will SIGTERM): %s", exc)
 
         self._terminate_daemon()
