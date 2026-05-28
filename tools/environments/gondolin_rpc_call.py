@@ -73,7 +73,14 @@ def _read_frame(buf: bytearray, sock: socket.socket) -> tuple[Any, bytearray]:
                 payload = bytes(buf[4:4 + n])
                 rest = bytearray(buf[4 + n:])
                 return msgpack.unpackb(payload, raw=False), rest
-        chunk = sock.recv(65536)
+        try:
+            chunk = sock.recv(65536)
+        except socket.timeout:
+            raise SystemExit(
+                f"gondolin: daemon went silent for "
+                f"{sock.gettimeout():.0f}s mid-frame; aborting "
+                f"(daemon may be wedged or vm.exec hung)"
+            )
         if not chunk:
             raise SystemExit("gondolin: daemon closed connection mid-frame")
         buf.extend(chunk)
@@ -141,6 +148,19 @@ def main(argv: list[str] | None = None) -> int:
     request = {"id": 1, "method": method, "params": params}
 
     with _connect_with_diagnostic(args.socket) as sock:
+        # Bound inter-frame silence so a stuck daemon (wedged vm.exec,
+        # crashed handler mid-stream) surfaces a clean error instead of
+        # blocking forever. BaseEnvironment's wall-clock SIGTERM would
+        # eventually rescue us, but its diagnostic is generic; ours
+        # names the socket and the timeout. Generous default — much
+        # larger than any realistic per-chunk latency — plus the user's
+        # own --timeout-ms if set, with a grace overhead.
+        per_call_timeout = (
+            (args.timeout_ms / 1000.0 + 30.0)
+            if args.timeout_ms is not None
+            else 600.0
+        )
+        sock.settimeout(per_call_timeout)
         if args.stream:
             return _run_streaming(sock, request)
         response = _send_request(sock, request)

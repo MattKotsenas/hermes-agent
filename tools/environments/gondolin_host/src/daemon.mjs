@@ -463,32 +463,21 @@ const handlers = {
       // Stub path or any adapter that exposes a stream-shaped interface.
       proc = vm.execStreaming(wrapped, { timeout: timeoutMs });
     } else {
-      // Real Gondolin: vm.exec with { stdout: "pipe" } returns an
-      // ExecProcess that's async-iterable per chunk. The iterator yields
-      // raw chunks (Buffers); we re-wrap each as {kind: "stdout", data}
-      // with the bytes passed through unmodified. msgpack carries binary
-      // data natively (bin8/bin32), so no encoding step is needed —
-      // arbitrary process output (test fixtures with non-UTF-8 bytes,
-      // compiled artefacts piped to stdout, etc.) survives the wire.
+      // Real Gondolin: vm.exec returns an ExecProcess. The Symbol.asyncIterator
+      // surface yields the merged stdout (all chunks tagged "string") which
+      // loses the stderr/stdout split — pytest/npm/gcc and any tool that
+      // diffs stderr would misclassify under --stream. Use ExecProcess.output()
+      // instead: it returns AsyncIterable<OutputChunk> with each chunk
+      // carrying { stream: "stdout"|"stderr", data: Buffer, text: string },
+      // matching the non-stream exec's split exactly.
       const real = vm.exec(wrapped, { timeout: timeoutMs, stdout: "pipe", stderr: "pipe" });
       proc = {
         async *chunks() {
-          // Gondolin emits chunks via for-await. We don't know which is
-          // stdout vs stderr from the unified iterator without extra
-          // metadata — fall back to tagging everything as stdout.
-          // (Gondolin's stderr is interleaved in stdout when both are
-          // "pipe"; users who want a strict split can use the non-stream
-          // exec call.)
-          for await (const chunk of real) {
-            // Pass through Buffers verbatim. If Gondolin ever hands us
-            // a string (back-compat), wrap it in a Buffer so the wire
-            // shape is consistent.
-            const data = Buffer.isBuffer(chunk)
-              ? chunk
-              : chunk instanceof Uint8Array
-                ? Buffer.from(chunk.buffer, chunk.byteOffset, chunk.byteLength)
-                : Buffer.from(String(chunk), "utf8");
-            yield { kind: "stdout", data };
+          for await (const chunk of real.output()) {
+            // chunk.data is a Buffer; re-emit with the proper kind tag.
+            // msgpack carries binary natively, so non-UTF-8 bytes
+            // survive the wire unmodified.
+            yield { kind: chunk.stream, data: chunk.data };
           }
         },
         async exitCode() {
@@ -500,8 +489,17 @@ const handlers = {
 
     let chunkCount = 0;
     for await (const c of proc.chunks()) {
-      ctx.streamWriter(c);
+      const ok = ctx.streamWriter(c);
       chunkCount++;
+      if (ok === false) {
+        // Socket send buffer is full. Without awaiting drain we'd
+        // buffer the rest of the VM's output in Node heap, unbounded.
+        // `yes | head -c 1G` from the guest would OOM the host
+        // daemon. ctx.drain() returns a promise that resolves on the
+        // next 'drain' event (added below). Cheap when consumers are
+        // keeping up — `ok` is true most of the time.
+        await ctx.drain();
+      }
     }
     const exitCode = await proc.exitCode();
     return {

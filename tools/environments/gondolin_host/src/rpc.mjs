@@ -52,7 +52,11 @@ function writeFrame(output, obj) {
   header.writeUInt32BE(payload.length, 0);
   output.write(header);
   // payload is a Uint8Array; Node streams accept it directly.
-  output.write(Buffer.from(payload.buffer, payload.byteOffset, payload.byteLength));
+  // Returns false when the socket's send buffer is full; callers that
+  // emit many frames in a hot loop (exec_stream's chunk pump) should
+  // await drain on false to avoid unbounded heap growth from buffered
+  // chunks under a slow consumer.
+  return output.write(Buffer.from(payload.buffer, payload.byteOffset, payload.byteLength));
 }
 
 export function runRpcServer({ input, output, handlers }) {
@@ -87,6 +91,18 @@ export function runRpcServer({ input, output, handlers }) {
       // unchanged.
       const ctx = {
         streamWriter: (frame) => writeFrame(output, { id, stream: frame }),
+        // Returns a promise that resolves on the next 'drain' event,
+        // or immediately if the stream isn't currently backpressured.
+        // exec_stream awaits this when streamWriter returns false so a
+        // slow consumer doesn't make us buffer the whole VM output in
+        // heap. Idempotent / safe to call when nothing's pending.
+        drain: () => {
+          if (typeof output.writableNeedDrain === "boolean"
+              && output.writableNeedDrain === false) {
+            return Promise.resolve();
+          }
+          return new Promise((resolve) => output.once("drain", resolve));
+        },
       };
       try {
         const result = await handler(params, ctx);
