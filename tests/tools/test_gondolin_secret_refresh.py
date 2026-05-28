@@ -444,3 +444,37 @@ def test_refresher_supports_multiple_secrets():
         assert names_pushed == {"FAST", "SLOW"}
     finally:
         refresher.stop()
+
+
+def test_refresher_default_sleep_is_interruptible_by_stop():
+    """Regression for G7: with no sleep_fn injected (production path), the
+    refresher must default to an interruptible sleep so stop() wakes the
+    thread immediately instead of waiting for the full refresh interval.
+
+    Setup: TTL of one hour and refresh_before_expiry_seconds=300 schedules
+    the next refresh ~3300s out. Before the fix, the thread sat in
+    time.sleep(3300) and ignored stop() until that interval elapsed (or
+    the process exited and tore the daemon thread down ungracefully).
+    With the fix, stop() returns and is_running() flips to False well
+    inside join's 2s timeout.
+    """
+    refresher = SecretRefresher(
+        env_set_secret=lambda *a, **kw: None,
+        # No time_source, no sleep_fn — exercise the production defaults.
+    )
+    refresher.add_secret(
+        name="LONG",
+        refresh_command="echo y",
+        ttl_seconds=3600,
+        refresh_before_expiry_seconds=300,
+        initial_value="x",
+    )
+    refresher.start()
+    # Give the loop a tick to enter its sleep.
+    time.sleep(0.05)
+    t0 = time.monotonic()
+    refresher.stop(timeout=2.0)
+    elapsed = time.monotonic() - t0
+    assert not refresher.is_running(), "thread did not exit after stop()"
+    # 0.5s is generous; pre-fix this would have been ~3300s (or never).
+    assert elapsed < 0.5, f"stop() took {elapsed:.2f}s — sleep not interruptible"

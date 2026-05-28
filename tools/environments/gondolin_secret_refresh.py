@@ -163,10 +163,16 @@ class SecretRefresher:
     ):
         self._env_set_secret = env_set_secret
         self._now = time_source or time.time
-        self._sleep = sleep_fn or time.sleep
         self._run_command = run_command or _default_run_command
         self._secrets: dict[str, _SecretState] = {}
         self._stop_event = threading.Event()
+        # Default sleep is the stop event's wait(): returns immediately
+        # when stop() sets the event, so cleanup doesn't have to outwait
+        # a 50-minute "until next refresh" interval. Plain time.sleep
+        # would be uninterruptible and leak the thread past stop()'s
+        # join timeout. Tests inject their own sleep_fn (a fake clock)
+        # and don't care which default we'd otherwise pick.
+        self._sleep = sleep_fn or self._stop_event.wait
         self._thread: threading.Thread | None = None
         self._lock = threading.Lock()
 
