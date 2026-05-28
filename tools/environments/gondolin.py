@@ -43,7 +43,9 @@ from tools.environments.gondolin_secret_refresh import SecretRefresher
 logger = logging.getLogger(__name__)
 
 
-def _start_daemon_stderr_reaper(proc, logger=logger):
+def _start_daemon_stderr_reaper(
+    proc: Any, log: logging.Logger
+) -> threading.Thread | None:
     """Drain the Node daemon's stderr pipe on a background thread.
 
     The daemon is spawned with ``stderr=subprocess.PIPE`` so the operator
@@ -59,7 +61,8 @@ def _start_daemon_stderr_reaper(proc, logger=logger):
     on EOF (daemon closed stderr — usually because the daemon process
     exited).
 
-    Returns the thread handle so cleanup() can join it.
+    Returns the thread handle so cleanup() can join it, or None when
+    ``proc.stderr`` is unavailable (caller chose DEVNULL).
     """
     if proc.stderr is None:
         return None
@@ -72,7 +75,7 @@ def _start_daemon_stderr_reaper(proc, logger=logger):
                 # decode with errors='replace' cannot raise on bytes.
                 line = raw.decode("utf-8", errors="replace").rstrip("\r\n")
                 if line:
-                    logger.warning("gondolin daemon stderr: %s", line)
+                    log.warning("gondolin daemon stderr: %s", line)
         except (OSError, ValueError):
             # ValueError: I/O on closed file (pipe closed under us during
             # cleanup). OSError: pipe broken / EBADF on shutdown race.
@@ -580,7 +583,7 @@ class GondolinEnvironment(BaseEnvironment):
         # fills. Without this, ~64 KB of stderr output is enough
         # to wedge the daemon's write(2) and stall the whole VM.
         self._daemon_stderr_reaper = _start_daemon_stderr_reaper(
-            self._daemon_proc, logger=logger
+            self._daemon_proc, log=logger
         )
 
         try:
@@ -709,6 +712,9 @@ class GondolinEnvironment(BaseEnvironment):
                     name,
                 )
                 continue
+            tmo = cfg.get("timeout_ms")
+            initial = cfg.get("value")
+            env = cfg.get("env")
             refresh_entries.append({
                 "name": name,
                 "refresh_command": refresh_command,
@@ -716,16 +722,17 @@ class GondolinEnvironment(BaseEnvironment):
                 "refresh_before_expiry_seconds": int(
                     cfg.get("refresh_before_expiry_seconds", 300)
                 ),
-                "initial_value": cfg.get("value") if isinstance(cfg.get("value"), str) else None,
+                "initial_value": initial if isinstance(initial, str) else None,
                 # Per-secret env: dict that the refresh subprocess sees,
                 # on top of the safe POSIX baseline (PATH, HOME, etc.).
                 # See _build_safe_env in gondolin_secret_refresh.py.
-                "env": cfg.get("env") if isinstance(cfg.get("env"), dict) else None,
+                "env": env if isinstance(env, dict) else None,
                 # Per-secret refresh subprocess timeout (ms). Surfaces
                 # the same `timeout_ms` knob that hooks.mjs reads for
                 # init-time from_command, so a slow refresh chain gets
-                # the same opt-out runway.
-                "timeout_ms": cfg.get("timeout_ms") if isinstance(cfg.get("timeout_ms"), int) and not isinstance(cfg.get("timeout_ms"), bool) else None,
+                # the same opt-out runway. `bool` is a subclass of `int`
+                # in Python, so explicitly exclude it.
+                "timeout_ms": tmo if isinstance(tmo, int) and not isinstance(tmo, bool) else None,
             })
 
         if not refresh_entries:

@@ -28,7 +28,7 @@ def test_drain_daemon_stderr_helper_exists():
     test it in isolation from the full env spinup. Pre-fix, it didn't
     exist at all (raw stderr=PIPE with no reader)."""
     assert hasattr(gondolin_mod, "_start_daemon_stderr_reaper"), (
-        "Missing helper: gondolin._start_daemon_stderr_reaper(proc, logger) "
+        "Missing helper: gondolin._start_daemon_stderr_reaper(proc, log) "
         "should exist to drain the daemon's stderr pipe. Without it, the "
         "daemon will wedge after ~64 KB of stderr output."
     )
@@ -57,7 +57,7 @@ def test_daemon_stderr_does_not_block_after_64kb():
 
         fake = _FakeProc(read_fd)
         reaper = gondolin_mod._start_daemon_stderr_reaper(
-            fake, logger=logging.getLogger("test.stderr_reaper")
+            fake, log=logging.getLogger("test.stderr_reaper")
         )
         assert reaper is not None, "reaper should return the thread handle"
 
@@ -111,10 +111,11 @@ def test_daemon_stderr_bytes_are_surfaced_to_logger(caplog):
                 return self.returncode
 
         fake = _FakeProc(read_fd)
-        logger = logging.getLogger("test.b13.surface")
+        logger = logging.getLogger("test.stderr_reaper.surface")
         logger.setLevel(logging.DEBUG)
-        with caplog.at_level(logging.DEBUG, logger="test.b13.surface"):
-            reaper = gondolin_mod._start_daemon_stderr_reaper(fake, logger=logger)
+        with caplog.at_level(logging.DEBUG, logger="test.stderr_reaper.surface"):
+            reaper = gondolin_mod._start_daemon_stderr_reaper(fake, log=logger)
+            assert reaper is not None
             os.write(write_fd, b"krun: unknown option --foo\n")
             os.write(write_fd, b"vm boot failed: ENOSPC\n")
             os.close(write_fd)
