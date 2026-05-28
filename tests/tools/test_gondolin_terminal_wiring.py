@@ -245,6 +245,68 @@ def test_create_environment_omits_rootfs_size_when_container_disk_unset(
 
 
 @pytest.mark.skipif(not NODE_AVAILABLE, reason="node or daemon.mjs missing")
+def test_create_environment_honors_minus_one_sentinel_in_container_disk(
+    tmp_path, _bypass_image_build
+):
+    """`container_disk: -1` is the opt-out sentinel — power users with a
+    custom image that lacks e2fsprogs, or who pinned `rootfs.mode='memory'`,
+    use it to skip the cap. The daemon then lets gondolin auto-size based
+    on the image. Validated at the shared-knob layer."""
+    from tools.terminal_tool import _create_environment
+    from tools.environments.gondolin import GondolinEnvironment
+
+    env = _create_environment(
+        env_type="gondolin",
+        image="",
+        cwd="/workspace",
+        timeout=60,
+        container_config={"container_disk": -1},
+        gondolin_config={
+            "sandbox_dir": str(tmp_path / "vm-sandbox"),
+            "stub_vm": True,
+            "image": "python:3.11-slim",
+        },
+        task_id="test-disk-optout-shared",
+    )
+    try:
+        assert isinstance(env, GondolinEnvironment)
+        assert "rootfs_size_mb" not in env.config
+    finally:
+        env.cleanup()
+
+
+@pytest.mark.skipif(not NODE_AVAILABLE, reason="node or daemon.mjs missing")
+def test_create_environment_honors_minus_one_sentinel_in_gondolin_rootfs(
+    tmp_path, _bypass_image_build
+):
+    """Same -1 sentinel at the per-backend layer: `terminal.gondolin.rootfs_size_mb: -1`
+    overrides any shared `container_disk` and skips the cap. This is the
+    "I only want to opt out for gondolin, not docker" path."""
+    from tools.terminal_tool import _create_environment
+    from tools.environments.gondolin import GondolinEnvironment
+
+    env = _create_environment(
+        env_type="gondolin",
+        image="",
+        cwd="/workspace",
+        timeout=60,
+        container_config={"container_disk": 20480},  # would otherwise apply
+        gondolin_config={
+            "sandbox_dir": str(tmp_path / "vm-sandbox"),
+            "stub_vm": True,
+            "image": "python:3.11-slim",
+            "rootfs_size_mb": -1,  # per-backend opt-out wins
+        },
+        task_id="test-disk-optout-backend",
+    )
+    try:
+        assert isinstance(env, GondolinEnvironment)
+        assert "rootfs_size_mb" not in env.config
+    finally:
+        env.cleanup()
+
+
+@pytest.mark.skipif(not NODE_AVAILABLE, reason="node or daemon.mjs missing")
 def test_create_environment_forwards_container_persistent_to_gondolin(
     tmp_path, _bypass_image_build
 ):

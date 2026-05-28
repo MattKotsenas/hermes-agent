@@ -1616,6 +1616,15 @@ def _create_environment(env_type: str, image: str, cwd: str, timeout: int,
         # already use. Forward as `rootfs_size_mb`; the daemon translates
         # to gondolin's qemu-suffix string. Omit entirely when unset so
         # gondolin's auto-sizing (image-based) kicks in.
+        #
+        # Opt-out sentinel: -1 (at either layer) means "don't pass a cap
+        # to the daemon — let gondolin use the image's natural size."
+        # This is the escape hatch for users with a custom guest image
+        # that lacks e2fsprogs, or who pinned `rootfs.mode='memory'` and
+        # don't want the cap to break boot. The cap is the default
+        # because runaway guest writes can exhaust host disk (qcow2 is
+        # sparse but grows to whatever the guest writes); -1 is the
+        # "I know what I'm doing" signal.
         gondolin_disk_mb = gc.get("rootfs_size_mb")
         if gondolin_disk_mb is None:
             container_disk_mb = (container_config or {}).get("container_disk")
@@ -1624,7 +1633,7 @@ def _create_environment(env_type: str, image: str, cwd: str, timeout: int,
                     gondolin_disk_mb = int(container_disk_mb)
                 except (TypeError, ValueError):
                     gondolin_disk_mb = None
-        if gondolin_disk_mb is not None:
+        if gondolin_disk_mb is not None and int(gondolin_disk_mb) != -1:
             daemon_config["rootfs_size_mb"] = int(gondolin_disk_mb)
         # Host-wide concurrency knobs. lock_dir defaults to a shared dir
         # under HERMES_HOME so the cap is enforced across the CLI,

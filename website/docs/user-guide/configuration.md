@@ -523,7 +523,24 @@ terminal:
     stream: true                 # Stream stdout/stderr from VM commands
                                  #   in real time. Set false for the older
                                  #   buffer-and-return-once shape.
+    rootfs_size_mb: null         # Per-backend override of the shared
+                                 #   `terminal.container_disk` cap (MB).
+                                 #   null = inherit container_disk.
+                                 #   -1 = opt out (no cap, gondolin
+                                 #   auto-sizes from the image). Use -1
+                                 #   when the guest image lacks
+                                 #   e2fsprogs or you've pinned a
+                                 #   non-default rootfs mode that
+                                 #   refuses resize. See "Rootfs cap"
+                                 #   below.
 ```
+
+**Rootfs cap:** gondolin honors the shared `terminal.container_disk` knob as a *virtual* qcow2 size cap (sparse, only consumes what the guest writes). The cap is the default because a runaway `dd` in the guest can otherwise grow the qcow2 to whatever the guest writes and exhaust host disk. The cap requires:
+
+- A **writable cow rootfs** (`rootfs.mode='cow'`, the gondolin default).
+- **`e2fsprogs`** in the guest image (for `resize2fs` at boot).
+
+The default image (`nikolaik/python-nodejs:python3.11-nodejs20`) ships both. If you use a custom image without `resize2fs`, or pin `rootfs.mode='memory'`/`'readonly'`, set `terminal.gondolin.rootfs_size_mb: -1` (per-backend) or `terminal.container_disk: -1` (shared) to opt out. The daemon then lets gondolin auto-size from the image.
 
 **Requirements:**
 - Linux or WSL2 host with `/dev/kvm` accessible (group `kvm`, usually).
