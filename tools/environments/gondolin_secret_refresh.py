@@ -311,6 +311,23 @@ class SecretRefresher:
             self._secrets[name] = state
 
     def start(self) -> None:
+        # Refuse to spawn while a previous worker is still alive. stop()
+        # nulls self._thread *before* join (so concurrent is_running()
+        # returns False once stop() has been called), but the old thread
+        # may not have actually exited yet — most commonly because its
+        # in-flight refresh subprocess hasn't returned. Spawning a second
+        # worker would race with it on the secret table; clearing
+        # stop_event would also un-cancel the old worker. Track the
+        # previous thread independently of self._thread so stop()'s
+        # bookkeeping can't fool the liveness check.
+        prev = getattr(self, "_prev_thread", None)
+        if prev is not None and prev.is_alive():
+            logger.warning(
+                "gondolin secret refresher: start() called while a previous "
+                "worker is still running (stop() join timed out). Refusing "
+                "to spawn a duplicate worker."
+            )
+            return
         if self._thread is not None and self._thread.is_alive():
             return
         self._stop_event.clear()
@@ -318,6 +335,8 @@ class SecretRefresher:
             target=self._run, name="gondolin-secret-refresh", daemon=True
         )
         self._thread.start()
+        # Track this thread so the next stop()/start() pair can see it.
+        self._prev_thread = self._thread
 
     def stop(self, timeout: float = 2.0) -> None:
         if self._thread is None:
@@ -329,6 +348,11 @@ class SecretRefresher:
             thread.join(timeout=timeout)
         except RuntimeError:
             pass
+        # Clear _prev_thread only if the join actually succeeded —
+        # otherwise leave it set so the next start() can detect the
+        # still-live previous worker and refuse to spawn a duplicate.
+        if not thread.is_alive():
+            self._prev_thread = None
 
     def is_running(self) -> bool:
         return self._thread is not None and self._thread.is_alive()

@@ -402,6 +402,83 @@ def test_refresher_stop_is_clean_and_idempotent():
     assert not refresher.is_running()
 
 
+def test_refresher_stop_does_not_resurrect_old_worker_on_restart():
+    """B12: stop() must not return until the old worker thread is gone
+    (or be honest that it hasn't), and start() must not silently spawn
+    a duplicate worker against a still-live previous thread.
+
+    Bug pre-B12: stop() set ``self._thread = None`` *before* join, so
+    if join timed out (worker mid-subprocess, slow user sleep_fn), the
+    old worker kept running. A subsequent start() saw self._thread is
+    None, cleared stop_event (un-cancelling the old worker), and
+    launched a SECOND thread. Two workers raced against the same
+    secret table.
+
+    Reproduction: a slow runner blocks past stop()'s 0.1s join; then
+    start() is called. With the bug both threads were live; with the
+    fix start() refuses to spawn while the old worker is still alive,
+    so we only ever observe one live worker thread.
+    """
+    runner_in_call = threading.Event()
+    runner_can_return = threading.Event()
+
+    def slow_runner(cmd, env=None, timeout=None):
+        runner_in_call.set()
+        # Block here so stop()'s short join times out — simulates a
+        # subprocess that's still running when cleanup fires.
+        runner_can_return.wait(timeout=10.0)
+        return (0, "v\n", "")
+
+    refresher = SecretRefresher(
+        env_set_secret=lambda *a, **kw: None,
+        run_command=slow_runner,
+        # Fast sleep so the worker reaches the runner immediately.
+        sleep_fn=lambda s: time.sleep(min(s, 0.01)),
+    )
+    refresher.add_secret(
+        name="TOK",
+        refresh_command="echo y",
+        ttl_seconds=1,
+        refresh_before_expiry_seconds=0,
+        initial_value="x",
+    )
+    refresher.start()
+    t1 = refresher._thread
+    assert t1 is not None
+    # Wait until the worker is actually mid-runner so stop's join can't
+    # complete in the 0.1s budget below.
+    assert runner_in_call.wait(timeout=2.0), "worker never reached runner"
+
+    # stop() with a short timeout — join times out, old worker still live.
+    refresher.stop(timeout=0.1)
+    assert t1.is_alive(), "test precondition: old worker should still be running"
+
+    # The bug: start() here would spawn a SECOND thread + clear
+    # stop_event, un-cancelling the first. Either no second thread is
+    # created (start refuses), or stop_event stays set so the first
+    # exits as soon as the runner unblocks. We must NOT end up with two
+    # live workers racing.
+    refresher.start()
+    t2 = refresher._thread
+    # Let the old worker unblock and finish (so we don't hang at teardown).
+    runner_can_return.set()
+
+    # The contract: never have two distinct live workers at the same time.
+    # Acceptable shapes:
+    #   (a) start() no-ops while old worker is alive (t2 is t1 OR t2 is None)
+    #   (b) start() defers — t2 spawned only after old worker is gone
+    if t2 is not None and t2 is not t1:
+        # Brief moment to let the old worker drain.
+        t1.join(timeout=2.0)
+        assert not t1.is_alive(), (
+            "BUG: stop()+start() left two live workers racing on the "
+            "same secrets table. start() should have refused to spawn "
+            "until the old worker exited."
+        )
+
+    refresher.stop(timeout=5.0)
+
+
 def test_refresher_supports_multiple_secrets():
     """Multiple secrets with different schedules all get refreshed."""
     clock = _FakeClock(start=1_000_000.0)
