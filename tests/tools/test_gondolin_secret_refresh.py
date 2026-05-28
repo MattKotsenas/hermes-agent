@@ -407,7 +407,7 @@ def test_refresher_stop_does_not_resurrect_old_worker_on_restart():
     (or be honest that it hasn't), and start() must not silently spawn
     a duplicate worker against a still-live previous thread.
 
-    Bug pre-stop() set ``self._thread = None`` *before* join, so
+    Bug pre-fix: stop() set ``self._thread = None`` *before* join, so
     if join timed out (worker mid-subprocess, slow user sleep_fn), the
     old worker kept running. A subsequent start() saw self._thread is
     None, cleared stop_event (un-cancelling the old worker), and
@@ -418,6 +418,13 @@ def test_refresher_stop_does_not_resurrect_old_worker_on_restart():
     start() is called. With the bug both threads were live; with the
     fix start() refuses to spawn while the old worker is still alive,
     so we only ever observe one live worker thread.
+
+    Note on timing: this test deliberately mixes a real sleep_fn
+    (``time.sleep(min(s, 0.01))``) with a real ``runner_in_call.wait``
+    barrier. The pure fake-clock path can't reproduce the bug — the bug
+    is about real threads racing on Event.set / Thread.join semantics,
+    which need actual wall-clock progress. The 2-second barrier wait is
+    generous enough for any non-pathological CI box.
     """
     runner_in_call = threading.Event()
     runner_can_return = threading.Event()

@@ -17,7 +17,7 @@ from __future__ import annotations
 
 import logging
 import os
-import time
+import threading
 
 
 from tools.environments import gondolin as gondolin_mod
@@ -38,6 +38,11 @@ def test_daemon_stderr_does_not_block_after_64kb():
     """Push >64KB through a fake daemon stderr pipe; the reaper must keep
     draining so the writer never blocks. Without the reaper the writer
     blocks at the kernel buffer cap.
+
+    Failure shape: the writer-thread join below times out (the writes are
+    deadlocked at the kernel pipe buffer cap), which surfaces as
+    `writer.is_alive()` after a 5s join. We don't time the writes — that
+    flakes on loaded CI. We just assert "the writer thread can finish."
     """
     # Set up a real OS pipe to play the role of subprocess.PIPE stderr.
     read_fd, write_fd = os.pipe()
@@ -52,27 +57,28 @@ def test_daemon_stderr_does_not_block_after_64kb():
 
         fake = _FakeProc(read_fd)
         reaper = gondolin_mod._start_daemon_stderr_reaper(
-            fake, logger=logging.getLogger("test.b13")
+            fake, logger=logging.getLogger("test.stderr_reaper")
         )
         assert reaper is not None, "reaper should return the thread handle"
 
-        # Write 200 KB (3x the typical 64 KB pipe buffer) and time it.
+        # Write 200 KB (3x the typical 64 KB pipe buffer) from a worker
+        # thread. If the reaper is broken, the worker blocks at the 64th
+        # KB and never finishes; if it's working, the worker returns
+        # promptly. We assert on thread liveness, not on elapsed time.
         payload = b"X" * 1024  # 1 KB chunks
         chunks = 200
-        t0 = time.monotonic()
-        for _ in range(chunks):
-            os.write(write_fd, payload)
-        elapsed = time.monotonic() - t0
 
-        # If the reaper is doing its job, 200 KB writes return in well
-        # under a second on any reasonable machine. If the reaper is
-        # broken, the write loop blocks at the 64th KB and the test
-        # hangs until os.write times out (which it doesn't — it blocks
-        # forever, so the pytest timeout fires).
-        assert elapsed < 5.0, (
-            f"200 KB of fake daemon stderr took {elapsed:.2f}s — the "
-            f"reaper is not draining the pipe. The real daemon would "
-            f"wedge after the first 64 KB in production."
+        def _writer():
+            for _ in range(chunks):
+                os.write(write_fd, payload)
+
+        writer = threading.Thread(target=_writer, name="stderr-writer")
+        writer.start()
+        writer.join(timeout=5.0)
+        assert not writer.is_alive(), (
+            "writer thread blocked writing 200 KB of fake daemon stderr — "
+            "the reaper is not draining the pipe. The real daemon would "
+            "wedge after the first 64 KB in production."
         )
 
         # Signal EOF so the reaper exits cleanly.

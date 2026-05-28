@@ -20,7 +20,6 @@ from __future__ import annotations
 
 import shutil
 import subprocess
-import time
 from pathlib import Path
 
 import pytest
@@ -97,14 +96,13 @@ def test_keyboardinterrupt_during_init_terminates_daemon(monkeypatch, tmp_path):
     proc = spawned.get("proc")
     assert proc is not None, "test bug: Popen was never invoked"
     # The fix should have called _terminate_daemon() which issues
-    # SIGTERM + wait(5). Give a small grace window for the OS to reap.
-    deadline = time.monotonic() + 2.0
-    while proc.poll() is None and time.monotonic() < deadline:
-        time.sleep(0.02)
-    poll_result = proc.poll()
-    if poll_result is None:
-        # Daemon still alive after grace window — clean up so we don't
-        # leak across the rest of the test run, then fail.
+    # SIGTERM + wait(5). Block on wait() rather than polling so the test
+    # doesn't go flaky on a loaded CI box where signal handling is slow.
+    try:
+        proc.wait(timeout=5.0)
+    except subprocess.TimeoutExpired:
+        # Daemon still alive — clean up so we don't leak across the
+        # rest of the test run, then fail with a useful message.
         try:
             proc.terminate()
             proc.wait(timeout=2)
@@ -116,7 +114,7 @@ def test_keyboardinterrupt_during_init_terminates_daemon(monkeypatch, tmp_path):
             "GondolinEnvironment.__init__'s outer `except BaseException` "
             "must call self._terminate_daemon() so a Ctrl-C during boot "
             "doesn't leak the 256-512 MB Node+VM allocation. Daemon "
-            "process was still alive 2 seconds after KeyboardInterrupt "
+            "process was still alive 5 seconds after KeyboardInterrupt "
             "propagated out of __init__."
         )
 
