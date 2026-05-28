@@ -235,6 +235,55 @@ def test_daemon_socket_not_visible_in_guest_workspace(gondolin_env_workspace):
 
 
 @requires_gondolin
+def test_stream_preserves_stderr_separation(gondolin_env):
+    """``gondolin_rpc_call --stream`` keeps stdout and stderr tagged
+    separately on the wire — a regression caught only with a real VM.
+
+    The streaming exec path inside the daemon iterates Gondolin's
+    ``ExecProcess.output()`` and yields ``{kind, data}`` chunks. Earlier
+    revisions iterated the bare async iterable instead, which yielded
+    ``string`` and silently flattened stderr into stdout (no ``kind``
+    field). Unit tests with a stub VM can't catch this — only a real
+    guest produces tagged chunks the daemon must thread through.
+    """
+    import subprocess
+    import sys
+
+    env = gondolin_env
+    # Use the live env's daemon socket — no second VM, no extra boot.
+    repo_root = Path(__file__).resolve().parent.parent.parent
+    rpc_call = repo_root / "tools" / "environments" / "gondolin_rpc_call.py"
+    # Print distinguishable markers to each stream so a flatten-into-stdout
+    # regression appears as both markers landing on stdout.
+    cmd = "printf 'OUT_MARKER\\n'; printf 'ERR_MARKER\\n' >&2; exit 7"
+    proc = subprocess.run(
+        [sys.executable, str(rpc_call), env.sock_path, cmd, "--stream"],
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    assert proc.returncode == 7, (
+        f"exit code not propagated: {proc.returncode} "
+        f"stdout={proc.stdout!r} stderr={proc.stderr!r}"
+    )
+    assert "OUT_MARKER" in proc.stdout, (
+        f"stdout marker missing from stdout:\nstdout={proc.stdout!r}\n"
+        f"stderr={proc.stderr!r}"
+    )
+    assert "ERR_MARKER" in proc.stderr, (
+        f"stderr marker landed on the wrong stream — regression to "
+        f"untagged-iterator bug. stdout={proc.stdout!r} stderr={proc.stderr!r}"
+    )
+    assert "OUT_MARKER" not in proc.stderr, (
+        f"stdout marker leaked into stderr: stderr={proc.stderr!r}"
+    )
+    assert "ERR_MARKER" not in proc.stdout, (
+        f"stderr marker leaked into stdout — likely the flatten regression: "
+        f"stdout={proc.stdout!r}"
+    )
+
+
+@requires_gondolin
 @pytest.mark.skipif(
     not _python_image_present(),
     reason=(
