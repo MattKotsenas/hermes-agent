@@ -1420,6 +1420,7 @@ def _create_environment(env_type: str, image: str, cwd: str, timeout: int,
             timeout=timeout,
             config=daemon_config,
             stub_vm=bool(gc.get("stub_vm", False)),
+            persistent_filesystem=persistent,
         )
 
     else:

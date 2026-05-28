@@ -820,3 +820,72 @@ def test_projection_can_be_disabled(stub_env_factory, monkeypatch, tmp_path):
     )
     env = stub_env_factory(config={"project_skills": False, "project_credentials": False})
     assert "extra_mounts" not in env.config
+
+
+# ---- container_persistent lifecycle ---------------------------------------
+#
+# Docker's container_persistent: True/False contract is about whether the
+# per-task sandbox bind dirs survive cleanup. Persistence of the rootfs
+# layer itself (apt-installs across sessions) is a separate feature docker
+# also doesn't ship today. Gondolin matches docker's bind-dir contract:
+# workspace_dir survives cleanup when persistent=True, gets rm'd when
+# persistent=False. The workspace_dir is where the agent does its actual
+# work, so this controls whether code/edits survive between sessions.
+
+@requires_node
+def test_workspace_dir_survives_cleanup_when_persistent(tmp_path):
+    """persistent_filesystem=True: workspace contents remain on disk after
+    cleanup so a subsequent GondolinEnvironment for the same task_id sees
+    the agent's prior files. Matches docker's container_persistent=True
+    behavior."""
+    sandbox = tmp_path / "task-persist"
+    env = GondolinEnvironment(
+        sandbox_dir=str(sandbox),
+        stub_vm=True,
+        persistent_filesystem=True,
+    )
+    workspace = env.workspace_dir
+    (workspace / "agent-output.txt").write_text("important-work-product")
+    env.cleanup()
+
+    # Dir + content survive.
+    assert workspace.exists()
+    assert (workspace / "agent-output.txt").read_text() == "important-work-product"
+
+
+@requires_node
+def test_workspace_dir_removed_on_cleanup_when_ephemeral(tmp_path):
+    """persistent_filesystem=False: workspace dir is rm'd on cleanup. Matches
+    docker's container_persistent=False behavior (sandbox dirs removed
+    alongside `docker rm -f`)."""
+    sandbox = tmp_path / "task-ephemeral"
+    env = GondolinEnvironment(
+        sandbox_dir=str(sandbox),
+        stub_vm=True,
+        persistent_filesystem=False,
+    )
+    workspace = env.workspace_dir
+    (workspace / "throwaway.txt").write_text("ephemeral")
+    assert workspace.exists()
+    env.cleanup()
+
+    # workspace_dir is gone.
+    assert not workspace.exists(), (
+        f"non-persistent workspace must be removed; found {list(sandbox.iterdir())}"
+    )
+
+
+@requires_node
+def test_persistent_default_is_false_for_safety(tmp_path):
+    """Default is persistent_filesystem=False so a constructor with no
+    explicit persistence arg gets ephemeral semantics — matches the safer
+    of the two failure modes (a stale workspace dir leaking content into
+    the next task is worse than re-creating an empty one). The
+    factory/terminal_tool layer is responsible for setting True when the
+    user opts in via container_persistent."""
+    sandbox = tmp_path / "task-default"
+    env = GondolinEnvironment(sandbox_dir=str(sandbox), stub_vm=True)
+    workspace = env.workspace_dir
+    (workspace / "marker.txt").write_text("x")
+    env.cleanup()
+    assert not workspace.exists()

@@ -301,6 +301,7 @@ class GondolinEnvironment(BaseEnvironment):
         stub_vm: bool = False,
         init_timeout: float = 60.0,
         daemon_path: str | None = None,
+        persistent_filesystem: bool = False,
     ):
         super().__init__(cwd=cwd, timeout=timeout)
 
@@ -328,6 +329,12 @@ class GondolinEnvironment(BaseEnvironment):
         # daemon/VM resources are touched. Released on cleanup or on
         # init failure (see except block at the end).
         self._slot: _Slot | None = _acquire_vm_slot(lock_dir=lock_dir)
+        # Persistence lifecycle: matches docker's container_persistent
+        # contract. True keeps the workspace dir on disk across cleanup
+        # so the next session for the same task_id resumes the agent's
+        # work; False rmtree's it. Stashed here (not in `config`) because
+        # it's a host-side lifecycle concern that the daemon doesn't see.
+        self._persistent_filesystem = bool(persistent_filesystem)
         try:
             self._init_after_slot(
                 sandbox_dir=sandbox_dir,
@@ -706,6 +713,19 @@ class GondolinEnvironment(BaseEnvironment):
             logger.debug("gondolin shutdown rpc failed (will SIGTERM): %s", exc)
 
         self._terminate_daemon()
+
+        # Honor the persistence lifecycle. Non-persistent sessions rm the
+        # workspace dir so its content doesn't leak into the next session
+        # for the same task_id. Persistent sessions leave it untouched
+        # (the next GondolinEnvironment for the same task_id will see and
+        # re-mount the existing dir). Matches docker.py:cleanup() which
+        # does shutil.rmtree on the workspace + home dirs when persistent
+        # is False.
+        if not self._persistent_filesystem:
+            try:
+                shutil.rmtree(self.workspace_dir, ignore_errors=True)
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("gondolin workspace cleanup failed: %s", exc)
 
         # Release the concurrent-VM slot so the next session can spawn.
         # Guarded against double-cleanup (cleanup called twice would

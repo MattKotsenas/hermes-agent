@@ -245,6 +245,66 @@ def test_create_environment_omits_rootfs_size_when_container_disk_unset(
 
 
 @pytest.mark.skipif(not NODE_AVAILABLE, reason="node or daemon.mjs missing")
+def test_create_environment_forwards_container_persistent_to_gondolin(
+    tmp_path, _bypass_image_build
+):
+    """The shared `terminal.container_persistent` knob controls whether
+    the per-task sandbox bind dirs survive cleanup. The factory threads
+    this into GondolinEnvironment.persistent_filesystem so docker users
+    switching to gondolin get the same lifecycle semantics for free."""
+    from tools.terminal_tool import _create_environment
+    from tools.environments.gondolin import GondolinEnvironment
+
+    env = _create_environment(
+        env_type="gondolin",
+        image="",
+        cwd="/workspace",
+        timeout=60,
+        container_config={"container_persistent": True},
+        gondolin_config={
+            "sandbox_dir": str(tmp_path / "vm-sandbox"),
+            "stub_vm": True,
+            "image": "python:3.11-slim",
+        },
+        task_id="test-persistent",
+    )
+    try:
+        assert isinstance(env, GondolinEnvironment)
+        assert env._persistent_filesystem is True
+    finally:
+        env.cleanup()
+
+
+@pytest.mark.skipif(not NODE_AVAILABLE, reason="node or daemon.mjs missing")
+def test_create_environment_forwards_container_persistent_false_to_gondolin(
+    tmp_path, _bypass_image_build
+):
+    """container_persistent=False flows through and triggers workspace
+    rmtree on cleanup."""
+    from tools.terminal_tool import _create_environment
+    from tools.environments.gondolin import GondolinEnvironment
+
+    env = _create_environment(
+        env_type="gondolin",
+        image="",
+        cwd="/workspace",
+        timeout=60,
+        container_config={"container_persistent": False},
+        gondolin_config={
+            "sandbox_dir": str(tmp_path / "vm-sandbox-ephemeral"),
+            "stub_vm": True,
+            "image": "python:3.11-slim",
+        },
+        task_id="test-ephemeral",
+    )
+    try:
+        assert isinstance(env, GondolinEnvironment)
+        assert env._persistent_filesystem is False
+    finally:
+        env.cleanup()
+
+
+@pytest.mark.skipif(not NODE_AVAILABLE, reason="node or daemon.mjs missing")
 def test_create_environment_returns_gondolin_environment(
     tmp_path, _bypass_image_build
 ):
