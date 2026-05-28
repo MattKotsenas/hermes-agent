@@ -148,6 +148,15 @@ const handlers = {
     if (STUB_VM) {
       vm = {
         async exec(cmd) {
+          // Honor a "SLEEP:<ms>:" prefix so tests can assert on concurrent
+          // dispatch (one long-running exec should not block a short one).
+          // Strip the bash-c wrap the daemon adds so the marker survives.
+          const m = cmd.match(/^bash -c '(.*)'$/);
+          const inner = m ? m[1].replace(/'\\''/g, "'") : cmd;
+          const sleepMatch = inner.match(/^SLEEP:(\d+):/);
+          if (sleepMatch) {
+            await new Promise((r) => setTimeout(r, Number(sleepMatch[1])));
+          }
           return { exitCode: 0, stdout: cmd + "\n", stderr: "" };
         },
         // Streaming exec: if cmd starts with "STREAM:", split the rest by
@@ -430,11 +439,28 @@ const handlers = {
 
 // ----- Socket transport -----
 
-// Serialize RPC dispatch across connections. The VM is single-threaded
-// (one in-flight exec at a time), and even concurrent stubbed exec calls
-// would race on the `vm` global during init/shutdown. A simple promise
-// chain is sufficient: each new request awaits the previous one.
-let dispatchChain = Promise.resolve();
+// Per-connection RPC dispatch. Earlier versions of this daemon serialized
+// all dispatch through a single promise chain on the rationale that "the
+// VM is single-threaded, one in-flight exec at a time." That rationale
+// was wrong: the underlying gondolin sandbox supports up to
+// DEFAULT_MAX_QUEUED_EXECS (currently 64) concurrent exec channels per
+// VM via SSH multiplexing, and the comment in src/qemu/ssh.js says so
+// explicitly ("A guest SSH connection can spawn multiple exec channels
+// concurrently"). Serializing here broke any caller that needed to
+// interleave execs against a single env — most notably
+// ``tools/code_execution_tool.py``'s RPC poll loop, which deadlocked
+// behind a blocking foreground ``python3 script.py`` execute because
+// the poll-loop's request-reading ``ls``/``cat`` calls couldn't acquire
+// the dispatch slot.
+//
+// We still need to serialize lifecycle methods (``init``, ``stop``,
+// anything that touches the ``vm`` global before it's assigned or
+// during teardown). Doing that with an explicit allow-list on the
+// lifecycle methods, rather than a blanket per-process lock, lets
+// steady-state ``exec`` calls run concurrently the way the gondolin
+// API intends.
+const LIFECYCLE_METHODS = new Set(["init", "stop", "rebuild"]);
+let lifecycleChain = Promise.resolve();
 function dispatch(method, params, ctx) {
   const handler = handlers[method];
   if (!handler) {
@@ -442,15 +468,23 @@ function dispatch(method, params, ctx) {
       Object.assign(new Error(`method not found: ${method}`), { code: -32601 }),
     );
   }
-  const next = dispatchChain.then(() => handler(params, ctx));
-  // Don't propagate rejections through the chain — each call awaits its
-  // own result, but a handler error shouldn't poison subsequent calls.
-  dispatchChain = next.catch(() => {});
-  return next;
+  if (LIFECYCLE_METHODS.has(method)) {
+    // Serialize lifecycle transitions against everything else so we
+    // don't race on the ``vm`` global. Steady-state methods that arrive
+    // mid-init/teardown will still queue behind the chain.
+    const next = lifecycleChain.then(() => handler(params, ctx));
+    lifecycleChain = next.catch(() => {});
+    return next;
+  }
+  // Steady-state methods (exec, exec_stream, set_secret, ...) wait for
+  // the most recent lifecycle transition to settle but then run free.
+  // ``vm.exec`` returns an awaitable that the underlying gondolin API
+  // multiplexes through SSH; concurrent dispatch is the supported shape.
+  return lifecycleChain.then(() => handler(params, ctx));
 }
 
 // `runRpcServer` invokes handlers[method](params, ctx). We wrap that here
-// so the per-VM dispatch lock applies across connections; the wrapper
+// so the lifecycle ordering applies across connections; the wrapper
 // forwards params + ctx (the streamWriter facility) into dispatch().
 const serializedHandlers = new Proxy(
   {},

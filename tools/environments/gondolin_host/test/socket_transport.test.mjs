@@ -200,6 +200,101 @@ test("daemon: socket transport, multiple connections, shared VM state", async (t
   });
 });
 
+test("daemon: concurrent execs are not serialized (steady-state dispatch)", async (t) => {
+  // Regression: an earlier daemon implementation chained ALL dispatch
+  // (including exec) through a single promise chain on the rationale
+  // that "the VM is single-threaded." That was wrong — the underlying
+  // gondolin sandbox supports up to DEFAULT_MAX_QUEUED_EXECS concurrent
+  // exec channels per VM via SSH multiplexing, and serializing here
+  // deadlocked any caller that needed to interleave execs against a
+  // single env (most notably code_execution_tool.py's RPC poll loop
+  // running alongside a blocking foreground `python3 script.py`).
+  //
+  // This test fires two concurrent stubbed execs against one daemon —
+  // a long one (500ms) and a short one (~immediate). If dispatch is
+  // serialized the short exec waits for the long one (~500ms); if
+  // dispatch is concurrent the short returns essentially instantly
+  // while the long is still in flight.
+
+  const tmp = mkdtempSync(path.join(os.tmpdir(), "gondolin-conc-test-"));
+  const sockPath = path.join(tmp, "d.sock");
+
+  const proc = spawn("node", [DAEMON, "--socket", sockPath], {
+    stdio: ["ignore", "ignore", "pipe"],
+    env: {
+      ...process.env,
+      GONDOLIN_DAEMON_QUIET: "1",
+      GONDOLIN_DAEMON_STUB_VM: "1",
+    },
+  });
+  let stderr = "";
+  proc.stderr.on("data", (c) => { stderr += c.toString(); });
+
+  t.after(async () => {
+    try { proc.kill("SIGTERM"); } catch {}
+    await new Promise((r) => {
+      if (proc.exitCode != null) return r();
+      proc.once("exit", r);
+      setTimeout(r, 2000);
+    });
+    rmSync(tmp, { recursive: true, force: true });
+    if (stderr) console.error("daemon stderr:", stderr);
+  });
+
+  await waitForSocket(sockPath);
+  const init = await rpcCall(sockPath, { id: 1, method: "init", params: { config: {} } });
+  assert.equal(init.error, undefined, `init failed: ${JSON.stringify(init.error)}`);
+
+  // Fire both execs concurrently. The long one sleeps 500ms inside the
+  // stub; the short one returns immediately. Measure when each one
+  // resolves relative to start.
+  const t0 = Date.now();
+  const longPromise = rpcCall(sockPath, {
+    id: 100,
+    method: "exec",
+    params: { cmd: "SLEEP:500:long" },
+  }).then((r) => ({ kind: "long", at: Date.now() - t0, resp: r }));
+  // Tiny stagger so the long exec definitely arrives first. Without it
+  // there's a small window where both arrive in the same event-loop tick
+  // and ordering depends on connect() timing.
+  await new Promise((r) => setTimeout(r, 20));
+  const shortPromise = rpcCall(sockPath, {
+    id: 101,
+    method: "exec",
+    params: { cmd: "quick" },
+  }).then((r) => ({ kind: "short", at: Date.now() - t0, resp: r }));
+
+  const [first, second] = await Promise.all([
+    Promise.race([longPromise, shortPromise]),
+    Promise.race([
+      longPromise.then((v) => ({ tag: "long", v })),
+      shortPromise.then((v) => ({ tag: "short", v })),
+    ]).then(async (winner) => (winner.tag === "short" ? longPromise : shortPromise)),
+  ]);
+
+  // The short call MUST land before the long call. If dispatch is
+  // serialized it'd be the other way around — short waits for long.
+  assert.equal(first.kind, "short",
+    `expected short exec to resolve first; got ${first.kind} at ${first.at}ms ` +
+    `(short=${shortPromise.then((s) => s.at)}, long=${longPromise.then((l) => l.at)})`);
+  assert.equal(second.kind, "long");
+
+  // And the short call must resolve well before the long one's 500ms
+  // sleep would have finished, proving it was not queued behind it.
+  assert.ok(first.at < 300,
+    `short exec took ${first.at}ms but should be <<300ms; ` +
+    `dispatch is likely re-serialized`);
+  assert.ok(second.at >= 500,
+    `long exec returned at ${second.at}ms but should be >=500ms (the sleep)`);
+
+  // Both should succeed.
+  assert.equal(first.resp.error, undefined);
+  assert.equal(second.resp.error, undefined);
+
+  const sd = await rpcCall(sockPath, { id: 999, method: "shutdown", params: {} });
+  assert.equal(sd.error, undefined);
+});
+
 test("daemon: connection closing mid-exec doesn't kill the daemon", async (t) => {
   const tmp = mkdtempSync(path.join(os.tmpdir(), "gondolin-sock-test-"));
   const sockPath = path.join(tmp, "d.sock");
