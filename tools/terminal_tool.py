@@ -1097,14 +1097,12 @@ def _get_env_config() -> Dict[str, Any]:
         # Gondolin-specific config — surfaces TERMINAL_GONDOLIN_* env vars into
         # a structured block that _create_environment forwards to
         # GondolinEnvironment. allowed_hosts defaults to ["*"] (open with
-        # Image resolution: explicit user override (TERMINAL_GONDOLIN_IMAGE
-        # or terminal.gondolin.image in config) wins; otherwise we resolve
-        # to the hermes-runtime tag. There is no "fall back to gondolin's
-        # own alpine-base default" path — alpine-base ships no python3,
-        # no bash, no node, which silently breaks execute_code and most
-        # skills downstream. If the tag isn't built, _create_environment
-        # raises with the actionable build command before we boot a VM.
-        # See docs/design/gondolin-terminal-backend.md § "Default image".
+        # credential isolation) to match the design doc; tightening is opt-in.
+        #
+        # `image` is a plain string (same shape as terminal.docker_image),
+        # default points at the same image docker defaults to. First use
+        # triggers gondolin's OCI rootfs build pipeline via
+        # _ensure_gondolin_image_built; subsequent sessions hit the cache.
         "gondolin": {
             "allowed_hosts": _parse_env_var(
                 "TERMINAL_GONDOLIN_ALLOWED_HOSTS", '["*"]', json.loads, "valid JSON"
@@ -1114,7 +1112,7 @@ def _get_env_config() -> Dict[str, Any]:
             ),
             "policy_script": os.getenv("TERMINAL_GONDOLIN_POLICY_SCRIPT") or None,
             "sandbox_dir": os.getenv("TERMINAL_GONDOLIN_SANDBOX_DIR") or None,
-            "image": os.getenv("TERMINAL_GONDOLIN_IMAGE") or _DEFAULT_GONDOLIN_IMAGE,
+            "image": os.getenv("TERMINAL_GONDOLIN_IMAGE") or DEFAULT_GONDOLIN_IMAGE,
             # Per-VM resource caps; None means "let Gondolin use defaults
             # (1G memory, 2 cpus)". The knob exists so a user running many
             # parallel sessions on a memory-constrained host can dial these
@@ -1128,92 +1126,37 @@ def _get_env_config() -> Dict[str, Any]:
     }
 
 
-# Sentinel for the gondolin image config: "use the hermes-runtime tag for
-# this Hermes version." Distinguishes "user explicitly set image to None"
-# (which we treat as "use default") from "user pinned a specific image"
-# (which skips the build check in _create_environment).
-class _DefaultGondolinImage:
-    def __repr__(self) -> str:
-        return "<default hermes-runtime>"
-
-    def __bool__(self) -> bool:
-        # Falsy so any `if image:` check still sees "no explicit override".
-        return False
-
-
-_DEFAULT_GONDOLIN_IMAGE = _DefaultGondolinImage()
+#: Default OCI image for the gondolin terminal backend.
+#:
+#: Same string as the docker backend's default (see ``terminal.docker_image``
+#: in this file's _get_env_config). Gondolin materializes it on first use
+#: via its OCI rootfs build pipeline, then caches the resulting image in
+#: ``~/.cache/gondolin/`` for subsequent sessions.
+#:
+#: A user who wants a different image (Microsoft devcontainer, custom
+#: build, or gondolin's stock alpine-base) sets ``terminal.gondolin.image``
+#: in config.yaml or exports ``TERMINAL_GONDOLIN_IMAGE``.
+DEFAULT_GONDOLIN_IMAGE = "nikolaik/python-nodejs:python3.11-nodejs20"
 
 
-def _resolve_gondolin_image_or_raise(image: Any) -> str:
-    """Map the config's gondolin image setting to a concrete tag, or raise.
+def _ensure_gondolin_image_built(image: str) -> str:
+    """Lazy materialization of the gondolin VM image.
 
-    The contract is intentionally narrow:
-
-    - If ``image`` is :data:`_DEFAULT_GONDOLIN_IMAGE` (the sentinel set
-      when the user hasn't overridden it), resolve to the
-      ``hermes-runtime:<version>`` tag for the running Hermes. If the
-      tag isn't built in gondolin's local image store, raise
-      :class:`RuntimeError` with the exact build command. We do not
-      fall back to gondolin's own ``alpine-base:latest`` — that image
-      has no ``python3``/``bash``/``node`` and silently breaks
-      ``execute_code`` and most skills.
-    - If ``image`` is a non-empty string, treat it as a user-pinned
-      override and pass it through unchanged. Validation is the user's
-      job; they typed it.
-    - Any other shape (empty string, None passed explicitly, junk) is a
-      misconfiguration and raises.
+    Delegates to :mod:`hermes_cli.gondolin_image` which knows how to
+    map an OCI name to a gondolin tag, detect podman/docker, and shell
+    out to ``gondolin build`` on first use. Re-imported defensively so
+    a broken Hermes install surfaces a clear error rather than a
+    deep ImportError mid-tool-call.
     """
-    if isinstance(image, _DefaultGondolinImage):
-        try:
-            from hermes_cli.gondolin_image import (
-                HERMES_RUNTIME_BUILD_CONFIG,
-                HERMES_RUNTIME_TAG,
-                is_hermes_runtime_present,
-                missing_host_packages,
-            )
-        except ImportError as e:
-            raise RuntimeError(
-                f"Gondolin image helper not importable: {e}. "
-                "This indicates a broken Hermes install; "
-                "reinstall or check sys.path."
-            ) from e
-        if is_hermes_runtime_present():
-            return HERMES_RUNTIME_TAG
-        # Not built. Give the user the exact path forward, with the
-        # apt prereqs they'll hit if they haven't installed them.
-        missing = missing_host_packages()
-        msg_lines = [
-            f"Gondolin terminal backend needs the hermes-runtime image "
-            f"({HERMES_RUNTIME_TAG}), which is not built yet in your "
-            f"local gondolin image store.",
-            "",
-            "Build it with:",
-            "  hermes gondolin build",
-            "",
-            f"Spec: {HERMES_RUNTIME_BUILD_CONFIG}",
-        ]
-        if missing:
-            pkgs = " ".join(missing)
-            msg_lines.extend([
-                "",
-                f"The build also needs these host packages on $PATH: {pkgs}",
-                f"  sudo apt-get install -y {pkgs}",
-            ])
-        msg_lines.extend([
-            "",
-            "To bypass and pin a different image (gondolin's stock "
-            "`alpine-base:latest`, or a path to a directory of assets you "
-            "built yourself), set `terminal.gondolin.image` in "
-            "~/.hermes/config.yaml or export TERMINAL_GONDOLIN_IMAGE.",
-        ])
-        raise RuntimeError("\n".join(msg_lines))
-    if isinstance(image, str) and image:
-        return image
-    raise RuntimeError(
-        f"Invalid gondolin image configuration: {image!r}. "
-        "Set `terminal.gondolin.image` to a tag, a path to built assets, "
-        "or leave it unset to use the default hermes-runtime image."
-    )
+    try:
+        from hermes_cli.gondolin_image import ensure_built
+    except ImportError as e:
+        raise RuntimeError(
+            f"Gondolin image helper not importable: {e}. "
+            "This indicates a broken Hermes install; reinstall or "
+            "check sys.path."
+        ) from e
+    return ensure_built(image)
 
 
 def _get_modal_backend_state(modal_mode: object | None) -> Dict[str, Any]:
@@ -1392,12 +1335,15 @@ def _create_environment(env_type: str, image: str, cwd: str, timeout: int,
             "secrets": gc.get("secrets", {}),
             "policy_script": gc.get("policy_script"),
         }
-        # `image` is required end-to-end: either the user pinned a tag /
-        # path, or _get_env_config left the sentinel in place and we
-        # resolve to the hermes-runtime tag now (raising if it's not
-        # built). The daemon never sees the sentinel; it always gets a
-        # concrete string.
-        daemon_config["image"] = _resolve_gondolin_image_or_raise(gc.get("image"))
+        # `image` is required end-to-end. The default is an OCI image
+        # name (DEFAULT_GONDOLIN_IMAGE); _ensure_gondolin_image_built
+        # materializes it via gondolin's OCI rootfs build pipeline on
+        # first use and returns the gondolin-store tag the daemon needs.
+        # A user-pinned absolute path or pre-built gondolin tag flows
+        # through unchanged. Build runs synchronously here; the wizard
+        # offers to pre-warm so the first session isn't the one that
+        # waits.
+        daemon_config["image"] = _ensure_gondolin_image_built(gc.get("image"))
         # Per-VM resource caps. Forward only when explicitly configured so
         # Gondolin's defaults (1G / 2 cpus) apply otherwise.
         if gc.get("memory"):

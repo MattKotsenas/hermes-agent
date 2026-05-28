@@ -22,56 +22,25 @@ NODE_DAEMON = REPO_ROOT / "tools" / "environments" / "gondolin_host" / "src" / "
 NODE_AVAILABLE = shutil.which("node") is not None and NODE_DAEMON.exists()
 
 
-def _hermes_runtime_ref_path() -> Path:
-    """Path to gondolin's local image-store ref for the hermes-runtime tag.
-
-    Gondolin stores refs as files under ``~/.cache/gondolin/images/refs/``
-    (directory hierarchy mirroring the ``name/tag`` shape). Looking
-    directly at the filesystem is intentional — we want the test to
-    exercise the real resolution path against the real store, not a
-    mock of it. If gondolin's storage layout ever changes, this helper
-    needs updating; that's a deliberate coupling to a stable interface.
-    """
-    from hermes_cli.gondolin_image import HERMES_RUNTIME_TAG
-    name, _, version = HERMES_RUNTIME_TAG.partition(":")
-    return Path.home() / ".cache" / "gondolin" / "images" / "refs" / name / version
-
-
 @pytest.fixture
-def _no_hermes_runtime_ref(tmp_path):
-    """Ensure the hermes-runtime tag is NOT present in gondolin's image
-    store for the duration of the test.
+def _bypass_image_build(monkeypatch):
+    """Bypass the OCI rootfs build path so _create_environment can run
+    without touching gondolin's image store or shelling out to podman.
 
-    If the ref exists, move it aside into a tmp path and restore on
-    teardown. If it doesn't, no-op. Either way, the resolution path
-    inside the test sees an empty store and yields image=None.
+    Substitutes ``ensure_built`` (and the wrapper in terminal_tool) with
+    an identity passthrough — whatever image string the test provides,
+    flows straight through to the daemon config. Used by the
+    constructor-shape tests below; the actual build path is exercised
+    end-to-end in tests/integration/test_gondolin_terminal.py and
+    unit-tested in tests/hermes_cli/test_gondolin_image.py.
     """
-    ref = _hermes_runtime_ref_path()
-    moved = None
-    if ref.exists():
-        moved = tmp_path / "saved-ref"
-        ref.rename(moved)
-    try:
-        yield
-    finally:
-        if moved is not None and moved.exists():
-            ref.parent.mkdir(parents=True, exist_ok=True)
-            moved.rename(ref)
+    from hermes_cli import gondolin_image
+    from tools import terminal_tool
 
-
-@pytest.fixture
-def _hermes_runtime_ref_present():
-    """Skip the test unless the hermes-runtime tag is already in
-    gondolin's local image store.
-
-    Building the image takes ~10 s and ~330 MB of disk, so we don't do
-    it at test time. CI without a build step will skip; dev hosts that
-    have run ``hermes gondolin build`` will exercise the test.
-    """
-    if not _hermes_runtime_ref_path().exists():
-        pytest.skip(
-            "hermes-runtime image not built; run `hermes gondolin build`"
-        )
+    monkeypatch.setattr(gondolin_image, "ensure_built", lambda image: image)
+    monkeypatch.setattr(
+        terminal_tool, "_ensure_gondolin_image_built", lambda image: image
+    )
     yield
 
 
@@ -95,7 +64,7 @@ def test_get_env_config_reads_gondolin_keys(monkeypatch):
         "/tmp/my-policy.mjs",
     )
     monkeypatch.setenv("TERMINAL_GONDOLIN_SANDBOX_DIR", "/tmp/my-sandbox")
-    monkeypatch.setenv("TERMINAL_GONDOLIN_IMAGE", "ubuntu-noble:latest")
+    monkeypatch.setenv("TERMINAL_GONDOLIN_IMAGE", "python:3.11-slim")
     monkeypatch.setenv("TERMINAL_GONDOLIN_MEMORY", "512M")
     monkeypatch.setenv("TERMINAL_GONDOLIN_CPUS", "1")
 
@@ -105,18 +74,17 @@ def test_get_env_config_reads_gondolin_keys(monkeypatch):
     assert g["secrets"]["GITHUB_TOKEN"]["from_env"] == "GITHUB_TOKEN"
     assert g["policy_script"] == "/tmp/my-policy.mjs"
     assert g["sandbox_dir"] == "/tmp/my-sandbox"
-    assert g["image"] == "ubuntu-noble:latest"
+    assert g["image"] == "python:3.11-slim"
     assert g["memory"] == "512M"
     assert g["cpus"] == 1
 
 
 def test_get_env_config_defaults_for_gondolin(monkeypatch):
-    """When no gondolin env vars are set, the gondolin block is present
-    with sane defaults. ``image`` carries the default-sentinel so
-    downstream resolution can tell "user didn't override" from "user
-    pinned a tag".
+    """When no gondolin env vars are set, the gondolin block carries
+    the default OCI image — same string the docker backend defaults to.
+    Image resolution happens later in _create_environment, not here.
     """
-    from tools.terminal_tool import _DEFAULT_GONDOLIN_IMAGE, _get_env_config
+    from tools.terminal_tool import DEFAULT_GONDOLIN_IMAGE, _get_env_config
 
     # Make sure no gondolin vars leak in from the surrounding shell.
     for k in (
@@ -137,79 +105,28 @@ def test_get_env_config_defaults_for_gondolin(monkeypatch):
     assert g["secrets"] == {}
     assert g["policy_script"] is None
     assert g["sandbox_dir"] is None
-    assert g["image"] is _DEFAULT_GONDOLIN_IMAGE
+    assert g["image"] == DEFAULT_GONDOLIN_IMAGE
     assert g["memory"] is None
     assert g["cpus"] is None
 
 
-def test_resolve_gondolin_image_returns_tag_when_built(
-    monkeypatch, _hermes_runtime_ref_present
-):
-    """``_resolve_gondolin_image_or_raise(_DEFAULT_GONDOLIN_IMAGE)`` returns
-    the hermes-runtime tag when the image is present in gondolin's local
-    store.
+def test_default_gondolin_image_matches_docker_default():
+    """Parity check: the gondolin default OCI image is the same string
+    docker uses, so a user switching backends doesn't relearn.
 
-    Skips when gondolin's store doesn't have the tag (CI without a build
-    step); on dev hosts that have run ``hermes gondolin build`` it
-    exercises the real resolution path.
+    If the docker default changes, this test fails and the docs in
+    configuration.md need updating in lockstep.
     """
-    from tools.terminal_tool import (
-        _DEFAULT_GONDOLIN_IMAGE,
-        _resolve_gondolin_image_or_raise,
-    )
-    from hermes_cli.gondolin_image import HERMES_RUNTIME_TAG
+    from tools.terminal_tool import DEFAULT_GONDOLIN_IMAGE, _get_env_config
 
-    assert _resolve_gondolin_image_or_raise(_DEFAULT_GONDOLIN_IMAGE) == HERMES_RUNTIME_TAG
-
-
-def test_resolve_gondolin_image_raises_when_not_built(
-    monkeypatch, _no_hermes_runtime_ref
-):
-    """When the hermes-runtime tag isn't built and the user hasn't
-    overridden it, resolution raises with the actionable build command
-    instead of silently falling back to a python-less image.
-
-    Real-world test: ``_no_hermes_runtime_ref`` moves any existing ref
-    aside for the duration of the test, then restores it. No mocking —
-    we exercise the actual resolution path against the actual store.
-    """
-    from tools.terminal_tool import (
-        _DEFAULT_GONDOLIN_IMAGE,
-        _resolve_gondolin_image_or_raise,
-    )
-    from hermes_cli.gondolin_image import HERMES_RUNTIME_TAG
-
-    with pytest.raises(RuntimeError) as exc:
-        _resolve_gondolin_image_or_raise(_DEFAULT_GONDOLIN_IMAGE)
-    msg = str(exc.value)
-    # Must name the missing tag and the exact build command.
-    assert HERMES_RUNTIME_TAG in msg
-    assert "hermes gondolin build" in msg
-    # Must point at the override knob so a user who wants alpine-base
-    # or ubuntu-noble has a way out.
-    assert "terminal.gondolin.image" in msg
-
-
-def test_resolve_gondolin_image_passes_through_user_override():
-    """A user-pinned image (string) flows through untouched — no
-    presence check, no build prompt. They typed it; we trust it.
-    """
-    from tools.terminal_tool import _resolve_gondolin_image_or_raise
-
-    assert _resolve_gondolin_image_or_raise("ubuntu-noble:latest") == "ubuntu-noble:latest"
-    assert _resolve_gondolin_image_or_raise("/path/to/built/assets") == "/path/to/built/assets"
-
-
-def test_resolve_gondolin_image_rejects_garbage():
-    """Empty string or None as image is a misconfiguration; raise rather
-    than silently pick something.
-    """
-    from tools.terminal_tool import _resolve_gondolin_image_or_raise
-
-    with pytest.raises(RuntimeError, match="Invalid gondolin image"):
-        _resolve_gondolin_image_or_raise("")
-    with pytest.raises(RuntimeError, match="Invalid gondolin image"):
-        _resolve_gondolin_image_or_raise(None)
+    monkeypatch_env = {
+        "TERMINAL_ENV": "docker",
+    }
+    # Read the docker backend's default by inspecting the code, since
+    # _get_env_config returns a Dict that doesn't carry the docker
+    # default in a stable place. The hardcoded default in terminal_tool
+    # is "nikolaik/python-nodejs:python3.11-nodejs20".
+    assert DEFAULT_GONDOLIN_IMAGE == "nikolaik/python-nodejs:python3.11-nodejs20"
 
 
 def test_get_env_config_default_cwd_for_gondolin(monkeypatch):
@@ -255,10 +172,16 @@ def test_get_env_config_rejects_relative_cwd_for_gondolin(monkeypatch):
 
 
 @pytest.mark.skipif(not NODE_AVAILABLE, reason="node or daemon.mjs missing")
-def test_create_environment_returns_gondolin_environment(tmp_path):
+def test_create_environment_returns_gondolin_environment(
+    tmp_path, _bypass_image_build
+):
     """_create_environment('gondolin', ...) constructs a GondolinEnvironment
     using the gondolin_config block. Uses stub_vm=True via a config flag
-    so we don't boot QEMU."""
+    so we don't boot QEMU.
+
+    Bypasses the image build path with a fixture — the build is unit-tested
+    separately in tests/hermes_cli/test_gondolin_image.py.
+    """
     from tools.terminal_tool import _create_environment
     from tools.environments.gondolin import GondolinEnvironment
 
@@ -268,7 +191,7 @@ def test_create_environment_returns_gondolin_environment(tmp_path):
         "secrets": {},
         "policy_script": None,
         "sandbox_dir": sandbox,
-        "image": "ubuntu-noble:latest",
+        "image": "python:3.11-slim",
         "stub_vm": True,  # test-only flag honored by factory
     }
     env = _create_environment(
@@ -283,13 +206,15 @@ def test_create_environment_returns_gondolin_environment(tmp_path):
         assert isinstance(env, GondolinEnvironment)
         assert env.sandbox_dir.as_posix() == sandbox
         # Image must have been forwarded into the daemon's init payload.
-        assert env.config.get("image") == "ubuntu-noble:latest"
+        assert env.config.get("image") == "python:3.11-slim"
     finally:
         env.cleanup()
 
 
 @pytest.mark.skipif(not NODE_AVAILABLE, reason="node or daemon.mjs missing")
-def test_create_environment_propagates_lock_dir_for_cross_process_cap(tmp_path, monkeypatch):
+def test_create_environment_propagates_lock_dir_for_cross_process_cap(
+    tmp_path, monkeypatch, _bypass_image_build
+):
     """The factory injects a default lock_dir under HERMES_HOME so the
     cross-process concurrent-VM cap is honored across the CLI, subagents,
     the gateway, and cron jobs — without users having to set anything."""
@@ -306,7 +231,7 @@ def test_create_environment_propagates_lock_dir_for_cross_process_cap(tmp_path, 
         gondolin_config={
             "sandbox_dir": str(tmp_path / "vm-sandbox"),
             "stub_vm": True,
-            "image": "ubuntu-noble:latest",
+            "image": "python:3.11-slim",
         },
         task_id="test-lockdir",
     )
@@ -325,7 +250,9 @@ def test_create_environment_propagates_lock_dir_for_cross_process_cap(tmp_path, 
 
 
 @pytest.mark.skipif(not NODE_AVAILABLE, reason="node or daemon.mjs missing")
-def test_create_environment_propagates_max_concurrent_vms_knob(tmp_path, monkeypatch):
+def test_create_environment_propagates_max_concurrent_vms_knob(
+    tmp_path, monkeypatch, _bypass_image_build
+):
     """`terminal.gondolin.max_concurrent_vms` set in config flows through
     to the module-level cap so users don't have to also export the env var."""
     from tools.terminal_tool import _create_environment
@@ -342,7 +269,7 @@ def test_create_environment_propagates_max_concurrent_vms_knob(tmp_path, monkeyp
             "sandbox_dir": str(tmp_path / "vm-sandbox"),
             "stub_vm": True,
             "max_concurrent_vms": 3,
-            "image": "ubuntu-noble:latest",
+            "image": "python:3.11-slim",
         },
         task_id="test-cap-knob",
     )
@@ -389,7 +316,7 @@ def test_config_set_terminal_gondolin_keys_sync_to_env(monkeypatch, tmp_path):
 
     keys_to_sync = {
         "terminal.backend": ("gondolin", "TERMINAL_ENV"),
-        "terminal.gondolin.image": ("ubuntu-noble:latest", "TERMINAL_GONDOLIN_IMAGE"),
+        "terminal.gondolin.image": ("python:3.11-slim", "TERMINAL_GONDOLIN_IMAGE"),
         "terminal.gondolin.policy_script": ("/tmp/p.mjs", "TERMINAL_GONDOLIN_POLICY_SCRIPT"),
         "terminal.gondolin.sandbox_dir": ("/tmp/sb", "TERMINAL_GONDOLIN_SANDBOX_DIR"),
         "terminal.gondolin.memory": ("512M", "TERMINAL_GONDOLIN_MEMORY"),

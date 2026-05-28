@@ -889,9 +889,9 @@ def _execute_remote(
             if env_type == "gondolin":
                 hint = (
                     " The image pinned at `terminal.gondolin.image` has no "
-                    "python3. Unset the override to use the default "
-                    "hermes-runtime image (ships python3 + node + uv), or "
-                    "rebuild your custom image with python3 installed."
+                    "python3. Unset the override to use the default OCI "
+                    "image (ships python3 + node), or rebuild your custom "
+                    "image with python3 installed."
                 )
             else:
                 hint = " Install Python to use execute_code with remote backends."

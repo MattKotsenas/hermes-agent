@@ -36,18 +36,23 @@ requires_gondolin = pytest.mark.skipif(
 )
 
 
-def _hermes_runtime_image_present() -> bool:
-    """Module-import-safe probe for the hermes-runtime tag.
+def _python_image_present() -> bool:
+    """Module-import-safe probe for a python-capable gondolin image.
 
     Used by ``test_execute_code_round_trip`` to decide whether to run
     (image built) or skip (image not built — CI without the build step
     won't fail the test). Swallows all exceptions because pytest runs
     this at collection time and a broken probe must not fail the whole
     test run.
+
+    Looks for the default-image tag the gondolin backend would resolve
+    to via ``ensure_built``. On a host that's run ``hermes setup`` or
+    ``hermes gondolin prebuild``, this is in the local image store.
     """
     try:
-        from hermes_cli.gondolin_image import is_hermes_runtime_present
-        return is_hermes_runtime_present()
+        from hermes_cli.gondolin_image import is_image_built, oci_image_tag
+        from tools.terminal_tool import DEFAULT_GONDOLIN_IMAGE
+        return is_image_built(oci_image_tag(DEFAULT_GONDOLIN_IMAGE))
     except Exception:  # noqa: BLE001
         return False
 
@@ -142,24 +147,26 @@ def gondolin_env_workspace(tmp_path):
 
 @pytest.fixture
 def gondolin_env_with_python(tmp_path):
-    """Real Gondolin VM with the hermes-runtime image (ships python3).
+    """Real Gondolin VM with a python-capable image (default OCI image).
 
-    Separate from ``gondolin_env_workspace`` because the default
+    Separate from ``gondolin_env_workspace`` because gondolin's stock
     alpine-base image is faster to boot but has no python3, and most
     integration tests don't need an interpreter. This fixture is for
     tests that exercise the in-VM Python runtime (``execute_code``,
     ``hermes_tools``-shipped scripts, etc.) and is automatically skipped
-    by the test's own ``skipif(not _hermes_runtime_image_present())``.
+    by the test's own ``skipif(not _python_image_present())``.
     """
-    from hermes_cli.gondolin_image import HERMES_RUNTIME_TAG
+    from hermes_cli.gondolin_image import oci_image_tag
     from tools.environments.gondolin import GondolinEnvironment
+    from tools.terminal_tool import DEFAULT_GONDOLIN_IMAGE
+
     env = GondolinEnvironment(
         sandbox_dir=str(tmp_path / "sandbox"),
         cwd="/workspace",
         timeout=60,
         init_timeout=180.0,  # bigger image, longer cold boot budget
         stub_vm=False,
-        config={"image": HERMES_RUNTIME_TAG},
+        config={"image": oci_image_tag(DEFAULT_GONDOLIN_IMAGE)},
     )
     try:
         yield env
@@ -229,12 +236,11 @@ def test_daemon_socket_not_visible_in_guest_workspace(gondolin_env_workspace):
 
 @requires_gondolin
 @pytest.mark.skipif(
-    not _hermes_runtime_image_present(),
+    not _python_image_present(),
     reason=(
-        "execute_code requires python3 in the guest. The hermes-runtime "
-        "image (built via `hermes gondolin build`) ships python3. Without "
-        "that tag, the gondolin backend raises at construction. Build the "
-        "image to exercise this test."
+        "execute_code requires python3 in the guest. Run `hermes setup` "
+        "or `hermes gondolin prebuild` to materialize the default OCI "
+        "image. Without it the integration test skips."
     ),
 )
 def test_execute_code_round_trip(gondolin_env_with_python):

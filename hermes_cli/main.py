@@ -6147,35 +6147,78 @@ def cmd_webhook(args):
 
 
 def cmd_gondolin(args):
-    """Gondolin terminal-backend management (currently: image build).
+    """Gondolin terminal-backend management.
 
-    Dispatches the ``hermes gondolin <action>`` subcommand. Only valid
-    action today is ``build`` (builds the hermes-runtime image via
-    gondolin's own build pipeline). Kept as a subcommand for forward
+    Dispatches the ``hermes gondolin <action>`` subcommand. Today the
+    only action is ``prebuild`` — runs gondolin's OCI rootfs build
+    pipeline for the currently-configured image so the first session
+    doesn't pay that cost. Kept as a subcommand for forward
     compatibility with future actions (``gc``, ``inspect``, etc.) —
     matches the pattern used by ``cron``, ``webhook``, and ``kanban``.
     """
     action = getattr(args, "gondolin_action", None)
-    if action == "build":
+    if action == "prebuild":
         from hermes_cli.gondolin_image import (
-            HERMES_RUNTIME_TAG,
-            HERMES_RUNTIME_BUILD_CONFIG,
-            run_build,
+            build_oci_image,
+            detect_oci_runtime,
+            is_image_built,
+            missing_build_host_packages,
+            oci_image_tag,
         )
-        tag = getattr(args, "tag", None) or HERMES_RUNTIME_TAG
-        config = getattr(args, "config", None) or HERMES_RUNTIME_BUILD_CONFIG
-        print(f"Building gondolin image {tag} from {config}...")
-        rc = run_build(tag=tag, config_path=Path(config))
+        from tools.terminal_tool import DEFAULT_GONDOLIN_IMAGE
+
+        image = (
+            getattr(args, "image", None)
+            or os.getenv("TERMINAL_GONDOLIN_IMAGE")
+            or DEFAULT_GONDOLIN_IMAGE
+        )
+        # An absolute path is already-built assets; nothing to do.
+        if os.path.isabs(image):
+            print(f"{image}: already a built-assets directory; nothing to do")
+            return
+        # An already-tagged gondolin image is already built.
+        if is_image_built(image):
+            print(f"{image}: already present in gondolin's local image store")
+            return
+
+        runtime = detect_oci_runtime()
+        if runtime is None:
+            print(
+                "Neither podman nor docker found on $PATH. Install one of "
+                "them so gondolin can pull and export the OCI image:\n"
+                "  sudo apt-get install -y podman",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        missing = missing_build_host_packages()
+        if missing:
+            pkgs = " ".join(missing)
+            print(
+                f"Missing host packages: {pkgs}\n"
+                f"Install with: sudo apt-get install -y {pkgs}",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+
+        tag = oci_image_tag(image)
+        if is_image_built(tag):
+            print(
+                f"{image}: rootfs already built as {tag}; nothing to do"
+            )
+            return
+
+        print(f"Building gondolin rootfs from OCI image {image} (tag: {tag})...")
+        rc = build_oci_image(image, tag=tag, runtime=runtime)
         if rc != 0:
             print(f"build failed (exit {rc})", file=sys.stderr)
             sys.exit(rc)
-        print(f"OK — image tagged {tag}")
+        print(f"OK — gondolin tag {tag} now in local image store")
         return
     # No action / unknown action → show help and exit non-zero so scripts
     # can detect the misuse.
     print(
-        "usage: hermes gondolin build [--tag TAG] [--config FILE]\n"
-        "       (build the hermes-runtime gondolin image)",
+        "usage: hermes gondolin prebuild [--image NAME]\n"
+        "       (pre-build the gondolin rootfs for the configured image)",
         file=sys.stderr,
     )
     sys.exit(2)
@@ -12018,44 +12061,35 @@ def main():
     # =========================================================================
     # gondolin command — terminal-backend image management
     # =========================================================================
-    # Currently a single action (`build`) but kept as a subcommand for
-    # forward compatibility with future actions (gc old tags, inspect a
-    # tag, etc.) — same shape as cron/webhook/kanban.
+    # Currently a single action (`prebuild`) but kept as a subcommand
+    # for forward compatibility with future actions (gc old tags,
+    # inspect a tag, etc.) — same shape as cron/webhook/kanban.
     gondolin_parser = subparsers.add_parser(
         "gondolin",
         help="Gondolin terminal-backend image management",
         description=(
-            "Manage the hermes-runtime image used by the gondolin "
-            "terminal backend. The build runs gondolin's own pipeline "
-            "(Alpine + python3 + node + uv) locally — no Hermes-published "
-            "artifacts."
+            "Manage the OCI rootfs images cached for the gondolin "
+            "terminal backend. `prebuild` runs gondolin's own build "
+            "pipeline so the first session doesn't pay that cost."
         ),
     )
     gondolin_subparsers = gondolin_parser.add_subparsers(dest="gondolin_action")
-    gondolin_build = gondolin_subparsers.add_parser(
-        "build",
-        help="Build the hermes-runtime gondolin image",
+    gondolin_prebuild = gondolin_subparsers.add_parser(
+        "prebuild",
+        help="Pre-build the gondolin rootfs for the configured image",
         description=(
-            "Run `gondolin build` against the bundled hermes-runtime spec "
-            "and tag the result as hermes-runtime:<hermes-version>. "
-            "Requires cpio + lz4 on the host (apt install cpio lz4 on "
-            "Ubuntu/Debian)."
+            "Pull the OCI image (via podman or docker) and run "
+            "`gondolin build --oci` to materialize a gondolin rootfs "
+            "under ~/.cache/gondolin/. Requires cpio + lz4 + podman or "
+            "docker on the host."
         ),
     )
-    gondolin_build.add_argument(
-        "--tag",
+    gondolin_prebuild.add_argument(
+        "--image",
         default=None,
         help=(
-            "Image tag to apply. Default: hermes-runtime:<hermes-version>. "
-            "Override only if you know why."
-        ),
-    )
-    gondolin_build.add_argument(
-        "--config",
-        default=None,
-        help=(
-            "Path to a gondolin build config JSON. Default: the bundled "
-            "tools/environments/gondolin_host/hermes-runtime.json."
+            "OCI image name to build (e.g. python:3.11-slim). Defaults "
+            "to $TERMINAL_GONDOLIN_IMAGE or the built-in default."
         ),
     )
     gondolin_parser.set_defaults(func=cmd_gondolin)

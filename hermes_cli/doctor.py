@@ -1291,48 +1291,72 @@ def run_doctor(args):
                 issues,
             )
 
-        # hermes-runtime image: the gondolin backend's default image.
-        # We don't auto-build (the build is a side-effect-bearing host
-        # operation that writes ~330 MB to ~/.cache/gondolin/ and pulls
-        # from upstream Alpine + libkrunfw mirrors). Missing host
-        # packages AND a missing image are both errors now: the gondolin
-        # backend raises at construction if the user hasn't pinned an
-        # override, so doctor's job is to flag the misconfiguration up
-        # front rather than wait for the first execute_code attempt.
-        # See docs/design/gondolin-terminal-backend.md § "Default image".
-        if not os.getenv("TERMINAL_GONDOLIN_IMAGE", "").strip():
-            try:
-                from hermes_cli.gondolin_image import (
-                    HERMES_RUNTIME_TAG,
-                    is_hermes_runtime_present,
-                    missing_host_packages,
+        # Gondolin's OCI rootfs build pipeline needs an OCI runtime
+        # (podman or docker) to pull and export the image, plus cpio +
+        # lz4 to assemble the initramfs. None of these are needed at
+        # session boot time once the rootfs is cached, so we surface
+        # them as fail-when-missing-AND-image-not-cached, info
+        # otherwise. The image-cache check piggybacks on the configured
+        # image so a user-pinned override that's already a built tag
+        # doesn't generate spurious warnings.
+        try:
+            from hermes_cli.gondolin_image import (
+                detect_oci_runtime,
+                is_image_built,
+                missing_build_host_packages,
+                oci_image_tag,
+            )
+            from tools.terminal_tool import DEFAULT_GONDOLIN_IMAGE
+
+            configured = (
+                os.getenv("TERMINAL_GONDOLIN_IMAGE")
+                or DEFAULT_GONDOLIN_IMAGE
+            )
+            # User pinned absolute path of built assets — nothing to probe.
+            if os.path.isabs(configured):
+                check_ok(
+                    f"gondolin image",
+                    f"(pinned to built assets at {configured})",
                 )
-                missing_pkgs = missing_host_packages()
-                if missing_pkgs:
-                    pkgs = " ".join(missing_pkgs)
+            elif is_image_built(configured) or is_image_built(
+                oci_image_tag(configured)
+            ):
+                check_ok(
+                    f"gondolin image",
+                    f"({configured} already built)",
+                )
+            else:
+                runtime = detect_oci_runtime()
+                missing_pkgs = missing_build_host_packages()
+                if runtime is None:
                     _fail_and_issue(
-                        f"gondolin: hermes-runtime image build needs host packages: {pkgs}",
-                        f"sudo apt-get install -y {pkgs}, then: hermes gondolin build",
-                        f"Install gondolin build deps ({pkgs}) and run 'hermes gondolin build'",
+                        f"gondolin: image {configured} not cached and no "
+                        f"OCI runtime found",
+                        "Need podman or docker on $PATH to build the rootfs",
+                        "Install podman (sudo apt-get install -y podman), "
+                        "then run 'hermes gondolin prebuild'",
                         issues,
                     )
-                elif not is_hermes_runtime_present():
+                elif missing_pkgs:
+                    pkgs = " ".join(missing_pkgs)
                     _fail_and_issue(
-                        f"gondolin: {HERMES_RUNTIME_TAG} not built",
-                        "Backend raises at construction until built (~10s, ~330 MB)",
-                        "Run 'hermes gondolin build' to build the hermes-runtime image",
+                        f"gondolin: image {configured} not cached and host "
+                        f"build deps missing: {pkgs}",
+                        f"OCI runtime {runtime} is present but cpio/lz4 are not",
+                        f"Install the build deps (sudo apt-get install -y "
+                        f"{pkgs}), then run 'hermes gondolin prebuild'",
                         issues,
                     )
                 else:
-                    check_ok(f"gondolin image", f"({HERMES_RUNTIME_TAG} present)")
-            except Exception:  # noqa: BLE001 — defensive: never block doctor
-                pass
-        else:
-            check_info(
-                f"gondolin image: pinned by TERMINAL_GONDOLIN_IMAGE "
-                f"({os.getenv('TERMINAL_GONDOLIN_IMAGE')!r}); hermes-runtime "
-                f"check skipped"
-            )
+                    # Build is possible but not done. Info-level: a
+                    # session-1 build will work; the user can prebuild.
+                    check_info(
+                        f"gondolin: image {configured} not cached yet "
+                        f"(will build on first use via {runtime}; "
+                        f"run 'hermes gondolin prebuild' to pre-warm)"
+                    )
+        except Exception:  # noqa: BLE001 — defensive: never block doctor
+            pass
 
         # Recent gondolin secret resolution warnings — surfaced from
         # errors.log so the user sees init-time and refresh-time failures

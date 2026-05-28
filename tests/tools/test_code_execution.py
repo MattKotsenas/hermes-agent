@@ -179,8 +179,8 @@ class TestExecuteCodeMissingPython(unittest.TestCase):
     """When the remote backend's `command -v python3` returns nothing, we
     surface a backend-specific actionable error. For gondolin this branch
     only fires when the user has pinned `terminal.gondolin.image` to a
-    python-less image (the default hermes-runtime ships python3, and an
-    unbuilt default raises at backend construction). The error must
+    python-less image (the default OCI image ships python3, and an
+    unbuilt image would have been built on first use). The error must
     point at the override they set."""
 
     def _run_remote_without_python(self, env_type):
@@ -210,7 +210,7 @@ class TestExecuteCodeMissingPython(unittest.TestCase):
         self.assertIn("terminal.gondolin.image", result["error"])
         # And point at the working default so a user who pinned out of
         # desperation has the "unset and you get python" off-ramp.
-        self.assertIn("hermes-runtime", result["error"])
+        self.assertIn("default OCI image", result["error"])
 
     def test_generic_backend_falls_through_to_generic_hint(self):
         """Non-gondolin backends keep the original 'install Python' guidance."""

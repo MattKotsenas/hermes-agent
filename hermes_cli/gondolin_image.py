@@ -1,112 +1,125 @@
-"""Hermes-runtime gondolin image: build, presence check, and host-deps probe.
+"""Lazy OCI image materialization for the gondolin terminal backend.
 
-The ``gondolin`` terminal backend boots VMs from gondolin-format images
-sourced from gondolin's local image store (``~/.cache/gondolin/``).
-Gondolin's built-in default, ``alpine-base:latest``, ships BusyBox plus
-networking but no python3/node/uv/bash — which makes the built-in
-``execute_code`` tool fail and degrades skills that shell out to those
-interpreters.
+The gondolin backend takes a plain OCI image name in
+``terminal.gondolin.image`` (same shape docker uses for
+``terminal.docker_image``). The first time a session needs that image
+gondolin's build pipeline pulls it via docker/podman and exports its
+filesystem into a gondolin-format rootfs cached under
+``~/.cache/gondolin/``. Subsequent sessions hit the cache.
 
-Rather than publishing our own image (registry, signing keys, release
-pipeline) or shipping a vendor-managed default we don't control, we
-ship a **pinned build spec** at
-``tools/environments/gondolin_host/hermes-runtime.json`` and let
-gondolin's own build pipeline produce a local image tagged
-``hermes-runtime:<hermes-version>`` on first run.
+This module is the thin glue between Hermes config and that build
+pipeline:
 
-This module is the shared surface:
+- :func:`oci_image_tag` — maps an OCI image name to the gondolin tag we
+  cache it under. Deterministic: same OCI name → same gondolin tag.
+- :func:`is_image_built` — checks whether the gondolin tag is in the
+  local image store.
+- :func:`detect_oci_runtime` — returns ``"docker"`` or ``"podman"`` if
+  either is on ``$PATH``, else ``None``.
+- :func:`missing_build_host_packages` — returns the subset of host
+  packages gondolin's build step needs that aren't on ``$PATH``.
+- :func:`build_oci_image` — invokes ``gondolin build`` with an OCI
+  config to materialize the image. Synchronous; surfaces gondolin's own
+  output rather than wrapping it.
+- :func:`ensure_built` — the one-call entry point used by the wizard
+  and by ``_create_environment``: idempotent, returns the gondolin tag
+  on success, raises with an actionable message on failure.
 
-- :data:`HERMES_RUNTIME_TAG` — the tag the rest of the codebase looks
-  for. Versioned with ``hermes_cli.__version__`` so a Hermes upgrade
-  that changes the spec doesn't silently swap images mid-flight.
-- :data:`HERMES_RUNTIME_BUILD_CONFIG` — absolute path to the bundled
-  build spec.
-- :data:`HERMES_RUNTIME_HOST_PACKAGES` — host packages gondolin's
-  build step needs (cpio, lz4 — both stock apt, both absent by default
-  on Ubuntu 24.04).
-- :func:`missing_host_packages` — returns the subset of host packages
-  not on ``$PATH``. Doctor uses this to surface the exact
-  ``apt install`` command up front.
-- :func:`is_hermes_runtime_present` — quick probe against
-  ``gondolin image ls`` to tell callers whether the tag is built.
-- :func:`run_build` — invokes ``gondolin build`` with our config, used
-  by the ``hermes gondolin build`` CLI subcommand.
-
-Everything here is side-effect-free except :func:`run_build`, which is
-explicitly the one place we touch the host's gondolin image store.
+A user-pinned absolute path (already-built gondolin assets) flows
+through ensure_built unchanged.
 """
 
 from __future__ import annotations
 
+import json
 import logging
 import os
+import re
 import shutil
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 from typing import IO, Any, List, Optional, Union
 
 logger = logging.getLogger(__name__)
 
 
-def _hermes_version() -> str:
-    """Return the running Hermes version string.
-
-    Falls back to ``unknown`` if the package metadata can't be loaded —
-    callers should treat that case the same as "no built image", i.e.
-    surface a build prompt rather than crashing.
-    """
-    try:
-        from hermes_cli import __version__
-        return __version__
-    except Exception:  # noqa: BLE001 — defensive: never crash callers
-        return "unknown"
-
-
-#: The image tag the gondolin backend resolves to by default.
+#: Host packages gondolin's build pipeline shells out to.
 #:
-#: Versioned with the Hermes release so two installs on the same
-#: version produce identical images, and a Hermes upgrade that changes
-#: the build spec doesn't silently swap images mid-flight.
-HERMES_RUNTIME_TAG = f"hermes-runtime:{_hermes_version()}"
+#: ``cpio`` and ``lz4`` are needed for initramfs assembly. ``apk`` and
+#: ``mkfs.ext4`` are also referenced but gondolin bundles vendored
+#: binaries for those — only ``cpio`` + ``lz4`` actually need ``$PATH``.
+#:
+#: Discovered empirically: see docs/design/gondolin-terminal-backend.md.
+BUILD_HOST_PACKAGES: tuple[str, ...] = ("cpio", "lz4")
+
+
+#: Default kernel package and image gondolin uses to wrap an OCI rootfs.
+#:
+#: Gondolin still needs an Alpine-built kernel + initramfs even when the
+#: rootfs is sourced from OCI. These values match
+#: gondolin/src/build/init-config.ts defaults.
+_DEFAULT_ALPINE_VERSION = "3.23.0"
+_DEFAULT_KERNEL_PACKAGE = "linux-virt"
+_DEFAULT_KERNEL_IMAGE = "vmlinuz-virt"
+_DEFAULT_KRUNFW_VERSION = "v5.2.1"
+
+
+def missing_build_host_packages() -> List[str]:
+    """Return the subset of :data:`BUILD_HOST_PACKAGES` not on ``$PATH``."""
+    return [p for p in BUILD_HOST_PACKAGES if shutil.which(p) is None]
+
+
+def detect_oci_runtime() -> Optional[str]:
+    """Return ``"docker"`` or ``"podman"`` if either is available, else None.
+
+    Order: podman first, docker second. Podman is rootless-friendly and
+    doesn't need a daemon running on Linux; docker requires the user to
+    be in the ``docker`` group or have a daemon listening. If both are
+    installed we prefer podman to match the no-Docker-Desktop story most
+    gondolin users have on WSL2/Linux.
+    """
+    for runtime in ("podman", "docker"):
+        if shutil.which(runtime):
+            return runtime
+    return None
+
+
+_TAG_SAFE_RE = re.compile(r"[^a-zA-Z0-9._-]+")
+
+
+def oci_image_tag(oci_image: str) -> str:
+    """Map an OCI image name to the gondolin tag we cache its build under.
+
+    The mapping is deterministic and reversible enough to debug. The
+    OCI registry/repo path is collapsed to a safe identifier and joined
+    with the OCI tag (or ``latest`` if absent):
+
+    - ``nikolaik/python-nodejs:python3.11-nodejs20`` →
+      ``nikolaik_python-nodejs:python3.11-nodejs20``
+    - ``mcr.microsoft.com/devcontainers/universal:latest`` →
+      ``mcr.microsoft.com_devcontainers_universal:latest``
+    - ``python:3.11-slim`` → ``python:3.11-slim``
+
+    The gondolin tag namespace is flat; this mapping just keeps it
+    legible in ``gondolin image ls`` output.
+    """
+    if ":" in oci_image and oci_image.rfind(":") > oci_image.rfind("/"):
+        name, _, tag = oci_image.rpartition(":")
+    else:
+        name = oci_image
+        tag = "latest"
+    safe_name = _TAG_SAFE_RE.sub("_", name).strip("_")
+    safe_tag = _TAG_SAFE_RE.sub("_", tag).strip("_") or "latest"
+    return f"{safe_name}:{safe_tag}"
 
 
 def _repo_root() -> Path:
-    """Locate the bundled ``hermes-runtime.json`` next to the daemon source."""
-    # tools/environments/gondolin_host/hermes-runtime.json lives next to
-    # daemon.mjs. This module lives at hermes_cli/gondolin_image.py.
-    # Walk up to the repo root, then descend.
+    """Locate the Hermes repo root so we can find the daemon CLI."""
     here = Path(__file__).resolve()
     # hermes_cli/ -> repo root
     return here.parent.parent
-
-
-HERMES_RUNTIME_BUILD_CONFIG: Path = (
-    _repo_root()
-    / "tools"
-    / "environments"
-    / "gondolin_host"
-    / "hermes-runtime.json"
-)
-
-
-#: Host packages gondolin's build pipeline shells out to.
-#:
-#: gondolin's build mostly runs in-process (Alpine minirootfs extraction,
-#: package install via apk inside a chroot, kernel fetch from libkrunfw
-#: releases). The final initramfs packaging step shells out to ``cpio``
-#: and ``lz4``; on Ubuntu 24.04 neither is in the base install. ``apk``
-#: and ``mkfs.ext4`` are also referenced but gondolin bundles its own
-#: vendored binaries — only cpio + lz4 actually need to be on $PATH.
-#:
-#: Discovered empirically: see docs/design/gondolin-terminal-backend.md
-#: § "Default image: first-run local build".
-HERMES_RUNTIME_HOST_PACKAGES: tuple[str, ...] = ("cpio", "lz4")
-
-
-def missing_host_packages() -> List[str]:
-    """Return the subset of :data:`HERMES_RUNTIME_HOST_PACKAGES` not on ``$PATH``."""
-    return [p for p in HERMES_RUNTIME_HOST_PACKAGES if shutil.which(p) is None]
 
 
 def _resolve_gondolin_cli() -> Optional[Path]:
@@ -114,9 +127,7 @@ def _resolve_gondolin_cli() -> Optional[Path]:
 
     Returns the path to the executable JS file, or ``None`` if the daemon
     deps haven't been installed yet (``npm install`` in
-    ``tools/environments/gondolin_host/`` wasn't run). Callers should
-    treat ``None`` as a setup-incomplete signal — same shape as missing
-    node.
+    ``tools/environments/gondolin_host/`` wasn't run).
     """
     candidate = (
         _repo_root()
@@ -133,14 +144,12 @@ def _resolve_gondolin_cli() -> Optional[Path]:
     return candidate if candidate.is_file() else None
 
 
-def is_hermes_runtime_present(tag: str = HERMES_RUNTIME_TAG) -> bool:
-    """Return True iff ``gondolin image ls`` lists ``tag``.
+def is_image_built(gondolin_tag: str) -> bool:
+    """Return True iff ``gondolin image ls`` lists ``gondolin_tag``.
 
-    Fast probe (~100ms): runs ``node gondolin.js image ls`` and matches
-    on the tag prefix. Returns False on any failure — missing node,
-    missing gondolin CLI, non-zero exit, parse error — because the
-    caller's job is to "prompt the user to build it" either way; we
-    don't want a flaky transient to look like "image present".
+    Returns False on any failure (missing node, missing gondolin CLI,
+    non-zero exit) — caller's job is "build it if not present" either
+    way; we don't want a flaky transient to look like "image present".
     """
     cli = _resolve_gondolin_cli()
     if cli is None:
@@ -159,32 +168,52 @@ def is_hermes_runtime_present(tag: str = HERMES_RUNTIME_TAG) -> bool:
         return False
     if result.returncode != 0:
         return False
-    # gondolin image ls output is line-per-ref: "name:tag  x86_64=<build-id>"
-    # We just want a hit on the tag at start-of-line.
     for line in result.stdout.splitlines():
-        if line.strip().startswith(tag):
+        if line.strip().startswith(gondolin_tag):
             return True
     return False
 
 
-def run_build(
+def _build_config_for_oci(oci_image: str, runtime: str) -> dict:
+    """Construct a gondolin build config that wraps an OCI image as rootfs.
+
+    See gondolin/docs/custom-images.md § OCI Support for the schema.
+    Kernel + initramfs come from Alpine; rootfs comes from OCI.
+    """
+    return {
+        "arch": "x86_64",
+        "distro": "alpine",
+        "oci": {
+            "image": oci_image,
+            "runtime": runtime,
+        },
+        "alpine": {
+            "version": _DEFAULT_ALPINE_VERSION,
+            "kernelPackage": _DEFAULT_KERNEL_PACKAGE,
+            "kernelImage": _DEFAULT_KERNEL_IMAGE,
+            "krunfwVersion": _DEFAULT_KRUNFW_VERSION,
+        },
+        "rootfs": {
+            "label": "gondolin-root",
+        },
+    }
+
+
+def build_oci_image(
+    oci_image: str,
     *,
-    tag: str = HERMES_RUNTIME_TAG,
-    config_path: Path = HERMES_RUNTIME_BUILD_CONFIG,
+    tag: Optional[str] = None,
+    runtime: Optional[str] = None,
     stdout: Optional[Union[int, IO[Any]]] = None,
     stderr: Optional[Union[int, IO[Any]]] = None,
 ) -> int:
-    """Invoke ``gondolin build`` with the bundled hermes-runtime spec.
+    """Invoke ``gondolin build`` against an OCI image.
 
-    Returns the upstream gondolin exit code. We don't translate errors —
-    if gondolin's build pipeline fails (missing host package, mirror
-    flake, integrity check), the user wants to see gondolin's own error
-    text, not a Hermes-wrapped paraphrase. This is the supply chain;
-    obscuring it would be worse than honest.
+    Returns the gondolin exit code. Errors are surfaced as gondolin
+    prints them — we don't paraphrase the supply chain.
 
-    ``stdout`` / ``stderr``: passed through to subprocess. ``None`` lets
-    the build's output flow to the caller's terminal. The CLI command
-    wires this up.
+    ``tag`` defaults to :func:`oci_image_tag` of ``oci_image``.
+    ``runtime`` defaults to :func:`detect_oci_runtime`.
     """
     cli = _resolve_gondolin_cli()
     if cli is None:
@@ -201,16 +230,18 @@ def run_build(
             file=sys.stderr,
         )
         return 1
-    if not config_path.is_file():
+
+    chosen_runtime = runtime or detect_oci_runtime()
+    if chosen_runtime is None:
         print(
-            f"build config not found at {config_path}",
+            "Neither podman nor docker found on $PATH. Gondolin needs one "
+            "of them to pull and export the OCI image.\n"
+            "Install with: sudo apt-get install -y podman",
             file=sys.stderr,
         )
         return 1
 
-    # Pre-flight host-deps check so we fail with an actionable message
-    # before gondolin itself dies inside the pipeline.
-    missing = missing_host_packages()
+    missing = missing_build_host_packages()
     if missing:
         pkgs = " ".join(missing)
         print(
@@ -221,11 +252,112 @@ def run_build(
         )
         return 1
 
-    cmd = [node, str(cli), "build", "--config", str(config_path), "--tag", tag]
-    logger.info("running: %s", " ".join(cmd))
+    target_tag = tag or oci_image_tag(oci_image)
+    config = _build_config_for_oci(oci_image, chosen_runtime)
+
+    with tempfile.NamedTemporaryFile(
+        mode="w",
+        suffix=".json",
+        prefix="gondolin-oci-",
+        delete=False,
+    ) as fp:
+        json.dump(config, fp, indent=2)
+        config_path = fp.name
+
     try:
-        result = subprocess.run(cmd, stdout=stdout, stderr=stderr)
-    except OSError as e:
-        print(f"failed to invoke gondolin build: {e}", file=sys.stderr)
-        return 1
-    return result.returncode
+        cmd = [
+            node, str(cli), "build",
+            "--config", config_path,
+            "--tag", target_tag,
+        ]
+        logger.info("running: %s", " ".join(cmd))
+        try:
+            result = subprocess.run(cmd, stdout=stdout, stderr=stderr)
+        except OSError as e:
+            print(f"failed to invoke gondolin build: {e}", file=sys.stderr)
+            return 1
+        return result.returncode
+    finally:
+        try:
+            os.unlink(config_path)
+        except OSError:
+            pass
+
+
+def ensure_built(image: str) -> str:
+    """Resolve a Hermes config ``image`` value to a gondolin daemon image arg.
+
+    Three input shapes:
+
+    1. **OCI image name** (e.g. ``nikolaik/python-nodejs:python3.11-nodejs20``,
+       ``mcr.microsoft.com/devcontainers/universal:latest``). We map it
+       to a gondolin tag, build if absent, return the tag.
+    2. **Pre-built gondolin tag** in the local store (e.g. one a power
+       user built via ``gondolin build --tag my-image:1``). We detect
+       this by checking ``gondolin image ls`` first; if the input is
+       already a tag in the store, return it unchanged.
+    3. **Absolute path to a directory of built assets**. We pass through.
+
+    Raises :class:`RuntimeError` with an actionable message on build
+    failure or invalid input.
+    """
+    if not isinstance(image, str) or not image:
+        raise RuntimeError(
+            f"Invalid gondolin image configuration: {image!r}. "
+            "Set `terminal.gondolin.image` to an OCI image name "
+            "(e.g. 'python:3.11-slim'), a pre-built gondolin tag, or an "
+            "absolute path to a directory of built assets."
+        )
+
+    # Absolute path — gondolin's contract, pass through.
+    if os.path.isabs(image):
+        return image
+
+    # Already a pre-built gondolin tag in the store? Use it as-is.
+    if is_image_built(image):
+        return image
+
+    # OCI image name. Map to a stable gondolin tag and build if missing.
+    gondolin_tag = oci_image_tag(image)
+    if is_image_built(gondolin_tag):
+        return gondolin_tag
+
+    runtime = detect_oci_runtime()
+    if runtime is None:
+        raise RuntimeError(
+            f"Gondolin terminal backend needs to build the rootfs for "
+            f"OCI image {image!r}, but neither podman nor docker is on "
+            f"$PATH. Install one of them:\n"
+            f"  sudo apt-get install -y podman\n"
+            f"Or set `terminal.gondolin.image` to an already-built "
+            f"gondolin tag or an absolute path to built assets."
+        )
+
+    missing = missing_build_host_packages()
+    if missing:
+        pkgs = " ".join(missing)
+        raise RuntimeError(
+            f"Gondolin terminal backend needs to build the rootfs for "
+            f"OCI image {image!r}, but the build pipeline needs these "
+            f"host packages on $PATH: {pkgs}\n"
+            f"Install with:\n"
+            f"  sudo apt-get install -y {pkgs}"
+        )
+
+    logger.info(
+        "gondolin image %s not built; running gondolin build (may take "
+        "several minutes for large images)",
+        gondolin_tag,
+    )
+    rc = build_oci_image(image, tag=gondolin_tag, runtime=runtime)
+    if rc != 0 or not is_image_built(gondolin_tag):
+        raise RuntimeError(
+            f"gondolin build failed for OCI image {image!r} (exit {rc}). "
+            f"See output above for gondolin's own diagnostics. To retry "
+            f"manually:\n"
+            f"  cd tools/environments/gondolin_host && \\\n"
+            f"  node node_modules/@earendil-works/gondolin/dist/bin/"
+            f"gondolin.js build --tag {gondolin_tag} \\\n"
+            f"    --config <(echo '<paste the auto-generated config>')"
+        )
+    return gondolin_tag

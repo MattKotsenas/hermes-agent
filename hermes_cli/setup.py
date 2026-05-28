@@ -1389,35 +1389,29 @@ def setup_tts(config: dict):
 
 
 def _setup_gondolin_backend(config: dict):
-    """Configure the gondolin microVM backend: host deps, daemon deps, image build.
+    """Configure the gondolin microVM backend: host deps, image, pre-build.
 
-    Three things have to be true for ``execute_code`` (and skills that
-    shell out to python) to work out of the box on gondolin:
+    Mirrors the docker/singularity wizard shape: prompt for an image
+    name (default = same as docker's default), then offer to pre-build
+    the gondolin rootfs so the first agent session isn't the one that
+    waits for the OCI pull + ext4 export. Real numbers vary by image:
+    ~1.5 GB nikolaik takes ~2 min; 10 GB MCR universal takes ~6 min.
 
-    1. ``node`` is on ``$PATH`` and the daemon's ``npm install`` has run
-       (gives us the gondolin CLI we shell out to).
-    2. ``cpio`` and ``lz4`` are on ``$PATH`` (gondolin's build pipeline
-       shells out to them when packaging the initramfs).
-    3. The ``hermes-runtime:<version>`` image is built in gondolin's
-       local image store. Auto-resolution in tools/terminal_tool.py
-       picks it up; without it, the daemon falls back to alpine-base
-       and execute_code fails with a python-not-found error deep in
-       the VM. Surfacing this here, in setup, beats surfacing it on
-       first ``execute_code`` call.
-
-    All three are best-effort: we report what's missing with the exact
-    fix command and let the user decide. We don't run ``sudo apt`` for
-    them (host-state side effect), but we do offer to run the image
-    build inline because that's a pure user-scoped operation
-    (~10 seconds, ~330 MB in ``~/.cache/gondolin/``).
+    Host-deps gates: node + daemon CLI must be present (Hermes can't
+    boot a VM without them). cpio + lz4 + podman/docker are needed for
+    the build; we surface the exact install command but don't gate the
+    wizard on them — a user who plans to keep using docker-the-backend
+    too can defer.
     """
+    from tools.terminal_tool import DEFAULT_GONDOLIN_IMAGE
+
     print_success("Terminal backend: Gondolin")
     print_info("Local microVM (QEMU/KVM) with wire-level credential isolation.")
     print_info("Each session boots a fresh VM; outbound HTTPS swaps in real")
     print_info("tokens at the network boundary so the agent inside the VM")
     print_info("never sees them.")
 
-    # 1. node + daemon deps
+    # 1. node + daemon deps — hard gate. Without these gondolin won't run.
     print()
     node_bin = shutil.which("node")
     if not node_bin:
@@ -1429,63 +1423,94 @@ def _setup_gondolin_backend(config: dict):
 
     try:
         from hermes_cli.gondolin_image import (
-            HERMES_RUNTIME_TAG,
+            BUILD_HOST_PACKAGES,
             _resolve_gondolin_cli,
-            is_hermes_runtime_present,
-            missing_host_packages,
-            run_build,
+            build_oci_image,
+            detect_oci_runtime,
+            is_image_built,
+            missing_build_host_packages,
+            oci_image_tag,
         )
     except ImportError as e:
         print_warning(f"Cannot import gondolin_image helper: {e}")
         return
 
-    daemon_cli = _resolve_gondolin_cli()
-    if daemon_cli is None:
+    if _resolve_gondolin_cli() is None:
         print_warning("Gondolin daemon dependencies not installed.")
         print_info("Run this to install them, then re-run 'hermes setup':")
         print_info("  cd tools/environments/gondolin_host && npm install")
         return
     print_info("Gondolin daemon CLI: present")
 
-    # 2. host packages (cpio, lz4)
-    missing = missing_host_packages()
-    if missing:
-        pkgs = " ".join(missing)
-        print()
-        print_warning(f"Missing host packages: {pkgs}")
-        print_info("Gondolin's build pipeline needs these on $PATH. Install with:")
-        print_info(f"  sudo apt-get install -y {pkgs}")
-        print_info("Then re-run 'hermes setup' to finish gondolin configuration.")
-        return
-    print_info("Host packages (cpio, lz4): present")
-
-    # 3. hermes-runtime image
+    # 2. Image — default matches the docker backend's default so users
+    #    switching backends don't relearn anything.
     print()
-    if is_hermes_runtime_present():
-        print_success(f"Image {HERMES_RUNTIME_TAG}: already built")
-    else:
-        print_info(f"Image {HERMES_RUNTIME_TAG} is not built yet.")
-        print_info("Without it, the VM defaults to alpine-base, which has no")
-        print_info("python3, so execute_code and python-based skills will fail.")
-        print_info("Build takes ~10 seconds and lands ~330 MB in ~/.cache/gondolin/.")
-        if prompt_yes_no("  Build hermes-runtime image now?", True):
-            print()
-            print_info("Running: gondolin build")
-            rc = run_build()
-            print()
-            if rc == 0 and is_hermes_runtime_present():
-                print_success(f"Image {HERMES_RUNTIME_TAG} built.")
-            else:
-                print_warning(f"Build failed (exit {rc}).")
-                print_info("Re-run later with: hermes gondolin build")
-        else:
-            print_info("Skipped. Run later with: hermes gondolin build")
-
-    # 4. VM resource caps (optional; null = gondolin defaults)
-    print()
-    print_info("VM resource caps (leave blank to use gondolin defaults: 1G/2 cpus):")
     terminal = config.setdefault("terminal", {})
     gondolin_cfg = terminal.setdefault("gondolin", {})
+    current_image = (
+        gondolin_cfg.get("image")
+        or get_env_value("TERMINAL_GONDOLIN_IMAGE")
+        or DEFAULT_GONDOLIN_IMAGE
+    )
+    image = prompt(
+        "  OCI image (gondolin will materialize a rootfs from it on first use)",
+        current_image,
+    ).strip() or DEFAULT_GONDOLIN_IMAGE
+    gondolin_cfg["image"] = image
+    save_env_value("TERMINAL_GONDOLIN_IMAGE", image)
+
+    # 3. Soft probes for the prebuild prereqs. We tell the user what's
+    #    missing but don't gate — they can defer the build or skip it.
+    print()
+    missing_pkgs = missing_build_host_packages()
+    runtime = detect_oci_runtime()
+    can_build = not missing_pkgs and runtime is not None
+    if missing_pkgs:
+        pkgs = " ".join(missing_pkgs)
+        print_warning(f"Missing host packages for the gondolin build: {pkgs}")
+        print_info(f"  Install with: sudo apt-get install -y {pkgs}")
+    if runtime is None:
+        print_warning("No OCI runtime found (need podman or docker on $PATH).")
+        print_info("  Install with: sudo apt-get install -y podman")
+    if can_build:
+        print_info(f"OCI runtime: {runtime}")
+        print_info(f"Build host packages ({' '.join(BUILD_HOST_PACKAGES)}): present")
+
+    # 4. Pre-build prompt. Skip entirely if the image is already in
+    #    gondolin's store under either its given name or its derived tag.
+    target_tag = oci_image_tag(image)
+    if is_image_built(image) or is_image_built(target_tag):
+        print_success(
+            f"Gondolin rootfs for {image} already in local image store."
+        )
+    elif can_build:
+        print()
+        print_info(
+            f"Gondolin will build the rootfs for {image} on first use. "
+            "That can take several minutes for big images "
+            "(2-6 min typical)."
+        )
+        if prompt_yes_no("  Pre-build it now?", True):
+            print()
+            print_info(f"Running: gondolin build --oci {image}")
+            rc = build_oci_image(image, tag=target_tag, runtime=runtime)
+            print()
+            if rc == 0 and is_image_built(target_tag):
+                print_success(f"Rootfs built and tagged {target_tag}.")
+            else:
+                print_warning(f"Build failed (exit {rc}).")
+                print_info("Re-run later with: hermes gondolin prebuild")
+        else:
+            print_info("Skipped. Run later with: hermes gondolin prebuild")
+    else:
+        print_info(
+            "Skipping pre-build prompt (host deps missing). Install the "
+            "packages above, then run: hermes gondolin prebuild"
+        )
+
+    # 5. VM resource caps (optional; null = gondolin defaults)
+    print()
+    print_info("VM resource caps (leave blank to use gondolin defaults: 1G/2 cpus):")
 
     current_mem = gondolin_cfg.get("memory") or ""
     mem = prompt("  Memory per VM (e.g. 1G, 512M)", current_mem)

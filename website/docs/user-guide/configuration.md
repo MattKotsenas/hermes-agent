@@ -473,17 +473,17 @@ terminal:
     # --- VM resources (forwarded to Gondolin's VMOptions) ---
     memory: null                 # e.g. "256M", "1G"; null = Gondolin default (1G)
     cpus: null                   # integer; null = Gondolin default (2)
-    image: null                  # null = use the default hermes-runtime image
-                                 #   for this Hermes version. Built by
-                                 #   `hermes setup` or `hermes gondolin build`.
-                                 #   Backend construction RAISES if the tag
-                                 #   isn't built — no silent fallback.
-                                 # Override with a built tag (currently
-                                 #   "alpine-base:latest" is the only image
-                                 #   in gondolin's built-in registry; build
-                                 #   your own with `gondolin build`) or an
-                                 #   absolute path to a directory of built
-                                 #   assets.
+    image: null                  # OCI image name. null = Hermes default
+                                 #   (nikolaik/python-nodejs:python3.11-nodejs20,
+                                 #   the same image the docker backend
+                                 #   defaults to). Gondolin materializes
+                                 #   it via OCI rootfs build on first use.
+                                 # Override with any OCI image
+                                 #   (mcr.microsoft.com/devcontainers/python:3.11,
+                                 #   your-registry/your-image:tag), a
+                                 #   pre-built gondolin tag, or an
+                                 #   absolute path to a directory of
+                                 #   built assets.
 
     # --- Concurrency caps ---
     max_concurrent_vms: 0        # 0 = disabled. Cap is enforced by fcntl flock
@@ -531,17 +531,17 @@ terminal:
 - Node.js 20+ on the host.
 - The Gondolin npm package installed under Hermes (`npm install` in
   `tools/environments/gondolin_host/`).
-- For the default `hermes-runtime` image build: `cpio` and `lz4` on `$PATH`
-  (`apt install cpio lz4`).
+- For the OCI rootfs build pipeline (one-time per image): `podman` (or `docker`), plus `cpio` and `lz4` on `$PATH` (`apt install podman cpio lz4`). Not needed at session boot time — only when materializing a new image.
 
 Run `hermes doctor` after configuring — it probes all of the above plus the running daemon and surfaces any unresolved or stale secrets it finds in `errors.log`.
 
-**Default image (`hermes-runtime`):** With `image: null` (the default), Hermes resolves to a tag of the form `hermes-runtime:<hermes version>`. The build spec is pinned in `tools/environments/gondolin_host/hermes-runtime.json` (Alpine 3.23 + `python3` + `nodejs` + `npm` + `uv` + `bash` + `curl` + `openssh` + `ca-certs`) and the image is ~330 MB. `hermes setup` offers to build it inline (~10 s on a clean WSL2 host) when you pick the Gondolin backend; if you skip that step or upgrade Hermes (which versions the tag), run `hermes gondolin build` to (re)build. **If the tag isn't built, the next call into the gondolin backend raises with the exact build command** — there is no silent fallback to a python-less image.
+**Default image:** With `image: null` (the default), Hermes uses `nikolaik/python-nodejs:python3.11-nodejs20` — the same OCI image the docker backend defaults to. Gondolin pulls it via podman/docker and exports its filesystem into a gondolin-format rootfs cached at `~/.cache/gondolin/`. The first session pays a one-time ~2 minute build cost (varies with image size); subsequent sessions boot from the cache. `hermes setup` offers to pre-build during configuration so the first agent session doesn't pay that cost; `hermes gondolin prebuild` does the same thing later.
 
-**Custom images:** Two supported paths:
+**Custom images:** Three supported paths, in order of effort:
 
-1. **Gondolin's stock minimal image.** Set `image: "alpine-base:latest"` if you specifically want gondolin's BusyBox-only base (no python, no node, no bash — `execute_code` and most skills will not work, but it boots in a few hundred milliseconds and uses ~50 MB). Currently the only ref in [gondolin's built-in registry](https://github.com/earendil-works/gondolin/blob/main/builtin-image-registry.json) besides what you build yourself.
-2. **Build your own.** Copy `tools/environments/gondolin_host/hermes-runtime.json` to your own spec file, edit the Alpine packages / kernel / krunfw version as needed, then `cd tools/environments/gondolin_host && node node_modules/@earendil-works/gondolin/dist/bin/gondolin.js build --config /path/to/yourspec.json --tag my-image:1`. Point `image: "my-image:1"`. Hermes does not wrap this path — it's Gondolin's own pipeline; `hermes gondolin build` is just the convenience case that runs it against the pinned `hermes-runtime` spec. Note: Gondolin's build pipeline is Alpine-only (`distro: "alpine"`); there is no OCI-image-import path in upstream gondolin today, so "use the MCR universal devcontainer as my VM image" is not a supported option.
+1. **Override the default with any OCI image.** Set `image: "mcr.microsoft.com/devcontainers/python:3.11"`, `image: "python:3.11-slim"`, `image: "your-registry/your-image:tag"`, etc. Anything podman or docker can pull. Gondolin materializes the rootfs on first use the same way as the default.
+2. **Use gondolin's stock minimal image.** Set `image: "alpine-base:latest"` if you specifically want gondolin's BusyBox-only base (no python, no node, no bash — `execute_code` and most skills will not work, but it boots in a few hundred milliseconds and uses ~50 MB). Currently the only ref in [gondolin's built-in registry](https://github.com/earendil-works/gondolin/blob/main/builtin-image-registry.json) besides what you build yourself.
+3. **Build a fully custom image.** Run `gondolin build` yourself with your own spec — see the [gondolin custom-images docs](https://earendil-works.github.io/gondolin/custom-images/). Tag it, point `image: "your-tag:1"`. Useful when you need a specific kernel, an Alpine package list rather than an OCI base, or anything beyond what an OCI image gives you. Hermes does not wrap this path.
 
 **Architecture:** Hermes spawns one Node.js "gondolin-host" daemon per session that owns exactly one VM. Each terminal/file-tool call sends a JSON-RPC request to the daemon over an AF_UNIX socket; the daemon runs the command in the VM and streams stdout/stderr back. From Hermes's perspective it looks like an ordinary subprocess. See `docs/design/gondolin-terminal-backend.md` for the full design rationale.
 
