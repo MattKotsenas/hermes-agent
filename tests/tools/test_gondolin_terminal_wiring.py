@@ -125,8 +125,13 @@ def test_default_gondolin_image_matches_docker_default():
     # Read the docker backend's default by inspecting the code, since
     # _get_env_config returns a Dict that doesn't carry the docker
     # default in a stable place. The hardcoded default in terminal_tool
-    # is "nikolaik/python-nodejs:python3.11-nodejs20".
-    assert DEFAULT_GONDOLIN_IMAGE == "nikolaik/python-nodejs:python3.11-nodejs20"
+    # is "docker.io/nikolaik/python-nodejs:python3.11-nodejs20".
+    # Fully-qualified so podman (which gondolin uses on Linux) doesn't
+    # trip on short-name resolution — see DEFAULT_GONDOLIN_IMAGE comment.
+    assert (
+        DEFAULT_GONDOLIN_IMAGE
+        == "docker.io/nikolaik/python-nodejs:python3.11-nodejs20"
+    )
 
 
 def test_get_env_config_default_cwd_for_gondolin(monkeypatch):

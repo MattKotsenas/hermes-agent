@@ -1128,15 +1128,22 @@ def _get_env_config() -> Dict[str, Any]:
 
 #: Default OCI image for the gondolin terminal backend.
 #:
-#: Same string as the docker backend's default (see ``terminal.docker_image``
-#: in this file's _get_env_config). Gondolin materializes it on first use
-#: via its OCI rootfs build pipeline, then caches the resulting image in
-#: ``~/.cache/gondolin/`` for subsequent sessions.
+#: Same image as the docker backend's default (see ``terminal.docker_image``
+#: in this file's _get_env_config), but fully qualified with ``docker.io/``.
+#: Docker's CLI silently auto-prefixes that registry; podman (which gondolin
+#: uses on Linux to extract OCI rootfs) does not — bare ``nikolaik/...`` fails
+#: with "short-name did not resolve" unless the user has configured
+#: ``unqualified-search-registries`` in ``/etc/containers/registries.conf``.
+#: Fully-qualified works on both runtimes without host-side configuration.
+#:
+#: Gondolin materializes it on first use via its OCI rootfs build pipeline,
+#: then caches the resulting image in ``~/.cache/gondolin/`` for subsequent
+#: sessions.
 #:
 #: A user who wants a different image (Microsoft devcontainer, custom
 #: build, or gondolin's stock alpine-base) sets ``terminal.gondolin.image``
 #: in config.yaml or exports ``TERMINAL_GONDOLIN_IMAGE``.
-DEFAULT_GONDOLIN_IMAGE = "nikolaik/python-nodejs:python3.11-nodejs20"
+DEFAULT_GONDOLIN_IMAGE = "docker.io/nikolaik/python-nodejs:python3.11-nodejs20"
 
 
 def _ensure_gondolin_image_built(image: str) -> str:

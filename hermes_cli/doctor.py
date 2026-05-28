@@ -1280,16 +1280,30 @@ def run_doctor(args):
                 issues,
             )
 
-        # /dev/kvm: software-only TCG is too slow to be useful.
-        if os.path.exists("/dev/kvm"):
-            check_ok("/dev/kvm", "(hardware acceleration available)")
-        else:
+        # /dev/kvm: existence isn't enough — software-only TCG is too slow
+        # to be useful, and a /dev/kvm that the current uid can't open
+        # (default Ubuntu/WSL2: crw-rw---- root:kvm, user not in kvm group)
+        # silently makes qemu fall back to TCG. Probe access, not presence.
+        kvm_path = "/dev/kvm"
+        if not os.path.exists(kvm_path):
             _fail_and_issue(
                 "/dev/kvm not available",
                 "(gondolin without KVM falls back to TCG and is unusably slow)",
                 "Enable KVM: ensure the kvm kernel module is loaded and your user is in the 'kvm' group",
                 issues,
             )
+        elif not os.access(kvm_path, os.R_OK | os.W_OK):
+            # Exists but unreadable/unwritable — same effective outcome
+            # (qemu falls back to TCG) but a much more confusing one
+            # because nothing visibly fails until VM boots take 30+ seconds.
+            _fail_and_issue(
+                "/dev/kvm not accessible",
+                "(file exists but current user can't open it; qemu silently falls back to TCG → unusably slow)",
+                "Grant access: 'sudo usermod -aG kvm $USER' then re-login (WSL2: 'wsl --shutdown'). Quick fix: 'sudo chmod 666 /dev/kvm' (resets on reboot)",
+                issues,
+            )
+        else:
+            check_ok("/dev/kvm", "(hardware acceleration, not TCG)")
 
         # Gondolin's OCI rootfs build pipeline needs an OCI runtime
         # (podman or docker) to pull and export the image, plus cpio +

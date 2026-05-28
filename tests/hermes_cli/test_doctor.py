@@ -297,6 +297,11 @@ def test_doctor_reports_gondolin_backend_all_green(monkeypatch, tmp_path):
     monkeypatch.setattr(doctor_mod, "_safe_which", fake_which)
     real_exists = os.path.exists
     monkeypatch.setattr(doctor_mod.os.path, "exists", lambda p: True if p == "/dev/kvm" else real_exists(p))
+    # /dev/kvm exists AND is readable+writable — the all-green shape.
+    # The doctor now distinguishes "missing" from "exists but no access"
+    # (silent TCG fallback), so both probes have to be stubbed.
+    real_access = os.access
+    monkeypatch.setattr(doctor_mod.os, "access", lambda p, mode: True if p == "/dev/kvm" else real_access(p, mode))
 
     # Stub `node --version` and `qemu-system-x86_64 --version` so doctor's
     # subprocess.run calls don't hit anything real.
@@ -324,6 +329,57 @@ def test_doctor_reports_gondolin_backend_all_green(monkeypatch, tmp_path):
     assert "node" in out.lower()
     assert "qemu" in out.lower()
     assert "/dev/kvm" in out
+    # Honest annotation — the user should be able to tell, from the doctor
+    # output alone, whether qemu is hardware-accelerated or silently in TCG.
+    assert "not tcg" in out.lower() or "hardware acceleration" in out.lower()
+
+
+def test_doctor_reports_gondolin_kvm_exists_but_inaccessible(monkeypatch, tmp_path):
+    """When /dev/kvm exists but the current uid can't open it, doctor must
+    flag this distinctly from missing — the silent TCG-fallback case is
+    much more confusing than outright "no KVM" (qemu doesn't error, it
+    just makes every VM boot crawl). Default Ubuntu/WSL2 ships /dev/kvm
+    as crw-rw---- root:kvm with the login user not in the kvm group,
+    which is exactly this shape."""
+    monkeypatch.setenv("TERMINAL_ENV", "gondolin")
+
+    def fake_which(cmd):
+        return {"node": "/usr/bin/node", "qemu-system-x86_64": "/usr/bin/qemu-system-x86_64"}.get(cmd)
+    monkeypatch.setattr(doctor_mod, "_safe_which", fake_which)
+    real_exists = os.path.exists
+    monkeypatch.setattr(doctor_mod.os.path, "exists", lambda p: True if p == "/dev/kvm" else real_exists(p))
+    real_access = os.access
+    # File exists but the uid can't read+write it — the silent-TCG case.
+    monkeypatch.setattr(doctor_mod.os, "access", lambda p, mode: False if p == "/dev/kvm" else real_access(p, mode))
+
+    real_run = doctor_mod.subprocess.run
+    def fake_run(cmd, *args, **kwargs):
+        if cmd and cmd[0] == "node" and "--version" in cmd:
+            return SimpleNamespace(returncode=0, stdout="v22.22.3\n", stderr="")
+        if cmd and cmd[0] == "qemu-system-x86_64" and "--version" in cmd:
+            return SimpleNamespace(returncode=0, stdout="QEMU emulator version 8.2.2\n", stderr="")
+        return real_run(cmd, *args, **kwargs)
+    monkeypatch.setattr(doctor_mod.subprocess, "run", fake_run)
+
+    fake_model_tools = types.SimpleNamespace(
+        check_tool_availability=lambda *a, **kw: ([], []),
+        TOOLSET_REQUIREMENTS={},
+    )
+    monkeypatch.setitem(sys.modules, "model_tools", fake_model_tools)
+
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        doctor_mod.run_doctor(Namespace(fix=False))
+    out = buf.getvalue()
+
+    # Surface the diagnosis distinctly from "missing" — the user needs to
+    # understand the file is there but unusable.
+    assert "/dev/kvm" in out
+    assert "not accessible" in out.lower(), out
+    # The actionable hint should point at the actual fix (usermod / chmod).
+    # Don't pin the exact wording, but the most-load-bearing token must be
+    # there so a confused user can grep for it.
+    assert "usermod" in out or "chmod" in out, out
 
 
 def test_doctor_reports_gondolin_missing_prereqs(monkeypatch, tmp_path):

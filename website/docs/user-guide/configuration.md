@@ -535,7 +535,7 @@ terminal:
 
 Run `hermes doctor` after configuring — it probes all of the above plus the running daemon and surfaces any unresolved or stale secrets it finds in `errors.log`.
 
-**Default image:** With `image: null` (the default), Hermes uses `nikolaik/python-nodejs:python3.11-nodejs20` — the same OCI image the docker backend defaults to. Gondolin pulls it via podman/docker and exports its filesystem into a gondolin-format rootfs cached at `~/.cache/gondolin/`. The first session pays a one-time ~2 minute build cost (varies with image size); subsequent sessions boot from the cache. `hermes setup` offers to pre-build during configuration so the first agent session doesn't pay that cost; `hermes gondolin prebuild` does the same thing later.
+**Default image:** With `image: null` (the default), Hermes uses `docker.io/nikolaik/python-nodejs:python3.11-nodejs20` — the same image the docker backend defaults to, fully qualified so podman accepts it without `registries.conf` tweaks. Gondolin pulls it via podman/docker and exports its filesystem into a gondolin-format rootfs cached at `~/.cache/gondolin/`. The first session pays a one-time ~2 minute build cost (varies with image size); subsequent sessions boot from the cache. `hermes setup` offers to pre-build during configuration so the first agent session doesn't pay that cost; `hermes gondolin prebuild` does the same thing later.
 
 **Custom images:** Three supported paths, in order of effort:
 
