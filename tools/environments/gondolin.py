@@ -657,6 +657,11 @@ class GondolinEnvironment(BaseEnvironment):
                 # on top of the safe POSIX baseline (PATH, HOME, etc.).
                 # See _build_safe_env in gondolin_secret_refresh.py.
                 "env": cfg.get("env") if isinstance(cfg.get("env"), dict) else None,
+                # Per-secret refresh subprocess timeout (ms). Surfaces
+                # the same `timeout_ms` knob that hooks.mjs reads for
+                # init-time from_command, so a slow refresh chain gets
+                # the same opt-out runway.
+                "timeout_ms": cfg.get("timeout_ms") if isinstance(cfg.get("timeout_ms"), int) and not isinstance(cfg.get("timeout_ms"), bool) else None,
             })
 
         if not refresh_entries:

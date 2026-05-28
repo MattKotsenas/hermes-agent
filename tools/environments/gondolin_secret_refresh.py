@@ -124,6 +124,10 @@ class _SecretState:
     # means "use the safe baseline alone" — the common case. Set by
     # add_secret() from the per-secret ``env:`` config.
     env: dict[str, str] | None = None
+    # Per-secret subprocess timeout in seconds. None → 30s default in
+    # _default_run_command. Driven by the per-secret ``timeout_ms``
+    # config (ms, converted to seconds here for subprocess.run).
+    timeout: float | None = None
 
 
 def _interpolate_env_vars(value: str) -> str:
@@ -180,7 +184,9 @@ def _build_safe_env(user_env: dict | None) -> dict[str, str]:
     return env
 
 
-def _default_run_command(cmd: str, env: dict | None = None) -> tuple[int, str, str]:
+def _default_run_command(
+    cmd: str, env: dict | None = None, timeout: float = 30.0
+) -> tuple[int, str, str]:
     """Run ``cmd`` via shell, capture stdout/stderr, return (rc, stdout, stderr).
 
     Trim whitespace on stdout (a leading/trailing newline from ``echo`` is
@@ -208,7 +214,7 @@ def _default_run_command(cmd: str, env: dict | None = None) -> tuple[int, str, s
         shell=True,
         capture_output=True,
         text=True,
-        timeout=30.0,
+        timeout=timeout,
         env=env if env is not None else _build_safe_env(None),
     )
     return (proc.returncode, (proc.stdout or "").strip(), proc.stderr or "")
@@ -236,7 +242,7 @@ class SecretRefresher:
         env_set_secret: Callable[..., None],
         time_source: Callable[[], float] | None = None,
         sleep_fn: Callable[[float], None] | None = None,
-        run_command: Callable[[str, dict | None], tuple[int, str, str]] | None = None,
+        run_command: Callable[[str, dict | None, float], tuple[int, str, str]] | None = None,
     ):
         self._env_set_secret = env_set_secret
         self._now = time_source or time.time
@@ -262,6 +268,7 @@ class SecretRefresher:
         refresh_before_expiry_seconds: int,
         initial_value: str | None,
         env: dict | None = None,
+        timeout_ms: int | None = None,
     ) -> None:
         """Register a secret for refresh. Safe to call before ``start()``.
 
@@ -271,8 +278,13 @@ class SecretRefresher:
         tick passes to the subprocess. Pass None (or omit) for the
         common case of "the refresh command needs no extra env beyond
         PATH/HOME/etc.".
+
+        ``timeout_ms`` is the per-secret subprocess timeout in
+        milliseconds. None → 30s default. Lets a slow refresh chain
+        (``op signin && op read ...``) opt out of the default cap.
         """
         resolved_env = _build_safe_env(env) if env is not None else None
+        timeout_s = (timeout_ms / 1000.0) if timeout_ms is not None else None
         with self._lock:
             state = _SecretState(
                 name=name,
@@ -281,6 +293,7 @@ class SecretRefresher:
                 refresh_before_expiry_seconds=refresh_before_expiry_seconds,
                 current_value=initial_value,
                 env=resolved_env,
+                timeout=timeout_s,
             )
             state.next_refresh_at = plan_refresh_schedule(
                 value=initial_value,
@@ -351,7 +364,11 @@ class SecretRefresher:
 
     def _refresh_one(self, state: _SecretState) -> None:
         try:
-            rc, stdout, stderr = self._run_command(state.refresh_command, state.env)
+            rc, stdout, stderr = self._run_command(
+                state.refresh_command,
+                state.env,
+                state.timeout if state.timeout is not None else 30.0,
+            )
         except subprocess.TimeoutExpired:
             self._schedule_retry(state, "refresh command timed out", stderr="")
             return

@@ -1154,19 +1154,23 @@ def _validate_gondolin_secrets(secrets):
                 )
         if "env" in cfg:
             user_env = cfg["env"]
-            # The env: dict is the opt-in escape hatch for from_command:
-            # variables the resolver process should see beyond the safe
-            # POSIX baseline. value: returns the literal; from_env:
-            # reads the host env directly (no subprocess to need an
-            # env). Allowing env: in those cases would be dead code the
-            # daemon silently drops, and the user would have no signal
-            # that their env: was unused. Reject up front.
-            if "from_command" not in cfg:
+            # The env: dict is the opt-in escape hatch for the resolver
+            # subprocesses: from_command (init-time, hooks.mjs) and/or
+            # refresh_command (background loop, gondolin_secret_refresh).
+            # value: returns the literal in-process; from_env: reads the
+            # host env directly. Neither involves a subprocess to receive
+            # env: vars — without a refresh_command alongside, the dict
+            # is dead config the daemon silently drops. Accept env: when
+            # either source has a subprocess.
+            has_subprocess = "from_command" in cfg or "refresh_command" in cfg
+            if not has_subprocess:
                 raise ValueError(
                     f"gondolin secret {name!r}: 'env' is only valid with "
-                    f"'from_command' (got source {sources!r}). The env: dict "
-                    f"is forwarded to the resolver subprocess; literal/value "
-                    f"and from_env have no subprocess to receive it."
+                    f"'from_command' or 'refresh_command' (got source "
+                    f"{sources!r}, no refresh_command). The env: dict is "
+                    f"forwarded to the resolver subprocess; literal/value "
+                    f"and from_env (without refresh_command) have no "
+                    f"subprocess to receive it."
                 )
             if not isinstance(user_env, dict):
                 raise ValueError(
@@ -1185,11 +1189,12 @@ def _validate_gondolin_secrets(secrets):
                         f"string (got {type(ev).__name__})"
                     )
         if "timeout_ms" in cfg:
-            # Per-secret resolver timeout, read by hooks.mjs:103 for
-            # from_command execSync. Like env:, it's only meaningful when
-            # there's a subprocess to time out — silently accepting it on
-            # value:/from_env: would give the user no signal their knob
-            # was dropped.
+            # Per-secret resolver timeout. Currently only consumed by
+            # hooks.mjs:103 for the init-time from_command execSync; the
+            # refresher hardcodes 30s and ignores this. Gate on
+            # from_command (not refresh_command) since that's where the
+            # knob actually takes effect — gating on refresh_command
+            # would falsely advertise a knob the refresher ignores.
             if "from_command" not in cfg:
                 raise ValueError(
                     f"gondolin secret {name!r}: 'timeout_ms' is only valid with "

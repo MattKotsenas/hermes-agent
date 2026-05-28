@@ -828,22 +828,48 @@ def test_secrets_validator_accepts_env_dict(monkeypatch):
 
 
 def test_secrets_validator_rejects_env_with_non_from_command_source(monkeypatch):
-    """env: is only meaningful for from_command (the shell subprocess
-    that needs extra host vars). With value: or from_env:, the daemon
-    silently drops env: — pre-G9b-revisit, the user had no signal that
-    their config was dead. Validator now rejects up front."""
+    """env: needs a subprocess to receive it — either from_command
+    (init-time resolver) or refresh_command (background loop). With
+    value:/from_env: and no refresh_command, the daemon silently drops
+    env: — the user gets no signal their config is dead. Validator
+    rejects up front."""
     _assert_invalid(
         monkeypatch,
         {"X": {"hosts": ["a"], "from_env": "X", "env": {"FOO": "bar"}}},
-        fragment="'env' is only valid with 'from_command'",
+        fragment="'env' is only valid with 'from_command' or 'refresh_command'",
     )
 
     # Same shape with value: (literal).
     _assert_invalid(
         monkeypatch,
         {"X": {"hosts": ["a"], "value": "literal", "env": {"FOO": "bar"}}},
-        fragment="'env' is only valid with 'from_command'",
+        fragment="'env' is only valid with 'from_command' or 'refresh_command'",
     )
+
+
+def test_secrets_validator_accepts_env_with_refresh_command_only(monkeypatch):
+    """B8 regression: value source from_env with a refresh_command needing
+    extra env (e.g. GH_HOST for `gh auth token`). Pre-B8, the B4 gate
+    rejected this even though the refresher passes env: to the
+    refresh_command subprocess. Documented refresh pattern; must work."""
+    from tools.terminal_tool import _get_env_config
+
+    _set_secrets(
+        monkeypatch,
+        {
+            "GH_TOKEN": {
+                "hosts": ["api.github.com"],
+                "from_env": "GH_TOKEN",
+                "refresh": True,
+                "refresh_command": "gh auth refresh && gh auth token",
+                "env": {"GH_HOST": "github.com"},
+            }
+        },
+    )
+    cfg = _get_env_config()
+    secret = cfg["gondolin"]["secrets"]["GH_TOKEN"]
+    assert secret["env"] == {"GH_HOST": "github.com"}
+    assert secret["refresh_command"] == "gh auth refresh && gh auth token"
 
 
 def test_secrets_validator_rejects_env_not_dict(monkeypatch):

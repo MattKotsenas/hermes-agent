@@ -512,7 +512,10 @@ terminal:
       #   hosts: [dev.azure.com]
       #   from_command: "az account get-access-token --resource ... -o tsv"
       #   refresh: true          # Re-run from_command on JWT exp or TTL
-      #   timeout_ms: 30000      # Per-secret resolution timeout
+      #   timeout_ms: 30000      # Per-secret resolution timeout (applies
+      #                          #   to from_command at init and to
+      #                          #   refresh_command in the background
+      #                          #   loop; defaults to 30000 if unset)
 
     # Escape hatch: full Gondolin TS API
     policy_script: null          # Path to a .mjs that exports getHooks(yaml)

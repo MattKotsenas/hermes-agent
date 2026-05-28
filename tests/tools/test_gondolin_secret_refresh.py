@@ -206,7 +206,7 @@ def test_refresher_does_not_leak_stderr_in_warn_log_by_default(caplog, monkeypat
     def fake_set_secret(name, *, value):
         push_event.set()
 
-    def fake_run_command(cmd, env=None):
+    def fake_run_command(cmd, env=None, timeout=30.0):
         attempts["n"] += 1
         if attempts["n"] < 2:
             return (1, "", leaked)
@@ -260,7 +260,7 @@ def test_refresher_opts_into_stderr_capture_with_debug_env(caplog, monkeypatch):
     def fake_set_secret(name, *, value):
         push_event.set()
 
-    def fake_run_command(cmd, env=None):
+    def fake_run_command(cmd, env=None, timeout=30.0):
         attempts["n"] += 1
         if attempts["n"] < 2:
             return (1, "", "specific-debug-marker-XYZ")
@@ -310,7 +310,7 @@ def test_refresher_handles_command_failure_with_warn_and_retry():
         push_event.set()
 
     # First two refresh-command invocations fail, third succeeds.
-    def fake_run_command(cmd: str, env: dict | None = None) -> tuple[int, str, str]:
+    def fake_run_command(cmd: str, env: dict | None = None, timeout: float = 30.0) -> tuple[int, str, str]:
         attempts["n"] += 1
         if attempts["n"] < 3:
             return (1, "", "transient auth blip")
@@ -604,7 +604,7 @@ def test_refresher_threads_per_secret_env_through_to_subprocess(monkeypatch):
     def fake_set_secret(name, *, value):
         push_event.set()
 
-    def fake_run_command(cmd, env=None):
+    def fake_run_command(cmd, env=None, timeout=30.0):
         captured_envs.append(env)
         return (0, "refreshed-token", "")
 
@@ -657,7 +657,7 @@ def test_refresher_no_env_means_safe_baseline_only(monkeypatch):
     def fake_set_secret(name, *, value):
         push_event.set()
 
-    def fake_run_command(cmd, env=None):
+    def fake_run_command(cmd, env=None, timeout=30.0):
         captured_envs.append(env)
         return (0, "refreshed-token", "")
 
@@ -687,3 +687,82 @@ def test_refresher_no_env_means_safe_baseline_only(monkeypatch):
         )
     finally:
         refresher.stop()
+
+
+def test_refresher_threads_timeout_ms_through_to_subprocess(monkeypatch):
+    """B8: timeout_ms on a per-secret config flows from add_secret() down
+    to the run_command call. Pre-B8 the refresher hardcoded 30s and
+    silently ignored the user's timeout_ms — surfacing it via gondolin
+    config did nothing in the background loop."""
+    monkeypatch.delenv("HERMES_GONDOLIN_DEBUG_SECRETS", raising=False)
+    captured_timeouts = []
+
+    def fake_run_command(cmd, env=None, timeout=30.0):
+        captured_timeouts.append(timeout)
+        return (0, "new-token", "")
+
+    refresher = SecretRefresher(
+        env_set_secret=lambda *a, **k: None,
+        time_source=lambda: 1_700_000_000.0,
+        sleep_fn=lambda s: None,
+        run_command=fake_run_command,
+    )
+    refresher.add_secret(
+        name="SLOW",
+        refresh_command="op signin && op read 'op://x'",
+        ttl_seconds=3600,
+        refresh_before_expiry_seconds=300,
+        initial_value="initial",
+        timeout_ms=60_000,  # 60s for a slow chain
+    )
+    state = refresher._secrets["SLOW"]
+    refresher._refresh_one(state)
+    assert captured_timeouts == [60.0], (
+        f"timeout_ms=60000 should arrive at run_command as 60.0s; "
+        f"got {captured_timeouts!r}"
+    )
+
+
+def test_refresher_uses_default_timeout_when_unset(monkeypatch):
+    """Without timeout_ms the refresher falls back to the 30s default,
+    same as before B8."""
+    monkeypatch.delenv("HERMES_GONDOLIN_DEBUG_SECRETS", raising=False)
+    captured_timeouts = []
+
+    def fake_run_command(cmd, env=None, timeout=30.0):
+        captured_timeouts.append(timeout)
+        return (0, "tok", "")
+
+    refresher = SecretRefresher(
+        env_set_secret=lambda *a, **k: None,
+        time_source=lambda: 1_700_000_000.0,
+        sleep_fn=lambda s: None,
+        run_command=fake_run_command,
+    )
+    refresher.add_secret(
+        name="X",
+        refresh_command="echo tok",
+        ttl_seconds=3600,
+        refresh_before_expiry_seconds=300,
+        initial_value="initial",
+    )
+    refresher._refresh_one(refresher._secrets["X"])
+    assert captured_timeouts == [30.0]
+
+
+def test_default_run_command_honors_per_call_timeout():
+    """The timeout kwarg on _default_run_command actually reaches
+    subprocess.run. A sleep 2 with timeout=0.3 raises TimeoutExpired
+    instead of waiting the full 2 seconds."""
+    import subprocess as _subprocess
+    import time as _time
+    from tools.environments.gondolin_secret_refresh import _default_run_command
+
+    t0 = _time.monotonic()
+    with pytest.raises(_subprocess.TimeoutExpired):
+        _default_run_command("sleep 2", env=None, timeout=0.3)
+    elapsed = _time.monotonic() - t0
+    assert elapsed < 1.5, (
+        f"timeout=0.3s should raise quickly; took {elapsed:.2f}s — likely "
+        f"the param was ignored and the hardcoded 30s was used."
+    )
