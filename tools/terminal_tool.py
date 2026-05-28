@@ -1153,6 +1153,20 @@ def _validate_gondolin_secrets(secrets):
                 )
         if "env" in cfg:
             user_env = cfg["env"]
+            # The env: dict is the opt-in escape hatch for from_command:
+            # variables the resolver process should see beyond the safe
+            # POSIX baseline. value: returns the literal; from_env:
+            # reads the host env directly (no subprocess to need an
+            # env). Allowing env: in those cases would be dead code the
+            # daemon silently drops, and the user would have no signal
+            # that their env: was unused. Reject up front.
+            if "from_command" not in cfg:
+                raise ValueError(
+                    f"gondolin secret {name!r}: 'env' is only valid with "
+                    f"'from_command' (got source {sources!r}). The env: dict "
+                    f"is forwarded to the resolver subprocess; literal/value "
+                    f"and from_env have no subprocess to receive it."
+                )
             if not isinstance(user_env, dict):
                 raise ValueError(
                     f"gondolin secret {name!r}: 'env' must be an object of "

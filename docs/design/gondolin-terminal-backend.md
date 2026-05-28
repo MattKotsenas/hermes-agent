@@ -481,14 +481,21 @@ the rest of Hermes:
 
 1. **`secrets.*.from_command`** (`hooks.mjs`) and
    **`secrets.*.refresh_command`** (`gondolin_secret_refresh.py`) run on
-   the host as the Hermes user. Both subprocesses get a **filtered
-   environment** — the safe POSIX baseline (`PATH`, `HOME`, `USER`,
-   `LANG`, `LC_ALL`, `TERM`, `SHELL`, `TMPDIR`, `XDG_*`) and nothing
-   else. The Hermes process env (API keys, tokens, secrets the user
-   exported in their shell) is **not** inherited. This matches MCP
-   servers (`tools/mcp_tool.py:_build_safe_env`) and Docker's
-   `docker_forward_env` convention: any extra env var a resolver needs
-   is explicit opt-in.
+   the host as the Hermes user. The **env-resolver subprocess** in each
+   case (the child of the daemon or the refresher thread) gets a
+   **filtered environment** — the safe POSIX baseline (`PATH`, `HOME`,
+   `USER`, `LANG`, `LC_ALL`, `TERM`, `SHELL`, `TMPDIR`, `XDG_*`) and
+   nothing else. The Hermes process env (API keys, tokens, secrets the
+   user exported in their shell) is **not** inherited by the resolver.
+   This matches MCP servers (`tools/mcp_tool.py:_build_safe_env`) and
+   Docker's `docker_forward_env` convention: any extra env var a
+   resolver needs is explicit opt-in.
+
+   (The gondolin daemon process itself does inherit the full Hermes
+   env at spawn — it needs `PATH` to find `node`, `qemu-system-x86_64`,
+   etc. — and `policy_script` runs inside the daemon, so it sees that
+   env. Plugin-trust applies, see (2) below. The env-filter only
+   applies to subprocesses the daemon spawns for resolving a secret.)
 
    ```yaml
    secrets:

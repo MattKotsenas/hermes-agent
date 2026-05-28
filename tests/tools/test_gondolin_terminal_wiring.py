@@ -765,10 +765,29 @@ def test_secrets_validator_accepts_env_dict(monkeypatch):
     }
 
 
+def test_secrets_validator_rejects_env_with_non_from_command_source(monkeypatch):
+    """env: is only meaningful for from_command (the shell subprocess
+    that needs extra host vars). With value: or from_env:, the daemon
+    silently drops env: — pre-G9b-revisit, the user had no signal that
+    their config was dead. Validator now rejects up front."""
+    _assert_invalid(
+        monkeypatch,
+        {"X": {"hosts": ["a"], "from_env": "X", "env": {"FOO": "bar"}}},
+        fragment="'env' is only valid with 'from_command'",
+    )
+
+    # Same shape with value: (literal).
+    _assert_invalid(
+        monkeypatch,
+        {"X": {"hosts": ["a"], "value": "literal", "env": {"FOO": "bar"}}},
+        fragment="'env' is only valid with 'from_command'",
+    )
+
+
 def test_secrets_validator_rejects_env_not_dict(monkeypatch):
     _assert_invalid(
         monkeypatch,
-        {"X": {"hosts": ["a"], "from_env": "X", "env": ["NOT_A_DICT"]}},
+        {"X": {"hosts": ["a"], "from_command": "echo y", "env": ["NOT_A_DICT"]}},
         fragment="'env' must be an object",
     )
 
@@ -777,7 +796,7 @@ def test_secrets_validator_rejects_env_non_string_value(monkeypatch):
     """Typo'd YAML number like `env: { TTL: 60 }` (meant as a string)."""
     _assert_invalid(
         monkeypatch,
-        {"X": {"hosts": ["a"], "from_env": "X", "env": {"TTL": 60}}},
+        {"X": {"hosts": ["a"], "from_command": "echo y", "env": {"TTL": 60}}},
         fragment="'env[TTL]' must be a string",
     )
 
@@ -785,6 +804,6 @@ def test_secrets_validator_rejects_env_non_string_value(monkeypatch):
 def test_secrets_validator_rejects_env_empty_key(monkeypatch):
     _assert_invalid(
         monkeypatch,
-        {"X": {"hosts": ["a"], "from_env": "X", "env": {"": "value"}}},
+        {"X": {"hosts": ["a"], "from_command": "echo y", "env": {"": "value"}}},
         fragment="'env' keys must be non-empty strings",
     )
