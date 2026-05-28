@@ -134,11 +134,14 @@ def _resolve_gondolin_cli() -> Optional[Path]:
 
 
 def is_image_built(gondolin_tag: str) -> bool:
-    """Return True iff ``gondolin image ls`` lists ``gondolin_tag``.
+    """Return True iff ``gondolin_tag`` is present in the local image store.
 
-    Returns False on any failure (missing node, missing gondolin CLI,
-    non-zero exit) — caller's job is "build it if not present" either
-    way; we don't want a flaky transient to look like "image present".
+    Uses ``gondolin image inspect <tag>``, which exits 0 when the ref
+    resolves and 1 when it doesn't. No text scraping. Returns False on
+    any other failure mode (missing node, missing gondolin CLI,
+    subprocess error) — caller's job is "build it if not present"
+    either way; we don't want a flaky transient to look like "image
+    present".
     """
     cli = _resolve_gondolin_cli()
     if cli is None:
@@ -148,19 +151,13 @@ def is_image_built(gondolin_tag: str) -> bool:
         return False
     try:
         result = subprocess.run(
-            [node, str(cli), "image", "ls"],
+            [node, str(cli), "image", "inspect", gondolin_tag],
             capture_output=True,
-            text=True,
             timeout=5,
         )
     except (subprocess.TimeoutExpired, OSError):
         return False
-    if result.returncode != 0:
-        return False
-    for line in result.stdout.splitlines():
-        if line.strip().startswith(gondolin_tag):
-            return True
-    return False
+    return result.returncode == 0
 
 
 def _build_config_for_oci(oci_image: str, runtime: str) -> dict:

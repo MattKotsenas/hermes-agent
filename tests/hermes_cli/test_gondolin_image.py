@@ -2,7 +2,7 @@
 
 Behavioral-only: we exercise the OCI tag mapping, runtime detection,
 and host-package probe directly. The actual ``gondolin build`` and
-``gondolin image ls`` shell-outs aren't tested here — they require a
+``gondolin image inspect`` shell-outs aren't tested here — they require a
 real gondolin installation with podman/docker on the host and are
 covered end-to-end by the integration tests under
 ``tests/integration/test_gondolin_terminal.py``.
