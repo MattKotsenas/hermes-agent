@@ -465,3 +465,279 @@ def test_config_set_terminal_gondolin_keys_sync_to_env(monkeypatch, tmp_path):
             f"saved keys were {sorted(saved.keys())}"
         )
         assert saved[expected_env_key] == value
+
+
+# ---- TERMINAL_GONDOLIN_SECRETS_JSON schema validation (G9b) -------------
+#
+# Without schema validation, hooks.mjs silently ignores unknown keys
+# (typo'd `from_envs` → no value source → daemon emits a WARN diagnostic
+# but the agent runs without credentials and the user has no obvious
+# signal at config-load time). Validation at the env-var parse boundary
+# converts the silent failure into a loud ValueError that names the
+# secret and the violation. The tests below pin one failure mode each.
+
+import json as _json
+
+import pytest
+
+
+def _set_secrets(monkeypatch, payload):
+    monkeypatch.setenv("TERMINAL_ENV", "gondolin")
+    monkeypatch.setenv("TERMINAL_GONDOLIN_SECRETS_JSON", _json.dumps(payload))
+
+
+def _set_secrets_raw(monkeypatch, raw: str):
+    monkeypatch.setenv("TERMINAL_ENV", "gondolin")
+    monkeypatch.setenv("TERMINAL_GONDOLIN_SECRETS_JSON", raw)
+
+
+def _assert_invalid(monkeypatch, payload, *, fragment: str):
+    """Set the secrets payload and assert _get_env_config raises ValueError
+    whose message contains *fragment* (case-sensitive substring match)."""
+    from tools.terminal_tool import _get_env_config
+
+    _set_secrets(monkeypatch, payload)
+    with pytest.raises(ValueError) as excinfo:
+        _get_env_config()
+    assert fragment in str(excinfo.value), (
+        f"expected message to mention {fragment!r}, got: {excinfo.value!r}"
+    )
+
+
+# Happy paths -- existing tests in this file already cover the typical
+# minimal config; here we just confirm the validator doesn't choke on
+# the placeholder/refresh extras.
+
+def test_secrets_validator_accepts_full_schema(monkeypatch):
+    """Every legal optional key should validate together."""
+    from tools.terminal_tool import _get_env_config
+
+    _set_secrets(monkeypatch, {
+        "TOKEN": {
+            "hosts": ["api.github.com", "github.com"],
+            "from_command": "gh auth token",
+            "placeholder": {"prefix": "GHTOK_", "length": 40, "alphabet": "abcdef0123456789"},
+            "refresh": True,
+            "refresh_command": "gh auth refresh -h github.com",
+            "ttl_seconds": 3600,
+            "refresh_before_expiry_seconds": 300,
+        },
+        "SIMPLE": {"hosts": ["api.example.com"], "value": "x"},
+    })
+    cfg = _get_env_config()
+    assert cfg["gondolin"]["secrets"]["TOKEN"]["hosts"] == ["api.github.com", "github.com"]
+    assert cfg["gondolin"]["secrets"]["SIMPLE"]["value"] == "x"
+
+
+def test_secrets_validator_accepts_string_placeholder(monkeypatch):
+    """Placeholder can also be a verbatim string (hooks.mjs accepts both)."""
+    from tools.terminal_tool import _get_env_config
+
+    _set_secrets(monkeypatch, {
+        "X": {"hosts": ["a"], "from_env": "X", "placeholder": "REDACTED"},
+    })
+    assert _get_env_config()["gondolin"]["secrets"]["X"]["placeholder"] == "REDACTED"
+
+
+# JSON-level failures keep their own message ----------------------------
+
+def test_secrets_validator_rejects_invalid_json(monkeypatch):
+    """A JSON syntax error should land on the 'expected valid JSON'
+    branch, not the schema branch — distinct guidance for users."""
+    from tools.terminal_tool import _get_env_config
+
+    _set_secrets_raw(monkeypatch, "{not json")
+    with pytest.raises(ValueError) as excinfo:
+        _get_env_config()
+    msg = str(excinfo.value)
+    assert "TERMINAL_GONDOLIN_SECRETS_JSON" in msg and "valid JSON" in msg
+
+
+# Top-level shape -------------------------------------------------------
+
+def test_secrets_validator_rejects_non_object_top_level(monkeypatch):
+    """The top-level must be a JSON object, not a list/string/etc."""
+    _assert_invalid(monkeypatch, ["GITHUB_TOKEN"], fragment="must be a JSON object")
+
+
+def test_secrets_validator_rejects_non_object_secret_cfg(monkeypatch):
+    """Each entry's value must be a dict, not a string."""
+    _assert_invalid(monkeypatch, {"X": "just-a-string"}, fragment="must be an object")
+
+
+# Unknown keys (the silent-fail trap) -----------------------------------
+
+def test_secrets_validator_rejects_typo_from_envs(monkeypatch):
+    """``from_envs`` (with the trailing s) is the canonical typo. Before
+    G9b, hooks.mjs ignored it and the agent ran without the credential.
+    """
+    _assert_invalid(
+        monkeypatch,
+        {"X": {"hosts": ["a"], "from_envs": "X"}},
+        fragment="unknown key(s)",
+    )
+
+
+def test_secrets_validator_lists_allowed_keys_on_unknown(monkeypatch):
+    """Error must enumerate the allowed keys so the user can self-correct."""
+    from tools.terminal_tool import _get_env_config
+
+    _set_secrets(monkeypatch, {"X": {"hosts": ["a"], "value": "v", "ttl": 60}})
+    with pytest.raises(ValueError) as excinfo:
+        _get_env_config()
+    msg = str(excinfo.value)
+    # Spot-check a few of the legal keys the message should mention.
+    for k in ("hosts", "value", "from_env", "from_command", "ttl_seconds"):
+        assert k in msg, f"expected allowed-key {k!r} in message: {msg!r}"
+
+
+# hosts -----------------------------------------------------------------
+
+def test_secrets_validator_rejects_missing_hosts(monkeypatch):
+    _assert_invalid(
+        monkeypatch,
+        {"X": {"from_env": "X"}},
+        fragment="'hosts' must be a non-empty array",
+    )
+
+
+def test_secrets_validator_rejects_empty_hosts(monkeypatch):
+    _assert_invalid(
+        monkeypatch,
+        {"X": {"hosts": [], "from_env": "X"}},
+        fragment="'hosts' must be a non-empty array",
+    )
+
+
+def test_secrets_validator_rejects_non_string_host(monkeypatch):
+    _assert_invalid(
+        monkeypatch,
+        {"X": {"hosts": ["github.com", 42], "from_env": "X"}},
+        fragment="'hosts' entries must be non-empty strings",
+    )
+
+
+# value / from_env / from_command — exactly one --------------------------
+
+def test_secrets_validator_rejects_no_value_source(monkeypatch):
+    """Zero sources is a silent-fail trap: daemon would emit a WARN
+    diagnostic but the agent would run without the credential."""
+    _assert_invalid(
+        monkeypatch,
+        {"X": {"hosts": ["a"]}},
+        fragment="exactly one of 'value', 'from_env', or 'from_command'",
+    )
+
+
+def test_secrets_validator_rejects_multiple_value_sources(monkeypatch):
+    """Two sources is ambiguous — which one wins?"""
+    _assert_invalid(
+        monkeypatch,
+        {"X": {"hosts": ["a"], "from_env": "X", "value": "y"}},
+        fragment="set only one of",
+    )
+
+
+def test_secrets_validator_rejects_empty_value(monkeypatch):
+    _assert_invalid(
+        monkeypatch,
+        {"X": {"hosts": ["a"], "from_env": ""}},
+        fragment="must be a non-empty string",
+    )
+
+
+# placeholder ----------------------------------------------------------
+
+def test_secrets_validator_rejects_placeholder_without_length(monkeypatch):
+    """Object form requires a positive integer length (drives the random
+    generator in hooks.mjs:resolvePlaceholder)."""
+    _assert_invalid(
+        monkeypatch,
+        {"X": {"hosts": ["a"], "from_env": "X", "placeholder": {"prefix": "GH_"}}},
+        fragment="placeholder object requires a positive integer 'length'",
+    )
+
+
+def test_secrets_validator_rejects_placeholder_zero_length(monkeypatch):
+    _assert_invalid(
+        monkeypatch,
+        {"X": {"hosts": ["a"], "from_env": "X", "placeholder": {"length": 0}}},
+        fragment="placeholder object requires a positive integer 'length'",
+    )
+
+
+def test_secrets_validator_rejects_placeholder_unknown_key(monkeypatch):
+    _assert_invalid(
+        monkeypatch,
+        {"X": {"hosts": ["a"], "from_env": "X",
+               "placeholder": {"length": 16, "encoding": "hex"}}},
+        fragment="placeholder has unknown key(s)",
+    )
+
+
+def test_secrets_validator_rejects_placeholder_wrong_type(monkeypatch):
+    _assert_invalid(
+        monkeypatch,
+        {"X": {"hosts": ["a"], "from_env": "X", "placeholder": 42}},
+        fragment="placeholder must be a string or",
+    )
+
+
+# refresh / ttl ---------------------------------------------------------
+
+def test_secrets_validator_rejects_refresh_not_bool(monkeypatch):
+    _assert_invalid(
+        monkeypatch,
+        {"X": {"hosts": ["a"], "from_env": "X", "refresh": "true"}},
+        fragment="'refresh' must be a boolean",
+    )
+
+
+def test_secrets_validator_rejects_ttl_negative(monkeypatch):
+    _assert_invalid(
+        monkeypatch,
+        {"X": {"hosts": ["a"], "from_env": "X", "ttl_seconds": -1}},
+        fragment="'ttl_seconds'",
+    )
+
+
+def test_secrets_validator_rejects_ttl_zero(monkeypatch):
+    _assert_invalid(
+        monkeypatch,
+        {"X": {"hosts": ["a"], "from_env": "X", "ttl_seconds": 0}},
+        fragment="'ttl_seconds'",
+    )
+
+
+def test_secrets_validator_rejects_ttl_bool(monkeypatch):
+    """bool is an int subclass; explicit-reject avoids ``ttl_seconds: True``
+    silently becoming 1."""
+    _assert_invalid(
+        monkeypatch,
+        {"X": {"hosts": ["a"], "from_env": "X", "ttl_seconds": True}},
+        fragment="'ttl_seconds'",
+    )
+
+
+def test_secrets_validator_rejects_refresh_command_empty(monkeypatch):
+    _assert_invalid(
+        monkeypatch,
+        {"X": {"hosts": ["a"], "from_env": "X", "refresh_command": ""}},
+        fragment="'refresh_command'",
+    )
+
+
+# Error messages must name the offending secret ------------------------
+
+def test_secrets_validator_error_names_the_secret(monkeypatch):
+    """In a config with multiple secrets, the message must say which one
+    failed so the user can find it in the config file."""
+    from tools.terminal_tool import _get_env_config
+
+    _set_secrets(monkeypatch, {
+        "OK_TOKEN": {"hosts": ["a"], "from_env": "X"},
+        "BROKEN_TOKEN": {"hosts": ["a"], "from_envs": "X"},  # typo
+    })
+    with pytest.raises(ValueError) as excinfo:
+        _get_env_config()
+    assert "BROKEN_TOKEN" in str(excinfo.value)

@@ -1006,6 +1006,185 @@ def _parse_env_var(name: str, default: str, converter=int, type_label: str = "in
         )
 
 
+# Allowed top-level keys on a single gondolin secret. Keep in sync with
+# tools/environments/gondolin_host/src/hooks.mjs:buildHooksInput and
+# resolveSecretWithDiagnostics — anything accepted there must be listed
+# here (otherwise valid configs get rejected), and anything rejected by
+# the schema below must also be unused by hooks.mjs (otherwise the
+# schema leaks a footgun back in).
+_GONDOLIN_SECRET_ALLOWED_KEYS = frozenset({
+    "hosts",
+    "value",
+    "from_env",
+    "from_command",
+    "placeholder",
+    "refresh",
+    "refresh_command",
+    "ttl_seconds",
+    "refresh_before_expiry_seconds",
+})
+
+# Allowed keys on a placeholder object (hooks.mjs:resolvePlaceholder).
+_GONDOLIN_PLACEHOLDER_ALLOWED_KEYS = frozenset({
+    "prefix", "suffix", "length", "alphabet",
+})
+
+
+def _validate_gondolin_secrets(secrets):
+    """Validate the shape of ``TERMINAL_GONDOLIN_SECRETS_JSON`` (or the
+    equivalent ``terminal.gondolin.secrets`` YAML key) and return the
+    validated dict.
+
+    The downstream daemon (hooks.mjs) accepts any key it recognizes and
+    silently ignores anything it doesn't, which means typos like
+    ``from_envs`` produce a secret with no value source and the agent
+    runs without that credential — the noisiest signal is a WARN-level
+    diagnostic logged from inside the Node daemon, far from the source.
+    Validating here surfaces the misconfig at config-load time with a
+    message that names the secret and the violation.
+
+    Raises ValueError on any schema violation. Returns the input dict
+    unchanged on success (caller-owned).
+    """
+    if not isinstance(secrets, dict):
+        raise ValueError(
+            f"TERMINAL_GONDOLIN_SECRETS_JSON must be a JSON object, got "
+            f"{type(secrets).__name__}"
+        )
+    for name, cfg in secrets.items():
+        if not isinstance(name, str) or not name:
+            raise ValueError(
+                f"gondolin secret name must be a non-empty string, got {name!r}"
+            )
+        if not isinstance(cfg, dict):
+            raise ValueError(
+                f"gondolin secret {name!r}: config must be an object, got "
+                f"{type(cfg).__name__}"
+            )
+
+        unknown = set(cfg.keys()) - _GONDOLIN_SECRET_ALLOWED_KEYS
+        if unknown:
+            allowed = ", ".join(sorted(_GONDOLIN_SECRET_ALLOWED_KEYS))
+            raise ValueError(
+                f"gondolin secret {name!r}: unknown key(s) "
+                f"{sorted(unknown)!r}. Allowed: {allowed}"
+            )
+
+        hosts = cfg.get("hosts")
+        if not isinstance(hosts, list) or not hosts:
+            raise ValueError(
+                f"gondolin secret {name!r}: 'hosts' must be a non-empty array"
+            )
+        for h in hosts:
+            if not isinstance(h, str) or not h:
+                raise ValueError(
+                    f"gondolin secret {name!r}: 'hosts' entries must be "
+                    f"non-empty strings, got {h!r}"
+                )
+
+        # Exactly one of value / from_env / from_command. Zero is a
+        # silent-fail trap (daemon emits a WARN diagnostic and the agent
+        # runs without the secret); multiple is ambiguous about which
+        # one wins.
+        sources = [k for k in ("value", "from_env", "from_command") if k in cfg]
+        if not sources:
+            raise ValueError(
+                f"gondolin secret {name!r}: must set exactly one of "
+                f"'value', 'from_env', or 'from_command'"
+            )
+        if len(sources) > 1:
+            raise ValueError(
+                f"gondolin secret {name!r}: set only one of 'value', "
+                f"'from_env', 'from_command' (got {sources!r})"
+            )
+        for src in sources:
+            if not isinstance(cfg[src], str) or not cfg[src]:
+                raise ValueError(
+                    f"gondolin secret {name!r}: {src!r} must be a non-empty string"
+                )
+
+        ph = cfg.get("placeholder")
+        if ph is not None:
+            if isinstance(ph, str):
+                if not ph:
+                    raise ValueError(
+                        f"gondolin secret {name!r}: placeholder string must be non-empty"
+                    )
+            elif isinstance(ph, dict):
+                ph_unknown = set(ph.keys()) - _GONDOLIN_PLACEHOLDER_ALLOWED_KEYS
+                if ph_unknown:
+                    ph_allowed = ", ".join(sorted(_GONDOLIN_PLACEHOLDER_ALLOWED_KEYS))
+                    raise ValueError(
+                        f"gondolin secret {name!r}: placeholder has unknown key(s) "
+                        f"{sorted(ph_unknown)!r}. Allowed: {ph_allowed}"
+                    )
+                length = ph.get("length")
+                # hooks.mjs:resolvePlaceholder requires a positive length on
+                # the object form (it's what drives the random-string generator).
+                if not isinstance(length, int) or isinstance(length, bool) or length <= 0:
+                    raise ValueError(
+                        f"gondolin secret {name!r}: placeholder object requires a "
+                        f"positive integer 'length' (got {length!r})"
+                    )
+                for opt_key in ("prefix", "suffix", "alphabet"):
+                    if opt_key in ph and not isinstance(ph[opt_key], str):
+                        raise ValueError(
+                            f"gondolin secret {name!r}: placeholder.{opt_key} must "
+                            f"be a string (got {type(ph[opt_key]).__name__})"
+                        )
+            else:
+                raise ValueError(
+                    f"gondolin secret {name!r}: placeholder must be a string or "
+                    f"{{prefix?, suffix?, length, alphabet?}} object (got "
+                    f"{type(ph).__name__})"
+                )
+
+        if "refresh" in cfg and not isinstance(cfg["refresh"], bool):
+            raise ValueError(
+                f"gondolin secret {name!r}: 'refresh' must be a boolean"
+            )
+        if "refresh_command" in cfg:
+            rc = cfg["refresh_command"]
+            if not isinstance(rc, str) or not rc:
+                raise ValueError(
+                    f"gondolin secret {name!r}: 'refresh_command' must be a "
+                    f"non-empty string"
+                )
+        for int_key in ("ttl_seconds", "refresh_before_expiry_seconds"):
+            if int_key in cfg:
+                v = cfg[int_key]
+                # bool is a subclass of int — explicitly reject it.
+                if not isinstance(v, int) or isinstance(v, bool) or v <= 0:
+                    raise ValueError(
+                        f"gondolin secret {name!r}: {int_key!r} must be a "
+                        f"positive integer (got {v!r})"
+                    )
+    return secrets
+
+
+def _parse_gondolin_secrets_env() -> dict:
+    """Parse + validate TERMINAL_GONDOLIN_SECRETS_JSON.
+
+    Two failure modes get their own clear messages:
+      - JSON syntax error: ``Invalid value for ... (expected valid JSON)``
+      - Schema violation: ``gondolin secret 'NAME': <detail>``
+
+    The split matters because ``_parse_env_var``'s generic wrapper would
+    swallow the schema detail into "expected valid JSON" — which sends
+    users hunting for missing commas instead of the actual bug
+    (typoed key, missing hosts, etc.).
+    """
+    raw = os.getenv("TERMINAL_GONDOLIN_SECRETS_JSON", "{}")
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError:
+        raise ValueError(
+            f"Invalid value for TERMINAL_GONDOLIN_SECRETS_JSON: {raw!r} "
+            f"(expected valid JSON). Check ~/.hermes/.env or environment variables."
+        )
+    return _validate_gondolin_secrets(parsed)
+
+
 def _get_env_config() -> Dict[str, Any]:
     """Get terminal environment configuration from environment variables."""
     # Default image with Python and Node.js for maximum compatibility
@@ -1107,9 +1286,7 @@ def _get_env_config() -> Dict[str, Any]:
             "allowed_hosts": _parse_env_var(
                 "TERMINAL_GONDOLIN_ALLOWED_HOSTS", '["*"]', json.loads, "valid JSON"
             ),
-            "secrets": _parse_env_var(
-                "TERMINAL_GONDOLIN_SECRETS_JSON", "{}", json.loads, "valid JSON"
-            ),
+            "secrets": _parse_gondolin_secrets_env(),
             "policy_script": os.getenv("TERMINAL_GONDOLIN_POLICY_SCRIPT") or None,
             "sandbox_dir": os.getenv("TERMINAL_GONDOLIN_SANDBOX_DIR") or None,
             "image": os.getenv("TERMINAL_GONDOLIN_IMAGE") or DEFAULT_GONDOLIN_IMAGE,
