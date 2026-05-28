@@ -912,18 +912,54 @@ def test_secrets_validator_accepts_timeout_ms(monkeypatch):
     assert cfg["gondolin"]["secrets"]["TOK"]["timeout_ms"] == 5000
 
 
+def test_secrets_validator_accepts_timeout_ms_with_refresh_command(monkeypatch):
+    """B11: timeout_ms is *also* meaningful with refresh_command.
+    B8 made the refresher honor per-secret timeout_ms; the validator's
+    gate was left at the pre-B8 form ('only valid with from_command'),
+    so configs that use value+refresh_command+timeout_ms get rejected
+    even though the refresher will honor the value at runtime.
+
+    Three accept shapes that all wire timeout_ms to a real subprocess:
+      - from_command + timeout_ms (init-time execSync)
+      - value + refresh_command + timeout_ms (refresher subprocess)
+      - from_env + refresh_command + timeout_ms (refresher subprocess)
+    """
+    from tools.terminal_tool import _get_env_config
+
+    _set_secrets(
+        monkeypatch,
+        {"TOK": {
+            "hosts": ["a"], "value": "init",
+            "refresh_command": "op read x", "timeout_ms": 5000,
+        }},
+    )
+    cfg = _get_env_config()
+    assert cfg["gondolin"]["secrets"]["TOK"]["timeout_ms"] == 5000
+
+    _set_secrets(
+        monkeypatch,
+        {"TOK": {
+            "hosts": ["a"], "from_env": "TOK_INIT",
+            "refresh_command": "op read x", "timeout_ms": 5000,
+        }},
+    )
+    cfg = _get_env_config()
+    assert cfg["gondolin"]["secrets"]["TOK"]["timeout_ms"] == 5000
+
+
 def test_secrets_validator_rejects_timeout_ms_with_non_from_command_source(monkeypatch):
-    """Same shape as env: timeout_ms only makes sense when there's a
-    subprocess to time out. value:/from_env: resolve in-process."""
+    """timeout_ms only makes sense when there's a subprocess to time out
+    — either an init-time from_command or a refresher refresh_command.
+    Reject the shape that has neither (pure value/from_env, no refresh)."""
     _assert_invalid(
         monkeypatch,
         {"X": {"hosts": ["a"], "from_env": "X", "timeout_ms": 5000}},
-        fragment="'timeout_ms' is only valid with 'from_command'",
+        fragment="'timeout_ms' is only valid with 'from_command' or 'refresh_command'",
     )
     _assert_invalid(
         monkeypatch,
         {"X": {"hosts": ["a"], "value": "literal", "timeout_ms": 5000}},
-        fragment="'timeout_ms' is only valid with 'from_command'",
+        fragment="'timeout_ms' is only valid with 'from_command' or 'refresh_command'",
     )
 
 

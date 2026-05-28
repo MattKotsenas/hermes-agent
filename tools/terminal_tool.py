@@ -1189,17 +1189,22 @@ def _validate_gondolin_secrets(secrets):
                         f"string (got {type(ev).__name__})"
                     )
         if "timeout_ms" in cfg:
-            # Per-secret resolver timeout. Currently only consumed by
-            # hooks.mjs:103 for the init-time from_command execSync; the
-            # refresher hardcodes 30s and ignores this. Gate on
-            # from_command (not refresh_command) since that's where the
-            # knob actually takes effect — gating on refresh_command
-            # would falsely advertise a knob the refresher ignores.
-            if "from_command" not in cfg:
+            # Per-secret resolver timeout. Applied wherever the secret value
+            # comes from a real subprocess:
+            #   - hooks.mjs:103 honors it for the init-time from_command
+            #     execSync.
+            #   - the refresher (gondolin_secret_refresh._refresh_one) honors
+            #     it for refresh_command after B8 threaded state.timeout
+            #     through the run_command callable.
+            # value/from_env without a refresh_command resolve in-process with
+            # no subprocess to time out, so timeout_ms is meaningless there.
+            has_subprocess = "from_command" in cfg or "refresh_command" in cfg
+            if not has_subprocess:
                 raise ValueError(
                     f"gondolin secret {name!r}: 'timeout_ms' is only valid with "
-                    f"'from_command' (got source {sources!r}). value/from_env "
-                    f"resolve in-process with no timeout to apply."
+                    f"'from_command' or 'refresh_command' (got source {sources!r}, "
+                    f"no refresh_command). value/from_env resolve in-process with "
+                    f"no subprocess to time out."
                 )
         for int_key in ("timeout_ms", "ttl_seconds", "refresh_before_expiry_seconds"):
             if int_key in cfg:
