@@ -89,29 +89,76 @@ export function runRpcServer({ input, output, handlers }) {
       // push intermediate `{ id, stream: obj }` frames before the final
       // response. Old single-arg handlers ignore ctx and behave
       // unchanged.
+      //
+      // B15: ctx.signal lets long-running handlers (exec_stream) abort
+      // when the client disconnects mid-flight. Without it, ctx.drain()
+      // can hang forever awaiting a 'drain' event that will never fire
+      // on a closed/destroyed stream, and the handler — plus the
+      // underlying VM ExecProcess — leaks indefinitely.
+      const aborter = new AbortController();
+      const onClose = () => {
+        if (!aborter.signal.aborted) aborter.abort(new Error("client disconnected"));
+      };
+      output.once("close", onClose);
+      output.once("error", onClose);
+      input.once("close", onClose);
+      input.once("error", onClose);
       const ctx = {
+        signal: aborter.signal,
         streamWriter: (frame) => writeFrame(output, { id, stream: frame }),
         // Returns a promise that resolves on the next 'drain' event,
         // or immediately if the stream isn't currently backpressured.
         // exec_stream awaits this when streamWriter returns false so a
         // slow consumer doesn't make us buffer the whole VM output in
         // heap. Idempotent / safe to call when nothing's pending.
+        //
+        // B15: also rejects when the output stream closes (client gone)
+        // so a backpressured pump unwinds instead of hanging.
         drain: () => {
           if (typeof output.writableNeedDrain === "boolean"
               && output.writableNeedDrain === false) {
             return Promise.resolve();
           }
-          return new Promise((resolve) => output.once("drain", resolve));
+          if (aborter.signal.aborted) {
+            return Promise.reject(aborter.signal.reason ?? new Error("aborted"));
+          }
+          return new Promise((resolve, reject) => {
+            const onDrain = () => {
+              cleanup();
+              resolve();
+            };
+            const onAbort = () => {
+              cleanup();
+              reject(aborter.signal.reason ?? new Error("aborted"));
+            };
+            const cleanup = () => {
+              output.off("drain", onDrain);
+              aborter.signal.removeEventListener("abort", onAbort);
+            };
+            output.once("drain", onDrain);
+            aborter.signal.addEventListener("abort", onAbort, { once: true });
+          });
         },
       };
       try {
         const result = await handler(params, ctx);
         writeFrame(output, { id, result });
       } catch (e) {
+        // If the client already went away, no point trying to write
+        // an error frame to a destroyed pipe — that throws synchronously
+        // and would crash the listener. Just swallow.
+        if (aborter.signal.aborted) return;
         writeFrame(output, {
           id,
           error: { code: -32603, message: e.message ?? String(e) },
         });
+      } finally {
+        // Tidy listener bookkeeping so we don't accumulate on the
+        // input/output streams over many requests on one connection.
+        output.off("close", onClose);
+        output.off("error", onClose);
+        input.off("close", onClose);
+        input.off("error", onClose);
       }
     };
 

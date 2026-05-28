@@ -280,6 +280,23 @@ const handlers = {
           // daemon through the full bash-wrap path.
           const m = cmd.match(/^bash -c '(.*)'$/);
           const inner = m ? m[1].replace(/'\\''/g, "'") : cmd;
+          // STREAM_SLOW:<delayMs>:<count> yields <count> small chunks with
+          // <delayMs> between each, so a test can disconnect mid-stream
+          // and observe whether the handler aborts (B15).
+          const slowMatch = inner.match(/^STREAM_SLOW:(\d+):(\d+)/);
+          if (slowMatch) {
+            const delay = Number(slowMatch[1]);
+            const count = Number(slowMatch[2]);
+            return {
+              async *chunks() {
+                for (let i = 0; i < count; i++) {
+                  await new Promise((r) => setTimeout(r, delay));
+                  yield { kind: "stdout", data: Buffer.from(`chunk-${i}\n`, "utf8") };
+                }
+              },
+              async exitCode() { return 0; },
+            };
+          }
           const parts = inner.startsWith("STREAM:")
             ? inner.slice("STREAM:".length).split("|")
             : [inner];
@@ -489,6 +506,16 @@ const handlers = {
 
     let chunkCount = 0;
     for await (const c of proc.chunks()) {
+      // B15: if the client disconnected, the rpc.mjs context aborts the
+      // signal — unwind here rather than streamWriter-ing into a
+      // destroyed socket forever. Best-effort kill the underlying VM
+      // exec so we don't leak guest pgrps.
+      if (ctx.signal?.aborted) {
+        if (typeof proc.kill === "function") {
+          try { proc.kill(); } catch {}
+        }
+        throw ctx.signal.reason ?? new Error("client disconnected");
+      }
       const ok = ctx.streamWriter(c);
       chunkCount++;
       if (ok === false) {
@@ -571,6 +598,16 @@ if (STUB_VM) {
     return { value: entry?.value, hosts: entry?.hosts };
   };
   HANDLER_CONCURRENCY._debug_get_secret = STEADY;
+
+  // B15 regression scaffolding: peek at the inFlightSteady set so a
+  // test can observe whether a handler is stuck (e.g. exec_stream
+  // hanging on ctx.drain after a client disconnect). Subtracts 1
+  // for the in-flight self — this call itself is registered on
+  // inFlightSteady, so we never report it as a leak.
+  handlers._debug_inflight_steady_count = async function () {
+    return { count: Math.max(0, inFlightSteady.size - 1) };
+  };
+  HANDLER_CONCURRENCY._debug_inflight_steady_count = STEADY;
 }
 
 // ----- Socket transport -----

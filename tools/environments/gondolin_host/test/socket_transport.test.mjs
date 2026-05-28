@@ -1119,3 +1119,95 @@ test("daemon: shutdown waits for in-flight steady-state RPCs on other connection
   assert.equal(longResult.frame.result.exit_code, 0);
 });
 
+
+test("daemon: exec_stream aborts when the client disconnects mid-stream (B15)", async (t) => {
+  // Bug: ctx.drain() in rpc.mjs awaits output.once("drain") but the
+  // 'drain' event never fires on a destroyed/closed stream. If a
+  // client crashes or quits while exec_stream is mid-pump, the
+  // handler awaits a Promise that will never resolve. The underlying
+  // ExecProcess (in real Gondolin, an SSH channel + guest pgrp) stays
+  // alive forever, and the promise leaks in inFlightSteady — exhausting
+  // the dispatcher's queue cap (DEFAULT_MAX_QUEUED_EXECS=64) over time.
+  //
+  // Reproduction: open conn A and fire a slow STREAM exec
+  // (STREAM_SLOW:30ms x 50 chunks = ~1.5s of streaming). Wait until
+  // a few chunks have arrived, then destroy A's socket. Open conn B
+  // shortly after and query _debug_inflight_steady_count: with the
+  // bug it returns 1 (the orphaned exec_stream is still pending);
+  // with the fix it returns 0 (the handler caught the disconnect
+  // and unwound).
+  const tmp = mkdtempSync(path.join(os.tmpdir(), "gondolin-b15-test-"));
+  const sockPath = path.join(tmp, "d.sock");
+  const proc = spawn("node", [DAEMON, "--socket", sockPath], {
+    stdio: ["ignore", "ignore", "pipe"],
+    env: {
+      ...process.env,
+      GONDOLIN_DAEMON_QUIET: "1",
+      GONDOLIN_DAEMON_STUB_VM: "1",
+    },
+  });
+  proc.stderr.on("data", () => {});
+  t.after(async () => {
+    try { proc.kill("SIGTERM"); } catch {}
+    await new Promise((r) => {
+      if (proc.exitCode != null) return r();
+      proc.once("exit", r);
+      setTimeout(r, 2000);
+    });
+    rmSync(tmp, { recursive: true, force: true });
+  });
+
+  await waitForSocket(sockPath);
+  const init = await rpcCall(sockPath, {
+    id: 1, method: "init", params: { config: {} },
+  });
+  assert.equal(init.error, undefined, `init failed: ${JSON.stringify(init.error)}`);
+
+  // Fire a slow exec_stream on its own connection — we want to be
+  // able to destroy *just this* socket.
+  const slowSock = net.createConnection(sockPath);
+  const slowChunks = [];
+  await new Promise((r) => slowSock.on("connect", r));
+  slowSock.on("data", (chunk) => slowChunks.push(chunk));
+  slowSock.write(encodeFrame({
+    id: 100,
+    method: "exec_stream",
+    // 100ms x 100 chunks = ~10s total runtime — gives the disconnect
+    // path plenty of time to manifest. The 3s post-disconnect wait
+    // below is much shorter than the natural completion time.
+    params: { cmd: "STREAM_SLOW:100:100" },
+  }));
+
+  // Wait until at least one chunk has been received so we know the
+  // handler is in the middle of the pump (not still waiting on init).
+  const deadline = Date.now() + 5000;
+  while (slowChunks.length === 0 && Date.now() < deadline) {
+    await new Promise((r) => setTimeout(r, 20));
+  }
+  assert.ok(slowChunks.length > 0, "no stream chunks arrived — test setup wrong");
+
+  // Rip the socket mid-stream. The pump is now waiting on the next
+  // setTimeout(30ms) inside the stub, and will try to streamWriter()
+  // the next chunk to a destroyed pipe.
+  slowSock.destroy();
+
+  // Give the daemon a moment to either (a) detect the close and
+  // unwind, or (b) hang forever waiting on output.once("drain"). The
+  // sleep is generous (3s) so even on slow CI the pump has time to
+  // try writing the remaining chunks.
+  await new Promise((r) => setTimeout(r, 3000));
+
+  // Query the in-flight counter via a fresh connection.
+  const debug = await rpcCall(sockPath, {
+    id: 9999, method: "_debug_inflight_steady_count", params: {},
+  });
+  assert.equal(debug.error, undefined,
+    `debug call failed: ${JSON.stringify(debug.error)}`);
+  assert.equal(debug.result.count, 0,
+    "B15: exec_stream leaked after client disconnect. " +
+    `Expected 0 in-flight steady-state handlers, got ${debug.result.count}. ` +
+    "ctx.drain() must reject (or the handler must observe a signal) " +
+    "when the client socket closes, so the pump can unwind instead " +
+    "of hanging on output.once('drain') forever.");
+});
+
