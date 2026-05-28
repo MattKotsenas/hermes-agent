@@ -148,6 +148,22 @@ const handlers = {
     // cost of slower builds inside the guest).
     const memory = typeof config.memory === "string" ? config.memory : null;
     const cpus = Number.isInteger(config.cpus) && config.cpus > 0 ? config.cpus : null;
+    // Per-session rootfs (root disk) size cap. Maps the shared
+    // `terminal.container_disk` MB knob onto gondolin's VMOptions.rootfs.size
+    // (qemu-syntax string). `null` means "let gondolin pick" (auto-sized
+    // based on the image's content). Validate strictly here so a typo at
+    // session-init surfaces with a clear error rather than as a confusing
+    // VM-boot failure.
+    let rootfsSize = null;
+    if (config.rootfs_size_mb != null) {
+      const mb = config.rootfs_size_mb;
+      if (!Number.isFinite(mb) || mb <= 0 || mb !== Math.trunc(mb)) {
+        throw new Error(
+          `rootfs_size_mb must be a positive integer (got ${mb})`,
+        );
+      }
+      rootfsSize = `${mb}M`;
+    }
 
     // Optional host->guest workspace mount. Maps a real host directory into
     // the guest's filesystem via Gondolin's vfs.mounts (RealFSProvider). The
@@ -322,6 +338,7 @@ const handlers = {
       if (workspaceMount != null) result.workspaceMount = workspaceMount;
       if (memory != null) result.memory = memory;
       if (cpus != null) result.cpus = cpus;
+      if (rootfsSize != null) result.rootfsSize = rootfsSize;
       // Compute secret diagnostics even in stub mode — they're host-side
       // and don't require a real VM. Lets stub-mode integration tests
       // exercise the diagnostic surface.
@@ -381,6 +398,9 @@ const handlers = {
     }
     if (memory != null) vmOptions.memory = memory;
     if (cpus != null) vmOptions.cpus = cpus;
+    if (rootfsSize != null) {
+      vmOptions.rootfs = { ...(vmOptions.rootfs || {}), size: rootfsSize };
+    }
     vm = await VM.create(vmOptions);
     log("VM ready");
     const result = { ready: true };

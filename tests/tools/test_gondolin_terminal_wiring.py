@@ -177,6 +177,74 @@ def test_get_env_config_rejects_relative_cwd_for_gondolin(monkeypatch):
 
 
 @pytest.mark.skipif(not NODE_AVAILABLE, reason="node or daemon.mjs missing")
+def test_create_environment_translates_container_disk_to_rootfs_size_mb(
+    tmp_path, _bypass_image_build
+):
+    """The shared `terminal.container_disk` knob (MB int) is the same lever
+    docker/singularity/modal/daytona use to cap rootfs size. Gondolin's
+    equivalent is VMOptions.rootfs.size (qemu-suffix string). The factory
+    translates MB → wire key `rootfs_size_mb` so a user setting
+    `container_disk: 20480` gets a 20 GB gondolin rootfs without having to
+    learn a backend-specific schema. The daemon-side MB→qemu translation
+    is tested in socket_transport.test.mjs.
+    """
+    from tools.terminal_tool import _create_environment
+    from tools.environments.gondolin import GondolinEnvironment
+
+    env = _create_environment(
+        env_type="gondolin",
+        image="",
+        cwd="/workspace",
+        timeout=60,
+        container_config={"container_disk": 20480},  # 20 GB
+        gondolin_config={
+            "sandbox_dir": str(tmp_path / "vm-sandbox"),
+            "stub_vm": True,
+            "image": "python:3.11-slim",
+        },
+        task_id="test-disk",
+    )
+    try:
+        assert isinstance(env, GondolinEnvironment)
+        # Python-side wiring: the disk MB lands on the daemon init payload
+        # under the wire key `rootfs_size_mb`.
+        assert env.config.get("rootfs_size_mb") == 20480
+    finally:
+        env.cleanup()
+
+
+@pytest.mark.skipif(not NODE_AVAILABLE, reason="node or daemon.mjs missing")
+def test_create_environment_omits_rootfs_size_when_container_disk_unset(
+    tmp_path, _bypass_image_build
+):
+    """When `container_disk` is absent from container_config, gondolin must
+    NOT pin a size — leave it null so the gondolin VM auto-sizes the rootfs
+    based on the image content (no surprise truncation when the image grows)."""
+    from tools.terminal_tool import _create_environment
+    from tools.environments.gondolin import GondolinEnvironment
+
+    env = _create_environment(
+        env_type="gondolin",
+        image="",
+        cwd="/workspace",
+        timeout=60,
+        container_config={},  # no disk knob
+        gondolin_config={
+            "sandbox_dir": str(tmp_path / "vm-sandbox"),
+            "stub_vm": True,
+            "image": "python:3.11-slim",
+        },
+        task_id="test-disk-default",
+    )
+    try:
+        assert isinstance(env, GondolinEnvironment)
+        # No rootfs_size_mb on the daemon payload.
+        assert "rootfs_size_mb" not in env.config
+    finally:
+        env.cleanup()
+
+
+@pytest.mark.skipif(not NODE_AVAILABLE, reason="node or daemon.mjs missing")
 def test_create_environment_returns_gondolin_environment(
     tmp_path, _bypass_image_build
 ):

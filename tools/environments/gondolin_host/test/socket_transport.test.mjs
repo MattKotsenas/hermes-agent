@@ -751,6 +751,118 @@ test("daemon: init forwards config.memory and config.cpus to VM", async (t) => {
 });
 
 
+test("daemon: init forwards config.rootfs_size_mb to VMOptions.rootfs.size", async (t) => {
+  // The shared `terminal.container_disk` knob (MB int, default 50GB) caps
+  // the rootfs image used by docker/singularity/modal/daytona. Gondolin's
+  // equivalent is VMOptions.rootfs.size (qemu suffix string, e.g. "50G").
+  // Python translates container_disk MB → rootfs_size_mb on the wire and
+  // the daemon converts it to the qemu shape. Verifies the round-trip in
+  // stub mode by echoing the resolved rootfs size back in the init result.
+  const tmp = mkdtempSync(path.join(os.tmpdir(), "gondolin-rootfs-size-"));
+  const sockPath = path.join(tmp, "d.sock");
+
+  const proc = spawn("node", [DAEMON, "--socket", sockPath], {
+    stdio: ["ignore", "ignore", "pipe"],
+    env: {
+      ...process.env,
+      GONDOLIN_DAEMON_QUIET: "1",
+      GONDOLIN_DAEMON_STUB_VM: "1",
+    },
+  });
+  proc.stderr.on("data", () => {});
+  t.after(async () => {
+    try { proc.kill("SIGTERM"); } catch {}
+    await new Promise((r) => {
+      if (proc.exitCode != null) return r();
+      proc.once("exit", r);
+      setTimeout(r, 2000);
+    });
+    rmSync(tmp, { recursive: true, force: true });
+  });
+
+  await waitForSocket(sockPath);
+
+  const init = await rpcCall(sockPath, {
+    id: 1,
+    method: "init",
+    params: { config: { rootfs_size_mb: 20480 } },  // 20 GB
+  });
+  assert.equal(init.error, undefined);
+  assert.equal(init.result.ready, true);
+  // The daemon converts MB → qemu-suffixed string. 20480 MB → "20480M"
+  // (gondolin's parser accepts the bare MB form).
+  assert.equal(init.result.rootfsSize, "20480M");
+});
+
+
+test("daemon: init without rootfs_size_mb leaves rootfs unset (gondolin defaults)", async (t) => {
+  const tmp = mkdtempSync(path.join(os.tmpdir(), "gondolin-rootfs-default-"));
+  const sockPath = path.join(tmp, "d.sock");
+
+  const proc = spawn("node", [DAEMON, "--socket", sockPath], {
+    stdio: ["ignore", "ignore", "pipe"],
+    env: {
+      ...process.env,
+      GONDOLIN_DAEMON_QUIET: "1",
+      GONDOLIN_DAEMON_STUB_VM: "1",
+    },
+  });
+  proc.stderr.on("data", () => {});
+  t.after(async () => {
+    try { proc.kill("SIGTERM"); } catch {}
+    await new Promise((r) => {
+      if (proc.exitCode != null) return r();
+      proc.once("exit", r);
+      setTimeout(r, 2000);
+    });
+    rmSync(tmp, { recursive: true, force: true });
+  });
+
+  await waitForSocket(sockPath);
+  const init = await rpcCall(sockPath, {
+    id: 1,
+    method: "init",
+    params: { config: {} },
+  });
+  assert.equal(init.error, undefined);
+  assert.equal(init.result.rootfsSize, undefined);
+});
+
+
+test("daemon: init rejects non-positive rootfs_size_mb", async (t) => {
+  const tmp = mkdtempSync(path.join(os.tmpdir(), "gondolin-rootfs-invalid-"));
+  const sockPath = path.join(tmp, "d.sock");
+
+  const proc = spawn("node", [DAEMON, "--socket", sockPath], {
+    stdio: ["ignore", "ignore", "pipe"],
+    env: {
+      ...process.env,
+      GONDOLIN_DAEMON_QUIET: "1",
+      GONDOLIN_DAEMON_STUB_VM: "1",
+    },
+  });
+  proc.stderr.on("data", () => {});
+  t.after(async () => {
+    try { proc.kill("SIGTERM"); } catch {}
+    await new Promise((r) => {
+      if (proc.exitCode != null) return r();
+      proc.once("exit", r);
+      setTimeout(r, 2000);
+    });
+    rmSync(tmp, { recursive: true, force: true });
+  });
+
+  await waitForSocket(sockPath);
+  const init = await rpcCall(sockPath, {
+    id: 1,
+    method: "init",
+    params: { config: { rootfs_size_mb: -5 } },
+  });
+  assert.notEqual(init.error, undefined);
+  assert.match(init.error.message || String(init.error), /rootfs_size_mb/);
+});
+
+
 test("daemon: init without resource caps leaves memory/cpus undefined", async (t) => {
   // Unset means "let Gondolin pick its defaults" (1G memory, 2 cpus).
   const tmp = mkdtempSync(path.join(os.tmpdir(), "gondolin-vmres-default-"));
