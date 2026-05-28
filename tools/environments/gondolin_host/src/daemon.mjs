@@ -3,9 +3,15 @@
 // Spawned once per Hermes session. Owns exactly one Gondolin VM and exposes
 // JSON-RPC over an AF_UNIX socket. Each Python-side wrapper invocation
 // (gondolin_rpc_call.py) opens its own short-lived connection, sends one
-// request, reads one response, closes. The daemon serializes inbound
-// requests against the single VM, so concurrent connections are safe but
-// effectively single-threaded — matching "one VM, one in-flight exec."
+// request, reads one response, closes.
+//
+// Concurrency: the underlying gondolin VM multiplexes up to
+// DEFAULT_MAX_QUEUED_EXECS concurrent exec channels via SSH (see
+// gondolin/src/qemu/ssh.js: "A guest SSH connection can spawn multiple
+// exec channels concurrently"). We let steady-state methods (exec,
+// exec_stream, set_secret) run concurrently and only serialize lifecycle
+// methods (init, shutdown) so they don't race on the `vm` global. See
+// dispatch() below for the mechanism.
 //
 // CLI:
 //   node daemon.mjs --socket <path>
@@ -17,7 +23,8 @@
 // RPC methods:
 //   init({ config })            - boot the VM with the given policy config
 //   exec({ cmd, timeout_ms })   - run a shell command, return result
-//   set_secret({ name, value }) - refresh a secret value (phase 2.5)
+//   exec_stream({ cmd, ... })   - exec with live stdout/stderr chunks
+//   set_secret({ name, value }) - refresh a secret value
 //   shutdown({})                - graceful teardown, daemon exits
 
 import net from "node:net";
@@ -47,6 +54,19 @@ let vm = null;
 // values mid-session without restarting the VM. In stub mode we install a
 // fake that records updates for test assertions.
 let secretManager = null;
+
+// Each handler is tagged with its concurrency class. ``lifecycle``
+// handlers touch the ``vm`` global directly (boot, teardown) and MUST
+// run serially with respect to everything else, including other
+// lifecycle calls. ``steady`` handlers ride on top of an established
+// VM via APIs that already multiplex (vm.exec → SSH channels,
+// secretManager.updateSecret → in-memory map). Tagging happens at
+// registration (see end of this object) — one place, no separate set
+// to drift out of sync, no untagged default. dispatch() looks up the
+// tag and falls back to a runtime error if a handler was added
+// without a classification.
+const LIFECYCLE = "lifecycle";
+const STEADY = "steady";
 
 const handlers = {
   async init(params) {
@@ -411,17 +431,6 @@ const handlers = {
     return { ok: true };
   },
 
-  async _debug_get_secret(params) {
-    // Stub-mode only: introspect the fake secretManager for test assertions.
-    // No-op against a real Gondolin VM (real secretManager doesn't expose
-    // the value back — for security).
-    if (!secretManager || typeof secretManager._peek !== "function") {
-      throw new Error("_debug_get_secret only available in stub mode");
-    }
-    const entry = secretManager._peek(params?.name);
-    return { value: entry?.value, hosts: entry?.hosts };
-  },
-
   async shutdown() {
     if (vm) {
       try {
@@ -436,6 +445,36 @@ const handlers = {
     return { ok: true };
   },
 };
+
+// Concurrency classification per handler. Single source of truth: edit
+// here when adding/changing a handler, dispatch() reads from this map.
+// A handler in `handlers` but absent here is a hard error at dispatch
+// time — there's no implicit default so contributors must pick a class.
+const HANDLER_CONCURRENCY = {
+  init: LIFECYCLE,
+  shutdown: LIFECYCLE,
+  exec: STEADY,
+  exec_stream: STEADY,
+  set_secret: STEADY,
+};
+
+// In stub mode the daemon exposes a debug peek into the fake secret
+// manager so secret-refresh tests can assert that updateSecret was
+// called with the right values. This is NEVER registered against a
+// real VM — its only consumer is the test fixture, and a real Gondolin
+// secretManager has no equivalent (secret values are write-only by
+// design). Gating on STUB_VM at registration time keeps test-shaped
+// surface off the production daemon.
+if (STUB_VM) {
+  handlers._debug_get_secret = async function _debug_get_secret(params) {
+    if (!secretManager || typeof secretManager._peek !== "function") {
+      throw new Error("_debug_get_secret only available in stub mode");
+    }
+    const entry = secretManager._peek(params?.name);
+    return { value: entry?.value, hosts: entry?.hosts };
+  };
+  HANDLER_CONCURRENCY._debug_get_secret = STEADY;
+}
 
 // ----- Socket transport -----
 
@@ -453,13 +492,10 @@ const handlers = {
 // the poll-loop's request-reading ``ls``/``cat`` calls couldn't acquire
 // the dispatch slot.
 //
-// We still need to serialize lifecycle methods (``init``, ``stop``,
+// We still need to serialize lifecycle methods (``init``, ``shutdown``,
 // anything that touches the ``vm`` global before it's assigned or
-// during teardown). Doing that with an explicit allow-list on the
-// lifecycle methods, rather than a blanket per-process lock, lets
-// steady-state ``exec`` calls run concurrently the way the gondolin
-// API intends.
-const LIFECYCLE_METHODS = new Set(["init", "stop", "rebuild"]);
+// during teardown). The classification lives in HANDLER_CONCURRENCY
+// above so adding a new handler forces an explicit pick.
 let lifecycleChain = Promise.resolve();
 function dispatch(method, params, ctx) {
   const handler = handlers[method];
@@ -468,7 +504,21 @@ function dispatch(method, params, ctx) {
       Object.assign(new Error(`method not found: ${method}`), { code: -32601 }),
     );
   }
-  if (LIFECYCLE_METHODS.has(method)) {
+  const concurrency = HANDLER_CONCURRENCY[method];
+  if (concurrency !== LIFECYCLE && concurrency !== STEADY) {
+    // A handler exists but has no concurrency tag. Treating it as
+    // either default would be a guess; refuse instead so the
+    // contributor has to make the call explicitly.
+    return Promise.reject(
+      Object.assign(
+        new Error(
+          `handler ${method} is missing a HANDLER_CONCURRENCY classification`,
+        ),
+        { code: -32603 },
+      ),
+    );
+  }
+  if (concurrency === LIFECYCLE) {
     // Serialize lifecycle transitions against everything else so we
     // don't race on the ``vm`` global. Steady-state methods that arrive
     // mid-init/teardown will still queue behind the chain.

@@ -9,7 +9,12 @@
 //   `{ id, stream: ... }` from a handler's streamWriter, or a terminal
 //   `{ id, result: ... }` / `{ id, error: ... }`.
 //
-// Requests are dispatched serially through `handlers[method]`.
+// Requests on a single connection are dispatched serially via a promise
+// chain — that's a per-connection guarantee, not a daemon-wide one. The
+// daemon (see daemon.mjs `dispatch`) lets steady-state methods on
+// DIFFERENT connections run concurrently; serialization is only needed
+// within one connection because we re-use the same `output` stream and
+// want response framing to stay ordered.
 //
 // Error codes follow JSON-RPC 2.0:
 //   -32700 parse error
@@ -94,9 +99,13 @@ export function runRpcServer({ input, output, handlers }) {
       }
     };
 
-    // Serial dispatch via promise chain — keeps response order
-    // deterministic and matches the "one VM, one in-flight exec" reality
-    // of phase 2.
+    // Serial per-connection dispatch via promise chain. Each connection
+    // owns one `output` stream; serializing here keeps response frames
+    // from interleaving on the wire. Cross-connection concurrency
+    // (multiple wrapper subprocesses talking to the daemon at once) is
+    // handled at the dispatcher layer in daemon.mjs — steady-state
+    // methods run free across connections; lifecycle methods serialize
+    // host-wide.
     let chain = Promise.resolve();
 
     input.on("data", (chunk) => {
