@@ -432,15 +432,20 @@ class GondolinEnvironment(BaseEnvironment):
                 # docker's -v $f:$g:ro does — the daemon-side validation
                 # accepts files, but gondolin's RealFSProvider does not.
                 # As a workaround, group credential files by their
-                # parent directory: mount the parent read-only and the
-                # file is reachable through it. Most credential files
-                # live in dedicated config dirs (~/.config/gcloud/,
-                # ~/.config/gh/, ~/.op/) so this works out cleanly. For
-                # entries where parent grouping would cause path
-                # collisions, the per-credential mount is skipped and a
-                # WARN is logged — the user can mount that credential
+                # parent directory: mount the parent read-only AND emit
+                # an `allowed_files` allowlist of the credential
+                # basenames so the daemon wraps the provider in a
+                # ShadowProvider — every other file in the parent dir
+                # surfaces as ENOENT. That preserves docker's file-level
+                # isolation property even though we have to mount a
+                # directory. See daemon.mjs buildExtraMountProvider.
+                # For entries where parent grouping would cause path
+                # collisions (same guest_parent → different
+                # host_parent), the per-credential mount is skipped and
+                # a WARN is logged — the user can mount that credential
                 # via wire-injected `secrets:` instead.
                 seen_parents: dict[str, str] = {}
+                grouped: dict[str, dict] = {}
                 for m in get_credential_file_mounts():
                     host_parent = os.path.dirname(m["host_path"])
                     guest_parent = os.path.dirname(m["container_path"])
@@ -452,14 +457,20 @@ class GondolinEnvironment(BaseEnvironment):
                             m["container_path"], guest_parent, seen_parents[guest_parent],
                         )
                         continue
-                    if guest_parent in seen_parents:
-                        continue
                     seen_parents[guest_parent] = host_parent
-                    extra_mounts.append({
+                    basename = os.path.basename(m["container_path"])
+                    entry = grouped.setdefault(guest_parent, {
                         "guest_path": guest_parent,
                         "host_path": host_parent,
                         "readonly": True,
+                        "allowed_files": [],
                     })
+                    # Allowed paths are provider-rooted (absolute under
+                    # the mount root); leading "/" + basename.
+                    rel = "/" + basename
+                    if rel not in entry["allowed_files"]:
+                        entry["allowed_files"].append(rel)
+                extra_mounts.extend(grouped.values())
         if extra_mounts:
             self.config["extra_mounts"] = extra_mounts
 

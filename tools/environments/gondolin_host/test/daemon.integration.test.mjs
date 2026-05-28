@@ -270,3 +270,90 @@ test("daemon: multiple extra_mounts coexist with workspace_mount", { skip: skipR
     rmSync(tmpSkills, { recursive: true, force: true });
   }
 });
+
+test("daemon: allowed_files exposes only the listed credential and shadows siblings", { skip: skipReason }, async () => {
+  // SECURITY: credential parent-dir mounting (~/.config/gh/) must not
+  // expose sibling files (~/.config/gh/state.json,
+  // ~/.config/gh/migration_state). Python emits an `allowed_files`
+  // allowlist per credential-grouped mount; the daemon wraps the
+  // RealFSProvider in a ShadowProvider so sibling reads ENOENT inside
+  // the guest. This is the end-to-end VM-level check; the daemon-side
+  // construction unit is in mounts.test.mjs.
+
+  const fs2 = await import("node:fs");
+  const tmpHost = mkdtempSync(path.join(os.tmpdir(), "gondolin-allowlist-"));
+  // The "credential" file (allowed) and a sibling that must stay hidden.
+  fs2.writeFileSync(path.join(tmpHost, "hosts.yml"), "github.com: token\n", "utf8");
+  fs2.writeFileSync(
+    path.join(tmpHost, "state.json"),
+    "SENSITIVE-SIBLING-CONTENT\n",
+    "utf8",
+  );
+  fs2.writeFileSync(
+    path.join(tmpHost, "migration_state"),
+    "internal-data\n",
+    "utf8",
+  );
+
+  const h = new DaemonHarness();
+  await h.start();
+  try {
+    const init = await h.call("init", {
+      config: {
+        extra_mounts: [
+          {
+            guest_path: "/root/.config/gh",
+            host_path: tmpHost,
+            readonly: true,
+            allowed_files: ["/hosts.yml"],
+          },
+        ],
+      },
+    }, 120_000);
+    assert.equal(init.error, undefined, `init failed: ${JSON.stringify(init.error)}`);
+
+    // The allowed file is readable.
+    const r1 = await h.call("exec", { cmd: "cat /root/.config/gh/hosts.yml" }, 60_000);
+    assert.equal(r1.result.exit_code, 0, `stderr: ${r1.result.stderr}`);
+    assert.match(r1.result.stdout, /github\.com: token/);
+
+    // Sibling reads fail. The sibling content must NOT appear in stdout
+    // regardless of exit code (a leak past the shadow would let the
+    // sensitive payload appear).
+    const r2 = await h.call("exec", {
+      cmd: "cat /root/.config/gh/state.json 2>&1; echo rc=$?",
+    }, 60_000);
+    assert.equal(r2.result.exit_code, 0); // shell command itself succeeds
+    assert.doesNotMatch(
+      r2.result.stdout,
+      /SENSITIVE-SIBLING-CONTENT/,
+      "shadow-shadowed file leaked its content to the guest",
+    );
+    assert.doesNotMatch(r2.result.stdout, /^rc=0$/m, "cat on shadowed file should fail");
+
+    // ls of the parent should also not list the sibling.
+    const r3 = await h.call("exec", { cmd: "ls /root/.config/gh" }, 60_000);
+    assert.equal(r3.result.exit_code, 0);
+    assert.match(r3.result.stdout, /hosts\.yml/);
+    assert.doesNotMatch(r3.result.stdout, /state\.json/);
+    assert.doesNotMatch(r3.result.stdout, /migration_state/);
+
+    // Symlink-bypass attempt: create a symlink from /workspace to the
+    // shadowed sibling. ShadowProvider's denySymlinkBypass should consult
+    // realpath and still block the read. (The workspace isn't mounted in
+    // this test, so use /tmp.)
+    const r4 = await h.call("exec", {
+      cmd: "ln -sf /root/.config/gh/state.json /tmp/bypass.txt 2>&1; cat /tmp/bypass.txt 2>&1; echo rc=$?",
+    }, 60_000);
+    assert.doesNotMatch(
+      r4.result.stdout,
+      /SENSITIVE-SIBLING-CONTENT/,
+      "symlink bypass leaked shadowed content",
+    );
+
+    await h.call("shutdown", {}, 30_000);
+  } finally {
+    await h.stop();
+    rmSync(tmpHost, { recursive: true, force: true });
+  }
+});

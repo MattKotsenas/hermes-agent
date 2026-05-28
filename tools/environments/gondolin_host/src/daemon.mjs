@@ -48,6 +48,67 @@ async function loadGondolin() {
   return await import("@earendil-works/gondolin");
 }
 
+/**
+ * Build the VirtualProvider for one extra_mounts entry.
+ *
+ * Three knobs:
+ *   readonly      — wrap in ReadonlyProvider (rejects writes with EROFS).
+ *                   Default true (mirrors docker -v $h:$g:ro).
+ *   allowedFiles  — optional allowlist of absolute (provider-relative)
+ *                   paths inside the mount that are visible. Everything
+ *                   else is shadowed (ENOENT on read, omitted from
+ *                   readdir, denySymlinkBypass blocks `ln -s sibling .`
+ *                   tricks). When omitted, the whole directory is
+ *                   exposed (legacy behavior, used for skills/ and the
+ *                   workspace).
+ *
+ * Exported for unit testing — the construction logic is the security
+ * surface for credential isolation and deserves direct coverage rather
+ * than only-through-init.
+ */
+export async function buildExtraMountProvider(em) {
+  const { RealFSProvider, ReadonlyProvider, ShadowProvider } =
+    await loadGondolin();
+  const real = new RealFSProvider(em.hostPath);
+  let provider = real;
+  if (Array.isArray(em.allowedFiles) && em.allowedFiles.length > 0) {
+    // Invert the upstream denylist into an allowlist: shadow every path
+    // that is NOT in the allowlist, EXCEPT the directory chain leading
+    // to an allowed file (otherwise `readdir('/')` and traversal into
+    // `subdir/` would ENOENT and the allowed file becomes unreachable).
+    //
+    // Algorithm: a path is shadowed iff (a) it's not in the allowlist,
+    // AND (b) no allowed file lives under it. The second clause lets
+    // `/`, `/.config`, `/.config/gh` all pass when allowed files like
+    // `/.config/gh/hosts.yml` exist; only sibling leaves get ENOENT.
+    const allowed = new Set(
+      em.allowedFiles.map((p) => (p.startsWith("/") ? p : "/" + p)),
+    );
+    const allowedPrefixes = new Set();
+    for (const p of allowed) {
+      // Add every ancestor directory of p ("/.config/gh", "/.config", "/")
+      // so readdir on any ancestor returns the path leading to p.
+      let cur = p;
+      while (true) {
+        const idx = cur.lastIndexOf("/");
+        if (idx <= 0) { allowedPrefixes.add("/"); break; }
+        cur = cur.slice(0, idx);
+        allowedPrefixes.add(cur);
+      }
+    }
+    provider = new ShadowProvider(real, {
+      shouldShadow: ({ path: p }) => {
+        if (allowed.has(p)) return false;
+        if (allowedPrefixes.has(p)) return false;
+        // Path is a leaf (or descendant) that isn't allowed. Shadow it.
+        return true;
+      },
+      writeMode: "deny",
+    });
+  }
+  return em.readonly === false ? provider : new ReadonlyProvider(provider);
+}
+
 // State: the daemon owns at most one VM, shared across every connection.
 let vm = null;
 // Gondolin's secretManager from createHttpHooks(). Lets us refresh secret
@@ -137,6 +198,7 @@ const handlers = {
         const guestPath = entry?.guest_path;
         const hostPath = entry?.host_path;
         const readonly = entry?.readonly !== false;  // default true
+        const allowedFiles = entry?.allowed_files;
         if (typeof guestPath !== "string" || !guestPath.startsWith("/")) {
           throw new Error(
             "extra_mounts[].guest_path must be an absolute path string",
@@ -144,6 +206,13 @@ const handlers = {
         }
         if (typeof hostPath !== "string" || hostPath.length === 0) {
           throw new Error("extra_mounts[].host_path must be a non-empty string");
+        }
+        if (allowedFiles != null) {
+          if (!Array.isArray(allowedFiles) || allowedFiles.some((p) => typeof p !== "string")) {
+            throw new Error(
+              "extra_mounts[].allowed_files must be an array of strings when set",
+            );
+          }
         }
         try {
           const stat = fs.statSync(hostPath);
@@ -161,7 +230,7 @@ const handlers = {
           }
           throw e;
         }
-        extraMounts.push({ guestPath, hostPath, readonly });
+        extraMounts.push({ guestPath, hostPath, readonly, allowedFiles });
       }
     }
 
@@ -277,7 +346,7 @@ const handlers = {
       imagePath,
       workspaceMount,
     });
-    const { VM, createHttpHooks, RealFSProvider, ReadonlyProvider } = await loadGondolin();
+    const { VM, createHttpHooks } = await loadGondolin();
     const hooksResult = createHttpHooks(hooksInput);
     const { httpHooks, env } = hooksResult;
     secretManager = hooksResult.secretManager;
@@ -288,22 +357,24 @@ const handlers = {
     }
     const mounts = {};
     if (workspaceMount != null) {
-      // vfs.mounts is a Record<guestPath, VirtualProvider>. RealFSProvider
-      // exposes a host directory directly. Gondolin's sandboxfs init script
-      // mounts the VFS provider tree at /data and binds the configured guest
-      // paths into the rest of the filesystem (see Alpine ROOTFS_INIT_SCRIPT
-      // and SandboxFsConfig.fuseBinds). For the agent, this means files
-      // written under workspaceMount.guestPath inside the VM appear under
-      // workspaceMount.hostPath on the host, and vice versa.
-      mounts[workspaceMount.guestPath] = new RealFSProvider(workspaceMount.hostPath);
+      // vfs.mounts is a Record<guestPath, VirtualProvider>. The workspace
+      // mount is read-write so the agent can save files; we use
+      // buildExtraMountProvider with readonly=false to keep one
+      // construction path for all mounts. Gondolin's sandboxfs init
+      // script mounts the VFS provider tree at /data and binds the
+      // configured guest paths into the rest of the filesystem (see
+      // Alpine ROOTFS_INIT_SCRIPT and SandboxFsConfig.fuseBinds).
+      mounts[workspaceMount.guestPath] = await buildExtraMountProvider({
+        guestPath: workspaceMount.guestPath,
+        hostPath: workspaceMount.hostPath,
+        readonly: false,
+      });
     }
     for (const em of extraMounts) {
-      // ReadonlyProvider wraps a RealFSProvider and rejects writes with
-      // EROFS. The guest can read but not modify host content — matches
-      // the read-only bind mounts docker/singularity use for skills/
-      // credential files.
-      const real = new RealFSProvider(em.hostPath);
-      mounts[em.guestPath] = em.readonly ? new ReadonlyProvider(real) : real;
+      // Credential mounts: ReadonlyProvider for write rejection, optional
+      // ShadowProvider for per-file allowlisting (set via allowed_files).
+      // See buildExtraMountProvider for the construction rules.
+      mounts[em.guestPath] = await buildExtraMountProvider(em);
     }
     if (Object.keys(mounts).length > 0) {
       vmOptions.vfs = { mounts };
@@ -583,27 +654,35 @@ function startSocketServer(sockPath) {
 }
 
 // ----- Entry point -----
+//
+// Only fire when invoked as the main script. Tests that import this file
+// for its exported helpers (buildExtraMountProvider, dispatch handlers)
+// must not trigger argv parsing / server startup.
 
-const { values } = parseArgs({
-  options: {
-    socket: { type: "string" },
-  },
-  allowPositionals: false,
-});
+import { pathToFileURL } from "node:url";
+if (import.meta.url === pathToFileURL(process.argv[1] ?? "").href) {
+  const { values } = parseArgs({
+    options: {
+      socket: { type: "string" },
+    },
+    allowPositionals: false,
+  });
 
-if (!values.socket) {
-  console.error("usage: node daemon.mjs --socket <path>");
-  process.exit(2);
+  if (!values.socket) {
+    console.error("usage: node daemon.mjs --socket <path>");
+    process.exit(2);
+  }
+
+  const server = startSocketServer(values.socket);
+
+  // eslint-disable-next-line no-inner-declarations
+  async function gracefulShutdown(signal) {
+    log(`received ${signal}, shutting down`);
+    try { server.close(); } catch {}
+    try { if (vm) await vm.close(); } catch {}
+    try { fs.unlinkSync(values.socket); } catch {}
+    process.exit(0);
+  }
+  process.on("SIGTERM", () => gracefulShutdown("SIGTERM"));
+  process.on("SIGINT", () => gracefulShutdown("SIGINT"));
 }
-
-const server = startSocketServer(values.socket);
-
-async function gracefulShutdown(signal) {
-  log(`received ${signal}, shutting down`);
-  try { server.close(); } catch {}
-  try { if (vm) await vm.close(); } catch {}
-  try { fs.unlinkSync(values.socket); } catch {}
-  process.exit(0);
-}
-process.on("SIGTERM", () => gracefulShutdown("SIGTERM"));
-process.on("SIGINT", () => gracefulShutdown("SIGINT"));

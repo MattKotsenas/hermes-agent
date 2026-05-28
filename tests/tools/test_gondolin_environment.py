@@ -746,16 +746,23 @@ def test_skill_directory_mounts_are_projected_by_default(stub_env_factory, monke
 
 @requires_node
 def test_credential_files_grouped_by_parent_dir(stub_env_factory, monkeypatch, tmp_path):
-    """Individual credential files mount as their parent directory.
+    """Individual credential files mount as their parent directory with an
+    allow-list of the visible filenames.
 
     Gondolin's RealFSProvider takes a directory rootPath, so a per-file
     bind-mount á la docker -v $f:$g:ro doesn't translate. GondolinEnvironment
     groups credentials by guest parent path and mounts that directory
-    read-only.
+    read-only — but every other file in the parent dir (state.json,
+    migration_state, leftover-debug.log) MUST be shadowed so the agent
+    sees only the credentials it's supposed to. The daemon receives a
+    per-mount `allowed_files` list and constructs a ShadowProvider that
+    surfaces siblings as ENOENT (see daemon.mjs buildExtraMountProvider).
     """
     gcloud_dir = tmp_path / "gcloud"; gcloud_dir.mkdir()
     (gcloud_dir / "credentials.json").write_text("{}")
     (gcloud_dir / "access_tokens.db").write_text("")
+    # A sibling that must NOT be exposed.
+    (gcloud_dir / "leftover-debug.log").write_text("secrets-in-debug-log")
     op_dir = tmp_path / "op"; op_dir.mkdir()
     (op_dir / "session.json").write_text("{}")
     fake_credentials = [
@@ -778,6 +785,22 @@ def test_credential_files_grouped_by_parent_dir(stub_env_factory, monkeypatch, t
     guest_paths = sorted(m["guest_path"] for m in mounts)
     assert guest_paths == ["/root/.config/gcloud", "/root/.op"]
     assert all(m["readonly"] is True for m in mounts)
+
+    # SECURITY: each credential mount carries an allowed_files allowlist.
+    # The daemon's ShadowProvider treats anything NOT in this list as
+    # ENOENT, so the agent cannot read sibling files in the parent dir
+    # (state.json, leftover-debug.log, etc).
+    by_guest = {m["guest_path"]: m for m in mounts}
+    gcloud_mount = by_guest["/root/.config/gcloud"]
+    assert "allowed_files" in gcloud_mount, (
+        f"mount missing allowed_files (sibling files would be exposed): {gcloud_mount!r}"
+    )
+    assert sorted(gcloud_mount["allowed_files"]) == [
+        "/access_tokens.db", "/credentials.json",
+    ]
+    op_mount = by_guest["/root/.op"]
+    assert "allowed_files" in op_mount
+    assert op_mount["allowed_files"] == ["/session.json"]
 
 
 @requires_node
