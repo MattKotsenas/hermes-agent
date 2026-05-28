@@ -8,7 +8,9 @@ having to remember which backend wrote what.
 Known layouts (all live side-by-side under one root):
 
   - ``docker/<task_id>/``      per-task, prunable
-  - ``gondolin-<task_id>/``    per-task, prunable
+  - ``gondolin/<task_id>/``    per-task, prunable
+  - ``gondolin/.locks/``       gondolin's host-wide flock slot files;
+                               counted (it's tiny) but skipped by prune
   - ``singularity/``           shared scratch, NOT per-task — counted but
                                never pruned (deleting it would nuke the
                                SIF cache that's expensive to rebuild)
@@ -24,7 +26,6 @@ doctor`` (which must not import heavyweight tool modules).
 from __future__ import annotations
 
 import logging
-import re
 import shutil
 import time
 from dataclasses import dataclass, field
@@ -33,9 +34,12 @@ from typing import Iterable, List, Optional, Set
 
 logger = logging.getLogger(__name__)
 
-# Per-task gondolin dir name: "gondolin-<task_id>" (task_id may contain
-# alnum, dash, underscore).
-_GONDOLIN_PREFIX = "gondolin-"
+# Backends whose top-level directory is a bucket of per-task subdirs.
+# Mirrors the docker pattern: <root>/<backend>/<task_id>/.
+_BUCKETED_BACKENDS = ("docker", "gondolin")
+
+# Backends whose top-level directory is shared scratch (one dir, no
+# per-task subdirs). Counted in the inventory but never pruned.
 _SHARED_BACKEND_DIRS = {"singularity"}
 
 
@@ -94,36 +98,40 @@ def _dir_mtime(path: Path) -> float:
         return 0.0
 
 
-def _classify_docker_subdirs(docker_root: Path) -> List[SandboxEntry]:
-    """`docker/` itself is a backend bucket — each child is one task."""
+def _classify_bucketed_subdirs(bucket_root: Path, backend: str) -> List[SandboxEntry]:
+    """A bucketed backend root (``docker/``, ``gondolin/``). Each child is
+    one task — except a single magic ``.locks/`` dir that gondolin uses
+    for host-wide flock slot files, which is counted but not prunable.
+    """
     out: List[SandboxEntry] = []
-    if not docker_root.is_dir():
+    if not bucket_root.is_dir():
         return out
-    for child in docker_root.iterdir():
+    for child in bucket_root.iterdir():
         if not child.is_dir():
+            continue
+        if child.name == ".locks":
+            # Host-wide concurrency-cap slot files. Tiny, but show them
+            # in the inventory so a curious user isn't surprised by a
+            # hidden dir. Never pruned: their lifetime is process-local
+            # (flock releases on exit), so they're harmless to leave.
+            out.append(SandboxEntry(
+                path=child,
+                backend=backend,
+                task_id=None,
+                size_bytes=_dir_size(child),
+                mtime=_dir_mtime(child),
+                prunable=False,
+            ))
             continue
         out.append(SandboxEntry(
             path=child,
-            backend="docker",
+            backend=backend,
             task_id=child.name,
             size_bytes=_dir_size(child),
             mtime=_dir_mtime(child),
             prunable=True,
         ))
     return out
-
-
-def _classify_gondolin(entry_path: Path) -> SandboxEntry:
-    """`gondolin-<task_id>/` is a single per-task dir."""
-    task_id = entry_path.name[len(_GONDOLIN_PREFIX):]
-    return SandboxEntry(
-        path=entry_path,
-        backend="gondolin",
-        task_id=task_id,
-        size_bytes=_dir_size(entry_path),
-        mtime=_dir_mtime(entry_path),
-        prunable=True,
-    )
 
 
 def _classify_shared(entry_path: Path, backend: str) -> SandboxEntry:
@@ -165,10 +173,8 @@ def scan(root: Path) -> SandboxReport:
             if not child.is_dir():
                 continue
             name = child.name
-            if name == "docker":
-                entries.extend(_classify_docker_subdirs(child))
-            elif name.startswith(_GONDOLIN_PREFIX) and len(name) > len(_GONDOLIN_PREFIX):
-                entries.append(_classify_gondolin(child))
+            if name in _BUCKETED_BACKENDS:
+                entries.extend(_classify_bucketed_subdirs(child, name))
             elif name in _SHARED_BACKEND_DIRS:
                 entries.append(_classify_shared(child, name))
             else:

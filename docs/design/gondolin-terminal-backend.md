@@ -954,157 +954,134 @@ gondolin. Unification is a follow-up RFC against
 `NousResearch/hermes-agent` once gondolin is upstream and the wire
 injection mechanism has a second consumer to justify the abstraction.
 
-## Default image: first-run local build (`hermes-runtime`)
+## Default image: plain OCI passthrough with lazy build
 
 ### The gap
 
 `alpine-base:latest` — gondolin's own default — ships BusyBox plus
 networking. It does **not** ship `python3`, `node`, `npm`, `uv`, or
 `bash`. That makes the built-in `execute_code` tool fail on the
-default gondolin install, and a handful of skills that shell out to
-those interpreters degrade. The previous mitigation was an actionable
-error message + a `hermes doctor` info line + `test_execute_code_round_trip`
-marked `xfail(strict=True)`. Honest, but a built-in tool failing on a
-built-in backend violates Hermes's "select a backend, things work"
-posture.
+default gondolin install, and skills that shell out to those
+interpreters degrade. A built-in tool failing on a built-in backend
+violates Hermes's "select a backend, things work" posture.
 
 ### What was considered, what was picked
 
-Four options, narrowed by experiment:
+Three options:
 
-1. **Default to a gondolin-registry image with python preinstalled**
-   (e.g. `ubuntu-noble:latest`, assuming it ships `python3`). Cheap to
-   change; hitches our default contents to gondolin's image cadence;
-   loses pinning control.
-2. **Hermes publishes its own image** (`hermes-runtime:latest` to a
-   registry). Full control over contents and version cadence; brings
-   image-publishing infrastructure into Hermes for the first time
-   (registry, signing keys, release pipeline). Significant new
-   surface.
-3. **Stay on `alpine-base:latest`.** Smallest install, fastest boot,
-   keep the strict-xfail and the doctor warning. Today's behavior.
-4. **First-run local build using gondolin's existing pipeline.**
-   `gondolin build --config <hermes-bundled-config> --tag
-   hermes-runtime:<hermes-version>` runs on the user's host, pulls
-   Alpine packages from the upstream mirror, produces a versioned
-   local image. Zero Hermes-published artifacts; we own the package
-   list via a JSON file in the repo.
+1. **Stay on `alpine-base:latest`** with an actionable error and a
+   `hermes doctor` info line. Today's behavior at the start of the
+   branch. Honest but degraded.
+2. **Hermes-curated image** — bundle a pinned `hermes-runtime.json`
+   build spec, build it as `hermes-runtime:<hermes-version>` on first
+   use. Tight contents-control; but Hermes ends up owning a parallel
+   image catalog (its own naming scheme, its own GC, its own doctor
+   surface) that diverges from how every other backend handles images.
+3. **Plain OCI image string, same shape as docker.** Default to the
+   same image docker defaults to (`nikolaik/python-nodejs:python3.11-nodejs20`
+   fully-qualified for podman). On first use, materialize it via
+   gondolin's own OCI-rootfs build pipeline; cache by a deterministic
+   tag derived from the OCI name. User overrides via
+   `terminal.gondolin.image` work exactly like
+   `terminal.docker_image`.
 
-(4) was validated with real numbers on a clean WSL2 host (Ubuntu
-24.04.4, x86_64, gondolin 0.12.0):
-
-| Metric                | Value                                                                              |
-|-----------------------|------------------------------------------------------------------------------------|
-| Build wall-clock      | **9.19 s** (cold; Alpine mirror was warm)                                          |
-| Image size on disk    | **326 MB** (rootfs 289 MB + kernel 19 MB + krun 12 MB + initramfs 6 MB)            |
-| Total gondolin cache  | 789 MB (alpine-base + hermes-runtime)                                              |
-| Host packages needed  | `cpio`, `lz4` (both stock apt; absent by default on Ubuntu 24.04)                  |
-| In-VM toolchain proven| python 3.12.13, node 24, npm 11, uv 0.10, bash 5.3, curl 8.19, openssh             |
-
-Build pulls from `dl-cdn.alpinelinux.org` (Alpine packages) and
-`github.com/containers/libkrunfw/releases` (kernel). No host root
-required at build time (the build step that needs root — mkfs.ext4
-inside the chroot — runs via gondolin's own machinery, which on this
-host worked unprivileged). Image artifacts land under
-`~/.cache/gondolin/images/objects/<build-id>/` and are tagged in
-gondolin's own image store via `gondolin image tag` — Hermes does not
-own a parallel store.
-
-(4) won. It gives us option (2)'s contents-control without any of
-(2)'s infrastructure cost, and bypasses (1)'s upstream-cadence
-coupling.
+(3) won. It mirrors the docker UX exactly — same default, same
+override semantics, same "swap an image, swap an environment" mental
+model. Hermes carries no image catalog of its own. The cost is one
+synchronous build on first use (or in the wizard's pre-warm offer);
+the wizard surfaces this cost upfront.
 
 ### What Hermes ships
 
-- **`tools/environments/gondolin_host/hermes-runtime.json`** — pinned
-  build config. Alpine version, kernel package, package list, krunfw
-  version all hard-pinned. This file is the supply-chain spec; bumping
-  it is a deliberate Hermes-side change with its own commit and
-  changelog entry. Lives next to the daemon source for proximity.
-- **`hermes doctor` checks**:
-  1. host has `cpio` and `lz4` (the two non-standard apt deps the
-     build needs)
-  2. `gondolin image ls` includes a current
-     `hermes-runtime:<hermes-version>` tag
-  3. if either check fails, surface a one-line actionable fix (the
-     exact `sudo apt-get install …` command, or the exact `hermes
-     gondolin build` command)
-- **Default image resolution** in `tools/environments/gondolin.py`:
-  the daemon-side `config.image` defaults to
-  `hermes-runtime:<hermes-version>` (where `<hermes-version>` is read
-  from `hermes_cli.__version__`). If the user has explicitly set
-  `terminal.gondolin.image`, their value wins. If the
-  `hermes-runtime:<hermes-version>` tag isn't present at session
-  start, the environment falls back to `alpine-base:latest` with a
-  WARN-level log entry and `execute_code` keeps its existing
-  actionable error — no regression versus today.
+- **`hermes_cli/gondolin_image.py`** — thin glue: `ensure_built` maps
+  an OCI image string to a gondolin tag, runs `gondolin build` when
+  the tag is absent, returns the tag. `detect_oci_runtime` finds
+  podman or docker on `$PATH`; `missing_build_host_packages` checks
+  for `cpio`/`lz4`. No pinned config file — gondolin's own defaults
+  for the Alpine kernel + krunfw wrap the OCI rootfs.
+- **`tools/terminal_tool.py`** — `DEFAULT_GONDOLIN_IMAGE =
+  "docker.io/nikolaik/python-nodejs:python3.11-nodejs20"`. Same image
+  the docker backend defaults to, fully-qualified so podman's
+  short-name resolution doesn't fail. `_ensure_gondolin_image_built`
+  runs synchronously before `_GondolinEnvironment` construction.
+- **`hermes_cli/doctor.py`** — three-state check on the configured
+  image:
+  - **OK** when the gondolin tag is already in the local store, or
+    when the user pinned an absolute path to built assets
+  - **Fail** when neither podman nor docker is on `$PATH`, or when
+    `cpio`/`lz4` are missing (build can't run)
+  - **Info** when the image isn't cached but the build pipeline is
+    available (will build on first use; `hermes gondolin prebuild`
+    pre-warms)
+- **`hermes gondolin prebuild [--image NAME]`** — runs the build
+  ahead of time so the first session doesn't pay the cost.
+  Idempotent: if the gondolin tag is already in the store, no-op.
+- **Setup wizard** — offers to run `prebuild` when the user picks
+  gondolin as their backend; surfaces the time/size cost (`~2 min /
+  ~1.5 GB` for the nikolaik default) before doing anything.
 
-### Why version the tag with Hermes's version
+### Why a content-derived tag, not Hermes's version
 
-`hermes-runtime:0.14.0` rather than `hermes-runtime:latest`. Three
-reasons:
+`oci_image_tag` maps the OCI name into a safe gondolin tag
+deterministically:
 
-1. **Reproducibility.** Two users on Hermes 0.14.0 get identical
-   images. A user on 0.14.0 and a user on 0.15.0 may not — that's
-   intended, because the spec moved.
-2. **Upgrade detection.** When a user upgrades to a Hermes version
-   that changed the build spec, the existing `hermes-runtime:0.14.0`
-   tag is still present and still works for the old install. The new
-   install starts with no `hermes-runtime:0.15.0` tag and the doctor
-   prompts for a fresh build. No mid-flight image swap.
-3. **Garbage collection later.** `gondolin image ls` makes it trivial
-   for a future `hermes gondolin gc` command to delete old
-   `hermes-runtime:<old-version>` tags.
+- `nikolaik/python-nodejs:python3.11-nodejs20` →
+  `nikolaik_python-nodejs:python3.11-nodejs20`
+- `mcr.microsoft.com/devcontainers/universal:latest` →
+  `mcr.microsoft.com_devcontainers_universal:latest`
+
+Same OCI input → same gondolin tag forever. Two users on the same
+image get the same cache key regardless of Hermes version. A Hermes
+upgrade does not invalidate caches it didn't change. A user switching
+between two images keeps both cached separately. (A
+`hermes-runtime:<version>` scheme would have coupled image identity to
+Hermes's release cadence for no benefit — the image contents come from
+the OCI registry, not from Hermes.)
 
 ### First-run UX
 
 The build is a side-effect-bearing host operation (writes to
-`~/.cache/gondolin/`, ~330 MB on disk, ~10 s wall, network-dependent).
-Hermes does **not** run the build automatically — gondolin's contract
-is that the user opts in to running VMs on their host. Instead:
+`~/.cache/gondolin/`, image-size-dependent: ~1.5 GB / ~2 min for
+nikolaik; ~10 GB / ~6 min for `mcr.microsoft.com/devcontainers/universal`).
+Hermes does **not** run the build silently — it's surfaced in three
+places:
 
-- `hermes doctor` and the first gondolin VM boot detect the missing
-  tag and surface the one-line command:
-  ```
-  hermes-runtime:0.14.0 not built. Run:
-    hermes gondolin build
-  to build it (~10 s, ~330 MB local cache). Requires cpio + lz4.
-  ```
-- `hermes gondolin build` is a thin wrapper around
-  `gondolin build --config tools/environments/gondolin_host/hermes-runtime.json --tag hermes-runtime:<hermes-version>`.
-  Idempotent: rebuilding while the tag exists rebuilds. Failure modes
-  surface the upstream gondolin error verbatim — no swallowing.
+- **Wizard** (`hermes setup`): when gondolin is picked, the wizard
+  prompts for the OCI image (default = same as docker's), then offers
+  to run `prebuild` immediately with a time/size estimate.
+- **Doctor** (`hermes doctor`): info line when the image is missing
+  but buildable; failure line with the exact apt-get command when
+  build deps are missing.
+- **Session start**: if the image isn't cached and no prebuild has
+  happened, `_ensure_gondolin_image_built` runs the build
+  synchronously and surfaces gondolin's own output. The first session
+  pays the cost; subsequent sessions hit the cache.
 
 ### Network and security posture
 
-Both the Alpine mirror and libkrunfw GitHub release are HTTPS, both
-have integrity checks built into Alpine's package format and
-gondolin's manifest verification respectively. The build doesn't
-require Hermes-side signing — the supply chain is "Alpine package
-signatures + libkrunfw release signatures + a pinned spec in our
-repo." That is, deliberately, the same trust surface a Hermes user
-would have if they ran `gondolin build` themselves. We're not adding
-trust assumptions.
+The OCI image comes from the user's configured registry (default:
+Docker Hub). Hermes doesn't proxy or repackage — the build literally
+shells out to `podman pull` (or `docker pull`) and exports the rootfs.
+Alpine kernel + libkrunfw come from gondolin's own pinned sources.
+Trust surface is exactly what the user already trusts when running
+`docker pull <same image>`: the OCI registry's content addressing
+plus gondolin's bundled supply chain. We add no new signing
+infrastructure.
 
 ### What this closes
 
-- `test_execute_code_round_trip` flips from `xfail(strict=True)` to a
-  passing test (gated on a built `hermes-runtime` tag; falls back to
-  `xfail` if the tag isn't present, since CI may not have the host
-  packages).
-- The doctor's existing "default image lacks python3" info line is
-  replaced by the build-prompt line above.
+- `test_execute_code_round_trip` passes on gondolin — the default
+  image ships `python3` because it's the same one docker uses.
+- The doctor's "image not cached" info line replaces the previous
+  "default image lacks python3" warning.
 - `code_execution_tool`'s actionable error stays as a defensive
-  fallback for the case where someone explicitly sets
+  fallback for the case where someone explicitly pins
   `terminal.gondolin.image` to a python-less image.
 
 ### Phase 5+ ideas (not in this commit)
 
-- Optional pre-warm during `hermes setup` when the user picks gondolin
-  as their backend.
-- `hermes gondolin gc` to prune old `hermes-runtime:<old-version>`
-  tags.
-- Layer skill-specific tooling on demand: a skill that requires `gh`
-  declares it, and `hermes gondolin build` includes `github-cli` in
-  the package list. Out of scope for the upstream PR; tracked
-  separately.
+- `hermes gondolin gc` to prune unused gondolin tags after a
+  configurable retention window.
+- Optional skill-specific image hints: a skill declares it needs
+  `gh`; the wizard's default suggestion narrows to images that ship
+  it. Out of scope for the upstream PR; tracked separately.

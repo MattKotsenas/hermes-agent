@@ -62,7 +62,7 @@ class TestStatus:
 
     def test_status_shows_per_backend_breakdown(self, sandbox_root, capsys):
         _make_dir(sandbox_root, "docker/t1", size_kb=64)
-        _make_dir(sandbox_root, "gondolin-t2", size_kb=128)
+        _make_dir(sandbox_root, "gondolin/t2", size_kb=128)
         rc = cli.cmd_status(_ns())
         out = capsys.readouterr().out
         assert rc == 0
@@ -120,7 +120,7 @@ class TestPrune:
         assert "Deleted 1 sandbox" in out
 
     def test_prune_backend_filter(self, sandbox_root, capsys):
-        gd = _make_dir(sandbox_root, "gondolin-old", age_days=30)
+        gd = _make_dir(sandbox_root, "gondolin/old", age_days=30)
         dk = _make_dir(sandbox_root, "docker/old", age_days=30)
         rc = cli.cmd_prune(_ns(older_than=7, backend="gondolin"))
         out = capsys.readouterr().out

@@ -4,7 +4,9 @@ discovery and pruning of `~/.hermes/sandboxes/` per-task directories.
 The inventory module reasons over three known layouts:
 
   sandboxes/docker/<task_id>/            (per-task, persistent_filesystem)
-  sandboxes/gondolin-<task_id>/          (per-task, flat with dash)
+  sandboxes/gondolin/<task_id>/          (per-task, mirrors docker shape)
+  sandboxes/gondolin/.locks/             (host-wide flock slots — counted
+                                          but never pruned)
   sandboxes/singularity/                 (shared scratch — NOT per-task,
                                           counted but never pruned)
 
@@ -60,13 +62,26 @@ class TestScanLayouts:
         assert len(report.entries) == 2
         assert {e.task_id for e in report.entries} == {"task_A", "task_B"}
 
-    def test_classifies_gondolin_dash_prefix(self, sandbox_root):
-        _make_dir(sandbox_root, "gondolin-abc123")
-        _make_dir(sandbox_root, "gondolin-def456")
+    def test_classifies_gondolin_subdirs(self, sandbox_root):
+        _make_dir(sandbox_root, "gondolin/abc123")
+        _make_dir(sandbox_root, "gondolin/def456")
         report = inv.scan(sandbox_root)
         backends = {e.backend for e in report.entries}
         assert backends == {"gondolin"}
         assert {e.task_id for e in report.entries} == {"abc123", "def456"}
+
+    def test_gondolin_locks_dir_counted_but_not_prunable(self, sandbox_root):
+        # gondolin/.locks/ holds host-wide flock slot files. It shows up
+        # in the inventory so a curious user sees it, but it's never
+        # picked for pruning.
+        _make_dir(sandbox_root, "gondolin/.locks")
+        _make_dir(sandbox_root, "gondolin/task1")
+        report = inv.scan(sandbox_root)
+        locks = [e for e in report.entries if e.backend == "gondolin" and e.task_id is None]
+        assert len(locks) == 1
+        assert locks[0].prunable is False
+        tasks = [e for e in report.entries if e.backend == "gondolin" and e.task_id is not None]
+        assert [e.task_id for e in tasks] == ["task1"]
 
     def test_singularity_is_shared_scratch_not_per_task(self, sandbox_root):
         # singularity/ itself is a shared dir, not a per-task one.
@@ -88,7 +103,7 @@ class TestScanLayouts:
 
     def test_mixed_layout_full_report(self, sandbox_root):
         _make_dir(sandbox_root, "docker/t1")
-        _make_dir(sandbox_root, "gondolin-t2")
+        _make_dir(sandbox_root, "gondolin/t2")
         _make_dir(sandbox_root, "singularity/cache")
         _make_dir(sandbox_root, "weird_thing")
         report = inv.scan(sandbox_root)
@@ -121,7 +136,7 @@ class TestAgeFiltering:
 
     def test_age_filter_backend_restriction(self, sandbox_root):
         _make_dir(sandbox_root, "docker/old", age_days=30)
-        _make_dir(sandbox_root, "gondolin-old", age_days=30)
+        _make_dir(sandbox_root, "gondolin/old", age_days=30)
         stale = inv.select_stale(
             inv.scan(sandbox_root), older_than_days=7, backends={"gondolin"}
         )
@@ -161,7 +176,7 @@ class TestPrune:
 class TestSummary:
     def test_human_summary_includes_counts_and_bytes(self, sandbox_root):
         _make_dir(sandbox_root, "docker/t1", size_kb=100)
-        _make_dir(sandbox_root, "gondolin-t2", size_kb=200)
+        _make_dir(sandbox_root, "gondolin/t2", size_kb=200)
         report = inv.scan(sandbox_root)
         summary = inv.human_summary(report)
         assert "docker" in summary

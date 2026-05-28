@@ -49,11 +49,12 @@ def _ensure_msgpack() -> None:
     The gondolin wire format is length-prefixed msgpack between the Python
     wrapper and the Node daemon. msgpack is declared as the
     `terminal.gondolin` extra in `pyproject.toml` and `tools/lazy_deps.py`,
-    so users who never select the gondolin backend never pay for it. On
-    first GondolinEnvironment use we route the install through the normal
-    lazy-install policy (venv-scoped, allowlisted, respects
-    `security.allow_lazy_installs`). Mirrors the modal/daytona/vercel
-    backends.
+    so users who never select the gondolin backend never pay for it. We
+    call this once per process from `_load_msgpack` below — the actual
+    import happens lazily on first GondolinEnvironment instantiation,
+    NOT at module import time. Importing this module (e.g. for
+    introspection, doctor probes, or sandbox-inventory's classifier)
+    must not trigger a pip install.
     """
     try:
         from tools.lazy_deps import ensure as _lazy_ensure
@@ -66,8 +67,21 @@ def _ensure_msgpack() -> None:
         raise ImportError(str(e))
 
 
-_ensure_msgpack()
-import msgpack  # noqa: E402  — must follow _ensure_msgpack() above
+# Module-level msgpack handle, populated by _load_msgpack on first call.
+# None until somebody actually constructs a GondolinEnvironment (or calls
+# _rpc_call directly), so simply importing this module — e.g. from doctor
+# or sandbox-inventory — never triggers the lazy-install machinery.
+_msgpack = None
+
+
+def _load_msgpack():
+    """Return the msgpack module, lazy-installing on first call."""
+    global _msgpack
+    if _msgpack is None:
+        _ensure_msgpack()
+        import msgpack as _m  # noqa: E402 — must follow _ensure_msgpack()
+        _msgpack = _m
+    return _msgpack
 
 # Location of the Node daemon source file relative to this module.
 _HERE = Path(__file__).resolve().parent
@@ -239,6 +253,7 @@ def _rpc_call(sock_path: str, request: dict[str, Any], timeout: float = 30.0) ->
     """
     s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     s.settimeout(timeout)
+    msgpack = _load_msgpack()
     try:
         s.connect(sock_path)
         payload: bytes = msgpack.packb(request, use_bin_type=True)  # type: ignore[assignment]

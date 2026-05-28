@@ -201,6 +201,13 @@ test("daemon: socket transport, multiple connections, shared VM state", async (t
 });
 
 test("daemon: concurrent execs are not serialized (steady-state dispatch)", async (t) => {
+  // This is the canonical regression test for the daemon's dispatcher
+  // concurrency model (see HANDLER_CONCURRENCY in daemon.mjs). It lives
+  // here rather than in daemon.integration.test.mjs because it doesn't
+  // need a real KVM-backed VM — the stubbed VM is enough to exercise
+  // the dispatch layer, and gating on /dev/kvm would mean CI without
+  // hardware accel runs no coverage of the concurrency contract.
+  //
   // Regression: an earlier daemon implementation chained ALL dispatch
   // (including exec) through a single promise chain on the rationale
   // that "the VM is single-threaded." That was wrong — the underlying

@@ -55,17 +55,6 @@ logger = logging.getLogger(__name__)
 BUILD_HOST_PACKAGES: tuple[str, ...] = ("cpio", "lz4")
 
 
-#: Default kernel package and image gondolin uses to wrap an OCI rootfs.
-#:
-#: Gondolin still needs an Alpine-built kernel + initramfs even when the
-#: rootfs is sourced from OCI. These values match
-#: gondolin/src/build/init-config.ts defaults.
-_DEFAULT_ALPINE_VERSION = "3.23.0"
-_DEFAULT_KERNEL_PACKAGE = "linux-virt"
-_DEFAULT_KERNEL_IMAGE = "vmlinuz-virt"
-_DEFAULT_KRUNFW_VERSION = "v5.2.1"
-
-
 def missing_build_host_packages() -> List[str]:
     """Return the subset of :data:`BUILD_HOST_PACKAGES` not on ``$PATH``."""
     return [p for p in BUILD_HOST_PACKAGES if shutil.which(p) is None]
@@ -178,7 +167,10 @@ def _build_config_for_oci(oci_image: str, runtime: str) -> dict:
     """Construct a gondolin build config that wraps an OCI image as rootfs.
 
     See gondolin/docs/custom-images.md § OCI Support for the schema.
-    Kernel + initramfs come from Alpine; rootfs comes from OCI.
+    Kernel + initramfs come from gondolin's own Alpine defaults — we
+    deliberately don't pin alpine/kernel/krunfw versions Hermes-side so
+    a gondolin upgrade picks up newer defaults without a parallel
+    Hermes release.
     """
     return {
         "arch": "x86_64",
@@ -186,12 +178,6 @@ def _build_config_for_oci(oci_image: str, runtime: str) -> dict:
         "oci": {
             "image": oci_image,
             "runtime": runtime,
-        },
-        "alpine": {
-            "version": _DEFAULT_ALPINE_VERSION,
-            "kernelPackage": _DEFAULT_KERNEL_PACKAGE,
-            "kernelImage": _DEFAULT_KERNEL_IMAGE,
-            "krunfwVersion": _DEFAULT_KRUNFW_VERSION,
         },
         "rootfs": {
             "label": "gondolin-root",

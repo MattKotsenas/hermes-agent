@@ -1333,7 +1333,7 @@ def _create_environment(env_type: str, image: str, cwd: str, timeout: int,
             # Default: per-task sandbox under HERMES_HOME so subagents /
             # parallel sessions never collide on the daemon socket path.
             from hermes_constants import get_hermes_home
-            sandbox_dir = str(get_hermes_home() / "sandboxes" / f"gondolin-{task_id}")
+            sandbox_dir = str(get_hermes_home() / "sandboxes" / "gondolin" / task_id)
         # config dict forwarded to the daemon's init RPC. Keep only the
         # keys the daemon understands; anything else stays out of the
         # JSON-RPC payload.
@@ -1351,12 +1351,43 @@ def _create_environment(env_type: str, image: str, cwd: str, timeout: int,
         # offers to pre-warm so the first session isn't the one that
         # waits.
         daemon_config["image"] = _ensure_gondolin_image_built(gc.get("image"))
-        # Per-VM resource caps. Forward only when explicitly configured so
-        # Gondolin's defaults (1G / 2 cpus) apply otherwise.
-        if gc.get("memory"):
-            daemon_config["memory"] = gc["memory"]
-        if gc.get("cpus") is not None:
-            daemon_config["cpus"] = int(gc["cpus"])
+        # Per-VM resource caps. Two layers:
+        # 1. Shared `terminal.container_memory` (int MB) and
+        #    `terminal.container_cpu` (float cores) — same knobs the
+        #    docker/singularity/modal/daytona backends use. Default 5120
+        #    MB / 1 cpu. Translated below into gondolin's native shapes
+        #    ("1G" string + integer cpus) so a user switching backends
+        #    doesn't relearn the schema.
+        # 2. `terminal.gondolin.memory` / `terminal.gondolin.cpus`
+        #    overrides — power users who want gondolin-native formats
+        #    (e.g. fractional GB strings the shared knob can't express).
+        #    Wins over (1) when set.
+        gondolin_mem = gc.get("memory")
+        if not gondolin_mem:
+            cc = container_config or {}
+            container_mem_mb = cc.get("container_memory")
+            if container_mem_mb is not None:
+                try:
+                    gondolin_mem = f"{int(container_mem_mb)}M"
+                except (TypeError, ValueError):
+                    gondolin_mem = None
+        if gondolin_mem:
+            daemon_config["memory"] = gondolin_mem
+
+        gondolin_cpus = gc.get("cpus")
+        if gondolin_cpus is None:
+            cc = container_config or {}
+            container_cpu = cc.get("container_cpu")
+            if container_cpu is not None:
+                try:
+                    # Gondolin's cpus knob is an integer; round 1.5 → 2
+                    # so users who set container_cpu=1.5 for docker get a
+                    # sensible VM cap (vs. silently failing the int cast).
+                    gondolin_cpus = max(1, round(float(container_cpu)))
+                except (TypeError, ValueError):
+                    gondolin_cpus = None
+        if gondolin_cpus is not None:
+            daemon_config["cpus"] = int(gondolin_cpus)
         # Host-wide concurrency knobs. lock_dir defaults to a shared dir
         # under HERMES_HOME so the cap is enforced across the CLI,
         # subagents, the gateway, and cron jobs by default — no extra
@@ -1939,7 +1970,7 @@ def terminal_tool(
                             }
 
                         container_config = None
-                        if env_type in {"docker", "singularity", "modal", "daytona", "vercel_sandbox"}:
+                        if env_type in {"docker", "singularity", "modal", "daytona", "vercel_sandbox", "gondolin"}:
                             container_config = {
                                 "container_cpu": config.get("container_cpu", 1),
                                 "container_memory": config.get("container_memory", 5120),

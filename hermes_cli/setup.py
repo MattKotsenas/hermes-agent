@@ -1508,28 +1508,15 @@ def _setup_gondolin_backend(config: dict):
             "packages above, then run: hermes gondolin prebuild"
         )
 
-    # 5. VM resource caps (optional; null = gondolin defaults)
-    print()
-    print_info("VM resource caps (leave blank to use gondolin defaults: 1G/2 cpus):")
-
-    current_mem = gondolin_cfg.get("memory") or ""
-    mem = prompt("  Memory per VM (e.g. 1G, 512M)", current_mem)
-    if mem.strip():
-        gondolin_cfg["memory"] = mem.strip()
-        save_env_value("TERMINAL_GONDOLIN_MEMORY", mem.strip())
-    elif "memory" in gondolin_cfg:
-        gondolin_cfg.pop("memory", None)
-
-    current_cpus = str(gondolin_cfg.get("cpus", "")) if gondolin_cfg.get("cpus") else ""
-    cpus = prompt("  CPUs per VM (integer)", current_cpus)
-    if cpus.strip():
-        try:
-            gondolin_cfg["cpus"] = int(cpus.strip())
-            save_env_value("TERMINAL_GONDOLIN_CPUS", cpus.strip())
-        except ValueError:
-            print_warning(f"  Ignored non-integer cpus value: {cpus!r}")
-    elif "cpus" in gondolin_cfg:
-        gondolin_cfg.pop("cpus", None)
+    # 5. VM resource caps. Reuses the shared prompt so a user switching
+    #    between docker/singularity/gondolin sees the same questions and
+    #    config keys (terminal.container_memory MB, terminal.container_cpu
+    #    cores). gondolin translates these into its own native shapes
+    #    ("5120M", integer cpus) at backend construction time. Power users
+    #    who want gondolin-native overrides (e.g. fractional-GB strings)
+    #    can set terminal.gondolin.memory and terminal.gondolin.cpus by
+    #    hand in the YAML — those win over the shared knobs.
+    _prompt_container_resources(config)
 
 
 def setup_terminal_backend(config: dict):
