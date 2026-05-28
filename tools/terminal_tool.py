@@ -1021,6 +1021,7 @@ _GONDOLIN_SECRET_ALLOWED_KEYS = frozenset({
     "placeholder",
     "refresh",
     "refresh_command",
+    "timeout_ms",
     "ttl_seconds",
     "refresh_before_expiry_seconds",
 })
@@ -1183,7 +1184,19 @@ def _validate_gondolin_secrets(secrets):
                         f"gondolin secret {name!r}: 'env[{ek}]' must be a "
                         f"string (got {type(ev).__name__})"
                     )
-        for int_key in ("ttl_seconds", "refresh_before_expiry_seconds"):
+        if "timeout_ms" in cfg:
+            # Per-secret resolver timeout, read by hooks.mjs:103 for
+            # from_command execSync. Like env:, it's only meaningful when
+            # there's a subprocess to time out — silently accepting it on
+            # value:/from_env: would give the user no signal their knob
+            # was dropped.
+            if "from_command" not in cfg:
+                raise ValueError(
+                    f"gondolin secret {name!r}: 'timeout_ms' is only valid with "
+                    f"'from_command' (got source {sources!r}). value/from_env "
+                    f"resolve in-process with no timeout to apply."
+                )
+        for int_key in ("timeout_ms", "ttl_seconds", "refresh_before_expiry_seconds"):
             if int_key in cfg:
                 v = cfg[int_key]
                 # bool is a subclass of int — explicitly reject it.

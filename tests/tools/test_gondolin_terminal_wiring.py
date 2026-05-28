@@ -807,3 +807,51 @@ def test_secrets_validator_rejects_env_empty_key(monkeypatch):
         {"X": {"hosts": ["a"], "from_command": "echo y", "env": {"": "value"}}},
         fragment="'env' keys must be non-empty strings",
     )
+
+
+def test_secrets_validator_accepts_timeout_ms(monkeypatch):
+    """timeout_ms is a real hooks.mjs knob (per-secret execSync timeout
+    for from_command). Validator must accept it — pre-B5, a working YAML
+    with timeout_ms: 5000 was rejected as 'unknown key' even though the
+    daemon would have honored it."""
+    from tools.terminal_tool import _get_env_config
+
+    _set_secrets(
+        monkeypatch,
+        {"TOK": {"hosts": ["a"], "from_command": "op read x", "timeout_ms": 5000}},
+    )
+    cfg = _get_env_config()
+    assert cfg["gondolin"]["secrets"]["TOK"]["timeout_ms"] == 5000
+
+
+def test_secrets_validator_rejects_timeout_ms_with_non_from_command_source(monkeypatch):
+    """Same shape as env: timeout_ms only makes sense when there's a
+    subprocess to time out. value:/from_env: resolve in-process."""
+    _assert_invalid(
+        monkeypatch,
+        {"X": {"hosts": ["a"], "from_env": "X", "timeout_ms": 5000}},
+        fragment="'timeout_ms' is only valid with 'from_command'",
+    )
+    _assert_invalid(
+        monkeypatch,
+        {"X": {"hosts": ["a"], "value": "literal", "timeout_ms": 5000}},
+        fragment="'timeout_ms' is only valid with 'from_command'",
+    )
+
+
+def test_secrets_validator_rejects_timeout_ms_not_positive_int(monkeypatch):
+    _assert_invalid(
+        monkeypatch,
+        {"X": {"hosts": ["a"], "from_command": "echo y", "timeout_ms": 0}},
+        fragment="'timeout_ms' must be a positive integer",
+    )
+    _assert_invalid(
+        monkeypatch,
+        {"X": {"hosts": ["a"], "from_command": "echo y", "timeout_ms": -100}},
+        fragment="'timeout_ms' must be a positive integer",
+    )
+    _assert_invalid(
+        monkeypatch,
+        {"X": {"hosts": ["a"], "from_command": "echo y", "timeout_ms": True}},
+        fragment="'timeout_ms' must be a positive integer",
+    )
