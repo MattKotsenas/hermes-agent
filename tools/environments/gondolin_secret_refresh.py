@@ -39,6 +39,7 @@ import base64
 import binascii
 import json
 import logging
+import os
 import subprocess
 import threading
 import time
@@ -297,7 +298,16 @@ class SecretRefresher:
         logger.info("gondolin secret %s refreshed; next at %s", state.name, state.next_refresh_at)
 
     def _schedule_retry(self, state: _SecretState, reason: str, *, stderr: str) -> None:
-        stderr_tail = stderr.strip()[-500:] if stderr else ""
+        # SECURITY: captured stderr from a failing refresh_command can
+        # contain partial secrets — a token half-written before the helper
+        # crashed, a JWT echoed in a verbose error, the raw response body
+        # from a misconfigured auth endpoint. The WARN log line flows to
+        # errors.log + `hermes doctor` + `gondolin_log_scan`; neither is
+        # the right place for secret tails. Default behavior omits stderr.
+        # Set HERMES_GONDOLIN_DEBUG_SECRETS=1 to opt in when debugging a
+        # broken refresh script.
+        debug_capture = os.environ.get("HERMES_GONDOLIN_DEBUG_SECRETS") == "1"
+        stderr_tail = stderr.strip()[-500:] if (debug_capture and stderr) else ""
         extra = f" stderr={stderr_tail!r}" if stderr_tail else ""
         logger.warning(
             "gondolin secret %s refresh failed: %s%s — retrying",

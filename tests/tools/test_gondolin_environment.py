@@ -484,10 +484,13 @@ def test_concurrent_vm_cap_config_knob_overrides_module_default(tmp_path, monkey
 # and `hermes doctor` shows it.
 
 @requires_node
-def test_secret_diagnostics_captured_from_init(tmp_path, caplog):
+def test_secret_diagnostics_captured_from_init(tmp_path, caplog, monkeypatch):
     """A from_command that exits non-zero shows up on env.secret_diagnostics
-    with stderr captured, and is logged at WARNING."""
+    and is logged at WARNING. SECURITY: stderr/stdout captured from the
+    failing helper are NOT included by default (they can contain partial
+    secrets); opt in via HERMES_GONDOLIN_DEBUG_SECRETS=1 (see next test)."""
     import logging as _logging
+    monkeypatch.delenv("HERMES_GONDOLIN_DEBUG_SECRETS", raising=False)
 
     env = GondolinEnvironment(
         sandbox_dir=str(tmp_path / "diag"),
@@ -496,7 +499,7 @@ def test_secret_diagnostics_captured_from_init(tmp_path, caplog):
             "secrets": {
                 "AAD_TOKEN": {
                     "hosts": ["login.microsoftonline.com"],
-                    "from_command": "sh -c 'echo broken-creds >&2; exit 3'",
+                    "from_command": "sh -c 'echo broken-creds-leak-marker >&2; exit 3'",
                 },
             },
         },
@@ -507,13 +510,56 @@ def test_secret_diagnostics_captured_from_init(tmp_path, caplog):
         assert d["name"] == "AAD_TOKEN"
         assert d["type"] == "from_command"
         assert "3" in d["error"]
-        assert "broken-creds" in d.get("stderr", "")
+        # Default behavior: stderr/stdout NOT captured into the diagnostic.
+        assert "stderr" not in d, (
+            f"stderr leaked into diagnostic without debug opt-in: {d!r}"
+        )
+        assert "stdout" not in d, (
+            f"stdout leaked into diagnostic without debug opt-in: {d!r}"
+        )
 
-        # And it was logged at WARNING.
+        # And it was logged at WARNING, but the leak marker is NOT in the log.
         warnings = [r for r in caplog.records if r.levelno >= _logging.WARNING]
         assert any("AAD_TOKEN" in r.getMessage() for r in warnings), (
             f"expected WARNING log mentioning AAD_TOKEN, got {[r.getMessage() for r in warnings]}"
         )
+        for r in warnings:
+            assert "broken-creds-leak-marker" not in r.getMessage(), (
+                f"stderr leaked into errors.log via WARN: {r.getMessage()!r}"
+            )
+    finally:
+        env.cleanup()
+
+
+@requires_node
+def test_secret_diagnostics_capture_stderr_with_debug_env(tmp_path, caplog, monkeypatch):
+    """When HERMES_GONDOLIN_DEBUG_SECRETS=1, the failing-helper stderr lands
+    in the diagnostic and the WARN log so operators can debug a broken
+    refresh script. Host-side env var only."""
+    import logging as _logging
+    monkeypatch.setenv("HERMES_GONDOLIN_DEBUG_SECRETS", "1")
+
+    env = GondolinEnvironment(
+        sandbox_dir=str(tmp_path / "diag-debug"),
+        stub_vm=True,
+        config={
+            "secrets": {
+                "AAD_TOKEN": {
+                    "hosts": ["login.microsoftonline.com"],
+                    "from_command": "sh -c 'echo broken-creds-debug-marker >&2; exit 3'",
+                },
+            },
+        },
+    )
+    try:
+        assert len(env.secret_diagnostics) == 1
+        d = env.secret_diagnostics[0]
+        assert "broken-creds-debug-marker" in d.get("stderr", "")
+
+        warnings = [r for r in caplog.records if r.levelno >= _logging.WARNING]
+        assert any(
+            "broken-creds-debug-marker" in r.getMessage() for r in warnings
+        ), f"expected debug-mode stderr in WARN log, got {[r.getMessage() for r in warnings]}"
     finally:
         env.cleanup()
 

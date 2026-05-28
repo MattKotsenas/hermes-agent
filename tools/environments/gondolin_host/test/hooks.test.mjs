@@ -259,7 +259,13 @@ test("buildHooksInput: returns empty diagnostics when nothing fails", () => {
   assert.deepEqual(input.secretDiagnostics, []);
 });
 
-test("buildHooksInput: from_command failure captures stderr + exit code", () => {
+test("buildHooksInput: from_command failure captures exit code without leaking stderr", () => {
+  // SECURITY: stderr and stdout may contain partial secrets (a token half-
+  // written before the auth helper crashed, a JWT echoed in a verbose
+  // failure message). Default behavior must NOT include them in the
+  // diagnostic, which flows to errors.log + `hermes doctor` + the agent's
+  // visible log scan. Opt-in via HERMES_GONDOLIN_DEBUG_SECRETS=1 below.
+  delete process.env.HERMES_GONDOLIN_DEBUG_SECRETS;
   const input = buildHooksInput({
     secrets: {
       AAD: {
@@ -276,7 +282,34 @@ test("buildHooksInput: from_command failure captures stderr + exit code", () => 
   assert.equal(d.name, "AAD");
   assert.equal(d.type, "from_command");
   assert.match(d.error, /exit code 7|status 7|exited with code 7/);
-  assert.match(d.stderr, /something-broke/);
+  // stderr/stdout are NOT in the diagnostic by default.
+  assert.equal(d.stderr, undefined, "stderr must not leak into diagnostic by default");
+  assert.equal(d.stdout, undefined, "stdout must not leak into diagnostic by default");
+});
+
+test("buildHooksInput: HERMES_GONDOLIN_DEBUG_SECRETS=1 opts into stderr/stdout capture", () => {
+  // Operators debugging a broken refresh script can opt in. The env var is
+  // host-side only (not propagated to the guest), and the docstring on the
+  // diagnostic-emitting path warns about secret exposure.
+  process.env.HERMES_GONDOLIN_DEBUG_SECRETS = "1";
+  try {
+    const input = buildHooksInput({
+      secrets: {
+        AAD: {
+          hosts: ["login.microsoftonline.com"],
+          from_command: "sh -c 'echo something-broke >&2; exit 7'",
+        },
+      },
+    });
+    assert.equal(input.secretDiagnostics.length, 1);
+    const d = input.secretDiagnostics[0];
+    assert.match(d.stderr, /something-broke/);
+    // stdout key present (empty string ok), so consumers can rely on its
+    // presence when debug mode is on.
+    assert.equal(typeof d.stdout, "string");
+  } finally {
+    delete process.env.HERMES_GONDOLIN_DEBUG_SECRETS;
+  }
 });
 
 test("buildHooksInput: from_env unset captures the var name", () => {

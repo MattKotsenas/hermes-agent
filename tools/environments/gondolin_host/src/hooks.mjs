@@ -55,6 +55,14 @@ export function resolveSecretWithDiagnostics(name, cfg) {
     const timeoutMs = typeof cfg.timeout_ms === "number" && cfg.timeout_ms > 0
       ? cfg.timeout_ms
       : 30_000;
+    // SECURITY: captured stderr/stdout from a failing resolver may contain
+    // partial secrets — a token half-written before exit, a JWT echoed in
+    // a verbose error, the raw response body from a misconfigured auth
+    // endpoint. They DO NOT enter the diagnostic by default. Set
+    // HERMES_GONDOLIN_DEBUG_SECRETS=1 to opt in when debugging a broken
+    // resolver. The flag is host-side only and never propagated to the
+    // guest.
+    const debugCapture = process.env.HERMES_GONDOLIN_DEBUG_SECRETS === "1";
     let stdout;
     try {
       stdout = execSync(cfg.from_command, {
@@ -76,29 +84,29 @@ export function resolveSecretWithDiagnostics(name, cfg) {
       } else {
         msg = `command failed: ${err.message}`;
       }
-      return {
-        value: null,
-        diagnostic: {
-          name,
-          type: "from_command",
-          error: msg,
-          stderr,
-          stdout: out,
-        },
+      const diagnostic = {
+        name,
+        type: "from_command",
+        error: msg,
       };
+      if (debugCapture) {
+        diagnostic.stderr = stderr;
+        diagnostic.stdout = out;
+      }
+      return { value: null, diagnostic };
     }
     const trimmed = stdout.trim();
     if (trimmed === "") {
-      return {
-        value: null,
-        diagnostic: {
-          name,
-          type: "from_command",
-          error: "command exited 0 but produced empty output",
-          stderr: "",
-          stdout: "",
-        },
+      const diagnostic = {
+        name,
+        type: "from_command",
+        error: "command exited 0 but produced empty output",
       };
+      if (debugCapture) {
+        diagnostic.stderr = "";
+        diagnostic.stdout = "";
+      }
+      return { value: null, diagnostic };
     }
     return { value: trimmed, diagnostic: null };
   }

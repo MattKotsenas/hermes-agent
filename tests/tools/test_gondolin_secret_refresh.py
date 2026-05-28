@@ -187,6 +187,114 @@ def test_refresher_runs_refresh_command_and_pushes_value():
         refresher.stop()
 
 
+def test_refresher_does_not_leak_stderr_in_warn_log_by_default(caplog, monkeypatch):
+    """SECURITY: a refresh_command can write secret material to stderr
+    (a partial token, an OAuth response body, a JWT echoed in a verbose
+    error). The WARN log line that surfaces refresh failures must NOT
+    include captured stderr by default — it lands in errors.log and the
+    doctor surface, which are not where secret tails belong.
+
+    Opt-in via HERMES_GONDOLIN_DEBUG_SECRETS=1 (verified by the next test).
+    """
+    monkeypatch.delenv("HERMES_GONDOLIN_DEBUG_SECRETS", raising=False)
+    clock = _FakeClock(start=1_000_000.0)
+    push_event = threading.Event()
+    attempts = {"n": 0}
+    leaked = "eyJhbGciOiJub25lIn0.PARTIAL-TOKEN-LEAK"
+
+    def fake_set_secret(name, *, value):
+        push_event.set()
+
+    def fake_run_command(cmd):
+        attempts["n"] += 1
+        if attempts["n"] < 2:
+            return (1, "", leaked)
+        return (0, "ok-token", "")
+
+    refresher = SecretRefresher(
+        env_set_secret=fake_set_secret,
+        time_source=clock.now,
+        sleep_fn=clock.sleep,
+        run_command=fake_run_command,
+    )
+    refresher.add_secret(
+        name="AAD_TOKEN",
+        refresh_command="auth-script",
+        ttl_seconds=3600,
+        refresh_before_expiry_seconds=300,
+        initial_value="initial",
+    )
+    refresher.start()
+    try:
+        import logging
+        with caplog.at_level(logging.WARNING, logger="tools.environments.gondolin_secret_refresh"):
+            clock.advance(3301)
+            time.sleep(0.05)
+            clock.advance(11)
+            assert push_event.wait(timeout=5.0)
+    finally:
+        refresher.stop()
+
+    warn_lines = [r.getMessage() for r in caplog.records if r.levelno >= 30]
+    assert any("refresh failed" in line for line in warn_lines), warn_lines
+    for line in warn_lines:
+        assert leaked not in line, (
+            f"stderr leaked into WARN log: {line!r}"
+        )
+        assert "stderr=" not in line, (
+            f"stderr= key present without opt-in: {line!r}"
+        )
+
+
+def test_refresher_opts_into_stderr_capture_with_debug_env(caplog, monkeypatch):
+    """When HERMES_GONDOLIN_DEBUG_SECRETS=1, the WARN log includes the
+    stderr tail so operators debugging a broken refresh script can see what
+    the helper actually emitted. The env var is host-side only; the daemon
+    never propagates it to the guest."""
+    monkeypatch.setenv("HERMES_GONDOLIN_DEBUG_SECRETS", "1")
+    clock = _FakeClock(start=1_000_000.0)
+    push_event = threading.Event()
+    attempts = {"n": 0}
+
+    def fake_set_secret(name, *, value):
+        push_event.set()
+
+    def fake_run_command(cmd):
+        attempts["n"] += 1
+        if attempts["n"] < 2:
+            return (1, "", "specific-debug-marker-XYZ")
+        return (0, "ok-token", "")
+
+    refresher = SecretRefresher(
+        env_set_secret=fake_set_secret,
+        time_source=clock.now,
+        sleep_fn=clock.sleep,
+        run_command=fake_run_command,
+    )
+    refresher.add_secret(
+        name="AAD_TOKEN",
+        refresh_command="auth-script",
+        ttl_seconds=3600,
+        refresh_before_expiry_seconds=300,
+        initial_value="initial",
+    )
+    refresher.start()
+    try:
+        import logging
+        with caplog.at_level(logging.WARNING, logger="tools.environments.gondolin_secret_refresh"):
+            clock.advance(3301)
+            time.sleep(0.05)
+            clock.advance(11)
+            assert push_event.wait(timeout=5.0)
+    finally:
+        refresher.stop()
+
+    warn_lines = [r.getMessage() for r in caplog.records if r.levelno >= 30]
+    assert any("specific-debug-marker-XYZ" in line for line in warn_lines), (
+        f"opt-in stderr capture missing from WARN log: {warn_lines}"
+    )
+
+
 def test_refresher_handles_command_failure_with_warn_and_retry():
     """A failing refresh_command does NOT crash the loop and does NOT push
     a bad value. The error is logged WARN and the refresher retries with
