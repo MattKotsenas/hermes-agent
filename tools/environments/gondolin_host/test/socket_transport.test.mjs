@@ -988,3 +988,134 @@ test("daemon: exec_stream falls back to a single chunk for non-STREAM stub comma
   assert.match(Buffer.from(streamFrames[0].data).toString("utf8"), /echo hello/);
   assert.equal(final.result.exit_code, 0);
 });
+
+
+// B14 helpers — rpcCall variants that surface socket close as a distinct
+// outcome (instead of waiting until timeout) so the test can tell the
+// difference between "daemon answered cleanly" and "daemon killed the
+// connection mid-flight."
+function rpcCallObservingClose(sockPath, request, { timeoutMs = 5000 } = {}) {
+  return new Promise((resolve, reject) => {
+    const sock = net.createConnection(sockPath);
+    let buf = Buffer.alloc(0);
+    let resolved = false;
+    const timer = setTimeout(() => {
+      if (resolved) return;
+      resolved = true;
+      sock.destroy();
+      reject(new Error(`rpc timeout after ${timeoutMs}ms`));
+    }, timeoutMs);
+    sock.on("data", (chunk) => {
+      buf = Buffer.concat([buf, chunk]);
+      const { frames, rest } = drainFrames(buf);
+      buf = rest;
+      if (frames.length > 0 && !resolved) {
+        resolved = true;
+        clearTimeout(timer);
+        sock.end();
+        resolve({ kind: "frame", frame: frames[0] });
+      }
+    });
+    sock.on("close", () => {
+      if (resolved) return;
+      resolved = true;
+      clearTimeout(timer);
+      // No frame arrived before close — this is the B14 bug shape.
+      resolve({ kind: "closed_without_frame" });
+    });
+    sock.on("error", (err) => {
+      if (resolved) return;
+      // ECONNRESET / EPIPE on a daemon process.exit mid-request shows up
+      // here. Treat it the same as a close without frame.
+      resolved = true;
+      clearTimeout(timer);
+      resolve({ kind: "closed_without_frame", error: err.code });
+    });
+    sock.on("connect", () => {
+      sock.write(encodeFrame(request));
+    });
+  });
+}
+
+
+test("daemon: shutdown waits for in-flight steady-state RPCs on other connections (B14)", async (t) => {
+  // The bug: dispatch() classifies exec/exec_stream as STEADY, which
+  // means they wait for lifecycleChain to settle but DON'T register
+  // themselves on it. shutdown() (LIFECYCLE) checks lifecycleChain,
+  // sees it's resolved, and immediately calls process.exit(0) — even
+  // if other connections still have exec calls in flight. Those
+  // callers see the socket die mid-request and have to interpret the
+  // close as an opaque transport error.
+  //
+  // Reproduction: connection A fires a 1s SLEEP exec; ~50ms later
+  // connection B fires shutdown. Without the fix, A's rpcCall sees
+  // the socket close with no response (kind: "closed_without_frame")
+  // and exits early. With the fix, A's rpcCall gets a proper exec
+  // result frame back before the daemon dies.
+  const tmp = mkdtempSync(path.join(os.tmpdir(), "gondolin-b14-test-"));
+  const sockPath = path.join(tmp, "d.sock");
+  const proc = spawn("node", [DAEMON, "--socket", sockPath], {
+    stdio: ["ignore", "ignore", "pipe"],
+    env: {
+      ...process.env,
+      GONDOLIN_DAEMON_QUIET: "1",
+      GONDOLIN_DAEMON_STUB_VM: "1",
+    },
+  });
+  proc.stderr.on("data", () => {});
+  t.after(async () => {
+    try { proc.kill("SIGTERM"); } catch {}
+    await new Promise((r) => {
+      if (proc.exitCode != null) return r();
+      proc.once("exit", r);
+      setTimeout(r, 2000);
+    });
+    rmSync(tmp, { recursive: true, force: true });
+  });
+
+  await waitForSocket(sockPath);
+  const init = await rpcCallObservingClose(sockPath, {
+    id: 1, method: "init", params: { config: {} },
+  });
+  assert.equal(init.kind, "frame", `init failed: ${JSON.stringify(init)}`);
+
+  // Connection A: a slow exec that takes ~1s inside the stub. Fire it
+  // and capture the outcome.
+  const longExec = rpcCallObservingClose(sockPath, {
+    id: 2, method: "exec", params: { cmd: "SLEEP:1000:slow" },
+  }, { timeoutMs: 5000 });
+
+  // Give the long exec a moment to land on the daemon and start its
+  // SLEEP. (The handler awaits a setTimeout under the hood.)
+  await new Promise((r) => setTimeout(r, 100));
+
+  // Connection B: shutdown. Fire it concurrently — under the bug, the
+  // daemon answers shutdown immediately and kills the process before
+  // the long exec returns.
+  const shutdown = rpcCallObservingClose(sockPath, {
+    id: 3, method: "shutdown", params: {},
+  }, { timeoutMs: 5000 });
+
+  // Wait for BOTH to settle.
+  const [longResult, shutdownResult] = await Promise.all([longExec, shutdown]);
+
+  // Shutdown itself should always succeed.
+  assert.equal(shutdownResult.kind, "frame",
+    `shutdown should return a frame: ${JSON.stringify(shutdownResult)}`);
+
+  // The actual B14 assertion: the long exec must get a structured
+  // response before the daemon dies. Under the bug, kind ===
+  // "closed_without_frame".
+  assert.equal(longResult.kind, "frame",
+    "B14: in-flight exec was orphaned by shutdown. The daemon killed " +
+    "the connection before responding to the exec. shutdown must wait " +
+    "for in-flight steady-state RPCs to settle before tearing down the " +
+    "VM and exiting. Got: " + JSON.stringify(longResult));
+  // And the response must actually be the exec result (not a generic
+  // "daemon shutting down" error injected late).
+  assert.equal(longResult.frame.id, 2);
+  assert.equal(longResult.frame.error, undefined,
+    `exec returned error instead of result: ${JSON.stringify(longResult.frame)}`);
+  assert.equal(longResult.frame.result.exit_code, 0);
+});
+

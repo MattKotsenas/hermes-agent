@@ -594,6 +594,12 @@ if (STUB_VM) {
 // during teardown). The classification lives in HANDLER_CONCURRENCY
 // above so adding a new handler forces an explicit pick.
 let lifecycleChain = Promise.resolve();
+// B14: track in-flight steady-state requests so shutdown can wait for
+// them to settle before tearing down the VM and calling process.exit.
+// Without this, an exec/exec_stream on connection A is silently
+// orphaned when shutdown arrives on connection B — the caller sees
+// the socket die with no response and has to guess at the cause.
+const inFlightSteady = new Set();
 function dispatch(method, params, ctx) {
   const handler = handlers[method];
   if (!handler) {
@@ -619,7 +625,17 @@ function dispatch(method, params, ctx) {
     // Serialize lifecycle transitions against everything else so we
     // don't race on the ``vm`` global. Steady-state methods that arrive
     // mid-init/teardown will still queue behind the chain.
-    const next = lifecycleChain.then(() => handler(params, ctx));
+    //
+    // For shutdown specifically, wait for in-flight steady-state RPCs
+    // to settle before invoking the handler — otherwise the handler
+    // calls process.exit() while exec/exec_stream are still pending on
+    // other connections, orphaning them (B14).
+    const settled = method === "shutdown"
+      ? Promise.allSettled([...inFlightSteady])
+      : Promise.resolve();
+    const next = lifecycleChain
+      .then(() => settled)
+      .then(() => handler(params, ctx));
     lifecycleChain = next.catch(() => {});
     return next;
   }
@@ -627,7 +643,13 @@ function dispatch(method, params, ctx) {
   // the most recent lifecycle transition to settle but then run free.
   // ``vm.exec`` returns an awaitable that the underlying gondolin API
   // multiplexes through SSH; concurrent dispatch is the supported shape.
-  return lifecycleChain.then(() => handler(params, ctx));
+  // Track the promise in inFlightSteady so a concurrent shutdown can
+  // wait for it (B14). Remove on settle so the set doesn't grow.
+  const p = lifecycleChain.then(() => handler(params, ctx));
+  inFlightSteady.add(p);
+  const cleanup = () => inFlightSteady.delete(p);
+  p.then(cleanup, cleanup);
+  return p;
 }
 
 // `runRpcServer` invokes handlers[method](params, ctx). We wrap that here
