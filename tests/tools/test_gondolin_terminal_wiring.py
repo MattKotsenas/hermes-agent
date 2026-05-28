@@ -848,8 +848,8 @@ def test_secrets_validator_rejects_env_with_non_from_command_source(monkeypatch)
 
 
 def test_secrets_validator_accepts_env_with_refresh_command_only(monkeypatch):
-    """B8 regression: value source from_env with a refresh_command needing
-    extra env (e.g. GH_HOST for `gh auth token`). Pre-B8, the B4 gate
+    """value source from_env with a refresh_command needing
+    extra env (e.g. GH_HOST for `gh auth token`). Pre-fix, the env gate
     rejected this even though the refresher passes env: to the
     refresh_command subprocess. Documented refresh pattern; must work."""
     from tools.terminal_tool import _get_env_config
@@ -913,8 +913,8 @@ def test_secrets_validator_accepts_timeout_ms(monkeypatch):
 
 
 def test_secrets_validator_accepts_timeout_ms_with_refresh_command(monkeypatch):
-    """B11: timeout_ms is *also* meaningful with refresh_command.
-    B8 made the refresher honor per-secret timeout_ms; the validator's
+    """timeout_ms is *also* meaningful with refresh_command.
+    An earlier fix made the refresher honor per-secret timeout_ms; the validator's
     gate was left at the pre-B8 form ('only valid with from_command'),
     so configs that use value+refresh_command+timeout_ms get rejected
     even though the refresher will honor the value at runtime.

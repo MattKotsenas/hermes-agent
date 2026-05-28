@@ -257,6 +257,10 @@ class SecretRefresher:
         # and don't care which default we'd otherwise pick.
         self._sleep = sleep_fn or self._stop_event.wait
         self._thread: threading.Thread | None = None
+        # Tracks the most-recently-spawned thread independently of
+        # self._thread, so start()'s liveness check can detect a stop()
+        # that timed out and refuse to spawn a duplicate worker.
+        self._prev_thread: threading.Thread | None = None
         self._lock = threading.Lock()
 
     def add_secret(
@@ -317,11 +321,10 @@ class SecretRefresher:
         # may not have actually exited yet — most commonly because its
         # in-flight refresh subprocess hasn't returned. Spawning a second
         # worker would race with it on the secret table; clearing
-        # stop_event would also un-cancel the old worker. Track the
-        # previous thread independently of self._thread so stop()'s
-        # bookkeeping can't fool the liveness check.
-        prev = getattr(self, "_prev_thread", None)
-        if prev is not None and prev.is_alive():
+        # stop_event would also un-cancel the old worker. self._prev_thread
+        # is tracked independently of self._thread so stop()'s bookkeeping
+        # can't fool the liveness check.
+        if self._prev_thread is not None and self._prev_thread.is_alive():
             logger.warning(
                 "gondolin secret refresher: start() called while a previous "
                 "worker is still running (stop() join timed out). Refusing "

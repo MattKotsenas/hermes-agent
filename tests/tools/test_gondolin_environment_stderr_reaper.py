@@ -1,7 +1,7 @@
-"""B13 regression: daemon stderr pipe must be drained, not left to fill.
+"""daemon stderr pipe must be drained, not left to fill.
 
 GondolinEnvironment spawns the Node daemon with stderr=subprocess.PIPE.
-Until B13, no code in the Python layer ever read that pipe — so the
+Until the reaper landed, no code in the Python layer ever read that pipe — so the
 kernel buffer (default ~64 KB on Linux) would fill, then the daemon's
 next write(2) on stderr would block in-kernel indefinitely. Any noisy
 diagnostic (V8 deprecation warning, Node debug log, OOM trace, the
@@ -17,20 +17,18 @@ from __future__ import annotations
 
 import logging
 import os
-import threading
 import time
 
-import pytest
 
 from tools.environments import gondolin as gondolin_mod
 
 
 def test_drain_daemon_stderr_helper_exists():
     """The reaper helper is a callable on the gondolin module so we can
-    test it in isolation from the full env spinup. Pre-B13 it didn't
+    test it in isolation from the full env spinup. Pre-fix, it didn't
     exist at all (raw stderr=PIPE with no reader)."""
     assert hasattr(gondolin_mod, "_start_daemon_stderr_reaper"), (
-        "B13 missing: gondolin._start_daemon_stderr_reaper(proc, logger) "
+        "Missing helper: gondolin._start_daemon_stderr_reaper(proc, logger) "
         "should exist to drain the daemon's stderr pipe. Without it, the "
         "daemon will wedge after ~64 KB of stderr output."
     )

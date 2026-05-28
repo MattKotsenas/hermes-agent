@@ -1194,8 +1194,8 @@ def _validate_gondolin_secrets(secrets):
             #   - hooks.mjs:103 honors it for the init-time from_command
             #     execSync.
             #   - the refresher (gondolin_secret_refresh._refresh_one) honors
-            #     it for refresh_command after B8 threaded state.timeout
-            #     through the run_command callable.
+            #     it for refresh_command — state.timeout is threaded through
+            #     the run_command callable.
             # value/from_env without a refresh_command resolve in-process with
             # no subprocess to time out, so timeout_ms is meaningless there.
             has_subprocess = "from_command" in cfg or "refresh_command" in cfg

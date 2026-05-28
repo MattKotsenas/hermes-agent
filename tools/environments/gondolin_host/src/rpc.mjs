@@ -90,7 +90,7 @@ export function runRpcServer({ input, output, handlers }) {
       // response. Old single-arg handlers ignore ctx and behave
       // unchanged.
       //
-      // B15: ctx.signal lets long-running handlers (exec_stream) abort
+      // ctx.signal lets long-running handlers (exec_stream) abort
       // when the client disconnects mid-flight. Without it, ctx.drain()
       // can hang forever awaiting a 'drain' event that will never fire
       // on a closed/destroyed stream, and the handler — plus the
@@ -112,7 +112,7 @@ export function runRpcServer({ input, output, handlers }) {
         // slow consumer doesn't make us buffer the whole VM output in
         // heap. Idempotent / safe to call when nothing's pending.
         //
-        // B15: also rejects when the output stream closes (client gone)
+        // Also rejects when the output stream closes (client gone)
         // so a backpressured pump unwinds instead of hanging.
         drain: () => {
           if (typeof output.writableNeedDrain === "boolean"

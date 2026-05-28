@@ -69,10 +69,8 @@ def _start_daemon_stderr_reaper(proc, logger=logger):
             for raw in iter(proc.stderr.readline, b""):
                 if not raw:
                     break
-                try:
-                    line = raw.decode("utf-8", errors="replace").rstrip("\r\n")
-                except Exception:  # noqa: BLE001 — never let a log line kill the reaper
-                    line = repr(raw)
+                # decode with errors='replace' cannot raise on bytes.
+                line = raw.decode("utf-8", errors="replace").rstrip("\r\n")
                 if line:
                     logger.warning("gondolin daemon stderr: %s", line)
         except (OSError, ValueError):
@@ -399,8 +397,8 @@ class GondolinEnvironment(BaseEnvironment):
             # re-raises). But KeyboardInterrupt / SystemExit slip past
             # that `Exception` filter and reach us here. Without an
             # explicit terminate, a Ctrl-C during _wait_for_socket or
-            # the init RPC leaks the 256-512 MB Node+VM allocation
-            # (B16). Same applies to any future BaseException-derived
+            # the init RPC leaks the 256-512 MB Node+VM allocation.
+            # Same applies to any future BaseException-derived
             # exception. _terminate_daemon is idempotent (no-op when
             # _daemon_proc is None or already reaped), so calling it
             # here can't double-kill the inner handler's work.
@@ -579,7 +577,7 @@ class GondolinEnvironment(BaseEnvironment):
             env=env_vars,
         )
         # Drain the daemon's stderr pipe so the kernel buffer never
-        # fills (B13). Without this, ~64 KB of stderr output is enough
+        # fills. Without this, ~64 KB of stderr output is enough
         # to wedge the daemon's write(2) and stall the whole VM.
         self._daemon_stderr_reaper = _start_daemon_stderr_reaper(
             self._daemon_proc, logger=logger
@@ -794,14 +792,11 @@ class GondolinEnvironment(BaseEnvironment):
             return
 
         # Best-effort graceful shutdown via RPC. Time-limited so a wedged
-        # daemon doesn't block the calling session forever.
-        #
-        # B17: catch any exception (not just OSError/RuntimeError). A
-        # malformed shutdown response — truncated msgpack frame, bad
-        # type, unexpected wire format — raises something outside the
-        # original narrow tuple, and the exception would escape
-        # cleanup(), skipping _terminate_daemon + workspace rmtree +
-        # slot release. Over many bad shutdowns the cap exhausts.
+        # daemon doesn't block the calling session forever. Catch any
+        # exception (msgpack format errors, truncated frames, unexpected
+        # wire shapes) — we're about to SIGTERM anyway, and letting the
+        # exception escape would skip _terminate_daemon, workspace
+        # rmtree, and slot release, exhausting the concurrent-VM cap.
         try:
             _rpc_call(
                 self.sock_path,
@@ -854,7 +849,8 @@ class GondolinEnvironment(BaseEnvironment):
             logger.debug("gondolin daemon teardown error: %s", exc)
         # Close the captured stderr pipe so the reaper exits and the
         # parent's fd doesn't accumulate across long-lived sessions
-        # that create/destroy many envs (B13).
+        # that create/destroy many envs. The reaper, mid-readline on
+        # this fd, sees the close as EOF or ValueError and exits.
         if proc.stderr is not None:
             try:
                 proc.stderr.close()

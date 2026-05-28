@@ -1,6 +1,6 @@
-"""B16 / B17 regression tests for init/cleanup error paths.
+"""Tests for init/cleanup error paths in GondolinEnvironment.
 
-B16: KeyboardInterrupt during init leaks the daemon subprocess.
+KeyboardInterrupt during init leaks the daemon subprocess.
 GondolinEnvironment.__init__ wraps _init_after_slot in `except
 BaseException` (to release the slot on Ctrl-C), but _init_after_slot
 itself only catches `except Exception` — KeyboardInterrupt slips
@@ -9,7 +9,7 @@ reaches the outer one (which only releases the slot, NOT the
 daemon). Result: a 256–512 MB Node+VM process is orphaned every
 time a user Ctrl-Cs during boot.
 
-B17: A malformed shutdown response from the daemon raises a msgpack
+A malformed shutdown response from the daemon raises a msgpack
 exception that cleanup()'s narrow `except (OSError, RuntimeError)`
 doesn't catch. The exception escapes cleanup, skipping
 _terminate_daemon, workspace rmtree, and slot release — silently
@@ -18,9 +18,7 @@ exhausting the cap over time as malformed shutdowns accumulate.
 
 from __future__ import annotations
 
-import os
 import shutil
-import socket
 import subprocess
 import time
 from pathlib import Path
@@ -37,7 +35,7 @@ requires_node = pytest.mark.skipif(not NODE_AVAILABLE, reason="node or daemon.mj
 
 
 # ----------------------------------------------------------------------
-# B16: KeyboardInterrupt during init must terminate the daemon
+# KeyboardInterrupt during init must terminate the daemon
 # ----------------------------------------------------------------------
 
 @requires_node
@@ -45,7 +43,7 @@ def test_keyboardinterrupt_during_init_terminates_daemon(monkeypatch, tmp_path):
     """A Ctrl-C arriving while __init__ is blocked in _wait_for_socket
     (or _rpc_call(init)) must NOT leave the daemon process orphaned.
 
-    Pre-B16: __init__'s outer `except BaseException` released the slot
+    Pre-fix: __init__'s outer `except BaseException` released the slot
     but did not call _terminate_daemon — the inner `except Exception`
     in _init_after_slot doesn't catch KeyboardInterrupt, so the
     daemon-cleanup branch was skipped.
@@ -114,7 +112,7 @@ def test_keyboardinterrupt_during_init_terminates_daemon(monkeypatch, tmp_path):
             try: proc.kill()
             except Exception: pass
         pytest.fail(
-            "B16: daemon orphaned after KeyboardInterrupt during init. "
+            "daemon orphaned after KeyboardInterrupt during init. "
             "GondolinEnvironment.__init__'s outer `except BaseException` "
             "must call self._terminate_daemon() so a Ctrl-C during boot "
             "doesn't leak the 256-512 MB Node+VM allocation. Daemon "
@@ -124,7 +122,7 @@ def test_keyboardinterrupt_during_init_terminates_daemon(monkeypatch, tmp_path):
 
 
 # ----------------------------------------------------------------------
-# B17: malformed shutdown response must not leak workspace/slot
+# malformed shutdown response must not leak workspace/slot
 # ----------------------------------------------------------------------
 
 @requires_node
@@ -167,11 +165,11 @@ def test_malformed_shutdown_response_does_not_leak_slot(monkeypatch, tmp_path):
 
     # Slot released, workspace gone, daemon process dead.
     assert env._slot is None, (
-        "B17: cleanup() let a malformed-shutdown exception escape, "
+        "cleanup() let a malformed-shutdown exception escape, "
         "skipping slot release. Slot leak compounds across sessions."
     )
     assert not workspace.exists(), (
-        "B17: cleanup() let an exception escape before workspace "
+        "cleanup() let an exception escape before workspace "
         "rmtree. Disk leak across sessions."
     )
     # Daemon process should be reaped within a couple of seconds.
@@ -179,6 +177,6 @@ def test_malformed_shutdown_response_does_not_leak_slot(monkeypatch, tmp_path):
     # _terminate_daemon nulls _daemon_proc on success, so checking
     # `is None` is the contract.
     assert proc is None, (
-        "B17: cleanup() did not call _terminate_daemon — "
+        "cleanup() did not call _terminate_daemon — "
         "self._daemon_proc still set to a live process."
     )

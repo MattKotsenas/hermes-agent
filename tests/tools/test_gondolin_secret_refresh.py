@@ -201,7 +201,7 @@ def test_refresher_does_not_leak_stderr_in_warn_log_by_default(caplog, monkeypat
     clock = _FakeClock(start=1_000_000.0)
     push_event = threading.Event()
     attempts = {"n": 0}
-    leaked = "eyJhbGciOiJub25lIn0.PARTIAL-TOKEN-LEAK"
+    leaked = "eyJhbG...LEAK"
 
     def fake_set_secret(name, *, value):
         push_event.set()
@@ -403,11 +403,11 @@ def test_refresher_stop_is_clean_and_idempotent():
 
 
 def test_refresher_stop_does_not_resurrect_old_worker_on_restart():
-    """B12: stop() must not return until the old worker thread is gone
+    """stop() must not return until the old worker thread is gone
     (or be honest that it hasn't), and start() must not silently spawn
     a duplicate worker against a still-live previous thread.
 
-    Bug pre-B12: stop() set ``self._thread = None`` *before* join, so
+    Bug pre-stop() set ``self._thread = None`` *before* join, so
     if join timed out (worker mid-subprocess, slow user sleep_fn), the
     old worker kept running. A subsequent start() saw self._thread is
     None, cleared stop_event (un-cancelling the old worker), and
@@ -767,8 +767,8 @@ def test_refresher_no_env_means_safe_baseline_only(monkeypatch):
 
 
 def test_refresher_threads_timeout_ms_through_to_subprocess(monkeypatch):
-    """B8: timeout_ms on a per-secret config flows from add_secret() down
-    to the run_command call. Pre-B8 the refresher hardcoded 30s and
+    """timeout_ms on a per-secret config flows from add_secret() down
+    to the run_command call. Pre-fix, the refresher hardcoded 30s and
     silently ignored the user's timeout_ms — surfacing it via gondolin
     config did nothing in the background loop."""
     monkeypatch.delenv("HERMES_GONDOLIN_DEBUG_SECRETS", raising=False)
@@ -802,7 +802,7 @@ def test_refresher_threads_timeout_ms_through_to_subprocess(monkeypatch):
 
 def test_refresher_uses_default_timeout_when_unset(monkeypatch):
     """Without timeout_ms the refresher falls back to the 30s default,
-    same as before B8."""
+    same as before the fix."""
     monkeypatch.delenv("HERMES_GONDOLIN_DEBUG_SECRETS", raising=False)
     captured_timeouts = []
 

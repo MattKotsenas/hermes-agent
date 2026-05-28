@@ -282,7 +282,7 @@ const handlers = {
           const inner = m ? m[1].replace(/'\\''/g, "'") : cmd;
           // STREAM_SLOW:<delayMs>:<count> yields <count> small chunks with
           // <delayMs> between each, so a test can disconnect mid-stream
-          // and observe whether the handler aborts (B15).
+          // and observe whether the handler aborts.
           const slowMatch = inner.match(/^STREAM_SLOW:(\d+):(\d+)/);
           if (slowMatch) {
             const delay = Number(slowMatch[1]);
@@ -506,7 +506,7 @@ const handlers = {
 
     let chunkCount = 0;
     for await (const c of proc.chunks()) {
-      // B15: if the client disconnected, the rpc.mjs context aborts the
+      // If the client disconnected, the rpc.mjs context aborts the
       // signal — unwind here rather than streamWriter-ing into a
       // destroyed socket forever. Best-effort kill the underlying VM
       // exec so we don't leak guest pgrps.
@@ -599,10 +599,10 @@ if (STUB_VM) {
   };
   HANDLER_CONCURRENCY._debug_get_secret = STEADY;
 
-  // B15 regression scaffolding: peek at the inFlightSteady set so a
-  // test can observe whether a handler is stuck (e.g. exec_stream
-  // hanging on ctx.drain after a client disconnect). Subtracts 1
-  // for the in-flight self — this call itself is registered on
+  // Debug helper: peek at the inFlightSteady set so a test can
+  // observe whether a handler is stuck (e.g. exec_stream hanging on
+  // ctx.drain after a client disconnect). Subtracts 1 for the
+  // in-flight self — this call itself is registered on
   // inFlightSteady, so we never report it as a leak.
   handlers._debug_inflight_steady_count = async function () {
     return { count: Math.max(0, inFlightSteady.size - 1) };
@@ -631,7 +631,7 @@ if (STUB_VM) {
 // during teardown). The classification lives in HANDLER_CONCURRENCY
 // above so adding a new handler forces an explicit pick.
 let lifecycleChain = Promise.resolve();
-// B14: track in-flight steady-state requests so shutdown can wait for
+// Track in-flight steady-state requests so shutdown can wait for
 // them to settle before tearing down the VM and calling process.exit.
 // Without this, an exec/exec_stream on connection A is silently
 // orphaned when shutdown arrives on connection B — the caller sees
@@ -666,7 +666,7 @@ function dispatch(method, params, ctx) {
     // For shutdown specifically, wait for in-flight steady-state RPCs
     // to settle before invoking the handler — otherwise the handler
     // calls process.exit() while exec/exec_stream are still pending on
-    // other connections, orphaning them (B14).
+    // other connections, orphaning them.
     const settled = method === "shutdown"
       ? Promise.allSettled([...inFlightSteady])
       : Promise.resolve();
@@ -681,7 +681,7 @@ function dispatch(method, params, ctx) {
   // ``vm.exec`` returns an awaitable that the underlying gondolin API
   // multiplexes through SSH; concurrent dispatch is the supported shape.
   // Track the promise in inFlightSteady so a concurrent shutdown can
-  // wait for it (B14). Remove on settle so the set doesn't grow.
+  // wait for it. Remove on settle so the set doesn't grow.
   const p = lifecycleChain.then(() => handler(params, ctx));
   inFlightSteady.add(p);
   const cleanup = () => inFlightSteady.delete(p);

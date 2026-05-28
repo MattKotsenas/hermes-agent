@@ -990,7 +990,7 @@ test("daemon: exec_stream falls back to a single chunk for non-STREAM stub comma
 });
 
 
-// B14 helpers — rpcCall variants that surface socket close as a distinct
+// rpcCall variants that surface socket close as a distinct
 // outcome (instead of waiting until timeout) so the test can tell the
 // difference between "daemon answered cleanly" and "daemon killed the
 // connection mid-flight."
@@ -1038,7 +1038,7 @@ function rpcCallObservingClose(sockPath, request, { timeoutMs = 5000 } = {}) {
 }
 
 
-test("daemon: shutdown waits for in-flight steady-state RPCs on other connections (B14)", async (t) => {
+test("daemon: shutdown waits for in-flight steady-state RPCs on other connections", async (t) => {
   // The bug: dispatch() classifies exec/exec_stream as STEADY, which
   // means they wait for lifecycleChain to settle but DON'T register
   // themselves on it. shutdown() (LIFECYCLE) checks lifecycleChain,
@@ -1107,7 +1107,7 @@ test("daemon: shutdown waits for in-flight steady-state RPCs on other connection
   // response before the daemon dies. Under the bug, kind ===
   // "closed_without_frame".
   assert.equal(longResult.kind, "frame",
-    "B14: in-flight exec was orphaned by shutdown. The daemon killed " +
+    "in-flight exec was orphaned by shutdown. The daemon killed " +
     "the connection before responding to the exec. shutdown must wait " +
     "for in-flight steady-state RPCs to settle before tearing down the " +
     "VM and exiting. Got: " + JSON.stringify(longResult));
@@ -1120,7 +1120,7 @@ test("daemon: shutdown waits for in-flight steady-state RPCs on other connection
 });
 
 
-test("daemon: exec_stream aborts when the client disconnects mid-stream (B15)", async (t) => {
+test("daemon: exec_stream aborts when the client disconnects mid-stream", async (t) => {
   // Bug: ctx.drain() in rpc.mjs awaits output.once("drain") but the
   // 'drain' event never fires on a destroyed/closed stream. If a
   // client crashes or quits while exec_stream is mid-pump, the
@@ -1204,7 +1204,7 @@ test("daemon: exec_stream aborts when the client disconnects mid-stream (B15)", 
   assert.equal(debug.error, undefined,
     `debug call failed: ${JSON.stringify(debug.error)}`);
   assert.equal(debug.result.count, 0,
-    "B15: exec_stream leaked after client disconnect. " +
+    "exec_stream leaked after client disconnect. " +
     `Expected 0 in-flight steady-state handlers, got ${debug.result.count}. ` +
     "ctx.drain() must reject (or the handler must observe a signal) " +
     "when the client socket closes, so the pump can unwind instead " +
