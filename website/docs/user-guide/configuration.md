@@ -526,24 +526,17 @@ terminal:
     stream: true                 # Stream stdout/stderr from VM commands
                                  #   in real time. Set false for the older
                                  #   buffer-and-return-once shape.
-    rootfs_size_mb: null         # Per-backend override of the shared
-                                 #   `terminal.container_disk` cap (MB).
-                                 #   null = inherit container_disk.
-                                 #   -1 = opt out (no cap, gondolin
-                                 #   auto-sizes from the image). Use -1
-                                 #   when the guest image lacks
-                                 #   e2fsprogs or you've pinned a
-                                 #   non-default rootfs mode that
-                                 #   refuses resize. See "Rootfs cap"
-                                 #   below.
+    rootfs_size_mb: null         # Opt-in rootfs cap (MB). null = use the
+                                 #   image's natural size (default-and-safe).
+                                 #   Set to N to invoke `resize2fs` inside
+                                 #   the guest at boot and grow the rootfs
+                                 #   to N MB; the image must ship e2fsprogs.
+                                 #   See "Rootfs cap" below.
 ```
 
-**Rootfs cap:** gondolin honors the shared `terminal.container_disk` knob as a *virtual* qcow2 size cap (sparse, only consumes what the guest writes). The cap is the default because a runaway `dd` in the guest can otherwise grow the qcow2 to whatever the guest writes and exhaust host disk. The cap requires:
+**Rootfs cap:** gondolin does NOT pick up the shared `terminal.container_disk` knob. For docker/modal/daytona/singularity, `container_disk` is a constructor argument — the platform allocates a disk that size. For gondolin, the rootfs *is* the OCI image; its size is the image's size. Capping it would require running `resize2fs` inside the guest at boot, which is a different operation with a different precondition (e2fsprogs in the image, writable `rootfs.mode='cow'`). Same honesty as vercel_sandbox, which also rejects `container_disk` rather than silently failing.
 
-- A **writable cow rootfs** (`rootfs.mode='cow'`, the gondolin default).
-- **`e2fsprogs`** in the guest image (for `resize2fs` at boot).
-
-The default image (`nikolaik/python-nodejs:python3.11-nodejs20`) ships both. If you use a custom image without `resize2fs`, or pin `rootfs.mode='memory'`/`'readonly'`, set `terminal.gondolin.rootfs_size_mb: -1` (per-backend) or `terminal.container_disk: -1` (shared) to opt out. The daemon then lets gondolin auto-size from the image.
+The default (no cap) is safe: the rootfs is exactly the image size, no resize happens, no e2fsprogs requirement. If you want a writable scratch area larger than the image, set `terminal.gondolin.rootfs_size_mb: N` explicitly. Your image must ship `e2fsprogs` (the default `nikolaik/python-nodejs:python3.11-nodejs20` does); if not, gondolin will fail at VM init with a hint pointing back here.
 
 **Requirements:**
 - Linux or WSL2 host with `/dev/kvm` accessible (group `kvm`, usually).

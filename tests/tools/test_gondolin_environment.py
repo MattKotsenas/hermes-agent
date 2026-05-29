@@ -134,10 +134,11 @@ def test_daemon_init_failure_is_surfaced(tmp_path, monkeypatch):
 
 @requires_node
 def test_rootfs_size_error_gets_actionable_hint(tmp_path, monkeypatch):
-    """When the daemon rejects a rootfs.size config (custom image without
-    e2fsprogs, or rootfs.mode='memory'), the bare gondolin error is not
-    actionable on its own — Python prepends a hint pointing the user at
-    the -1 opt-out sentinel and the docs."""
+    """When the daemon rejects a rootfs.size config because the image
+    lacks e2fsprogs (or pinned rootfs.mode='memory'), the bare gondolin
+    error doesn't tell the user what to do. Python prepends a hint that
+    tells them to either remove `rootfs_size_mb` or use an image with
+    e2fsprogs."""
     sandbox = tmp_path / "sandbox"
 
     def fake_rpc(sock_path, request, timeout=30.0):
@@ -160,8 +161,8 @@ def test_rootfs_size_error_gets_actionable_hint(tmp_path, monkeypatch):
         )
     msg = str(excinfo.value)
     assert "rootfs.size requires resize2fs" in msg
-    assert "rootfs_size_mb: -1" in msg
-    assert "container_disk: -1" in msg
+    assert "remove `rootfs_size_mb`" in msg
+    assert "e2fsprogs" in msg
 
 
 @requires_node

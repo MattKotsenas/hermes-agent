@@ -1621,29 +1621,20 @@ def _create_environment(env_type: str, image: str, cwd: str, timeout: int,
                     gondolin_cpus = None
         if gondolin_cpus is not None:
             daemon_config["cpus"] = int(gondolin_cpus)
-        # Rootfs disk-size cap. Shared `terminal.container_disk` (int MB,
-        # default 50 GB) is the lever docker/singularity/modal/daytona
-        # already use. Forward as `rootfs_size_mb`; the daemon translates
-        # to gondolin's qemu-suffix string. Omit entirely when unset so
-        # gondolin's auto-sizing (image-based) kicks in.
+        # Rootfs disk-size cap (opt-in). The shared `terminal.container_disk`
+        # knob is a *constructor* argument for the other backends (the
+        # platform allocates a disk of that size). For gondolin the rootfs
+        # IS the OCI image — its size is the image's size. Capping it
+        # requires invoking `resize2fs` inside the guest at boot, which
+        # mutates the image's filesystem and requires e2fsprogs in the
+        # image. That's not the same operation, so gondolin doesn't pick
+        # up `container_disk` — same honesty as vercel_sandbox.
         #
-        # Opt-out sentinel: -1 (at either layer) means "don't pass a cap
-        # to the daemon — let gondolin use the image's natural size."
-        # This is the escape hatch for users with a custom guest image
-        # that lacks e2fsprogs, or who pinned `rootfs.mode='memory'` and
-        # don't want the cap to break boot. The cap is the default
-        # because runaway guest writes can exhaust host disk (qcow2 is
-        # sparse but grows to whatever the guest writes); -1 is the
-        # "I know what I'm doing" signal.
+        # If you explicitly set `terminal.gondolin.rootfs_size_mb: N`,
+        # we forward it; the daemon translates MB → qemu suffix and runs
+        # resize2fs inside the guest. Your image must ship e2fsprogs.
         gondolin_disk_mb = gc.get("rootfs_size_mb")
-        if gondolin_disk_mb is None:
-            container_disk_mb = (container_config or {}).get("container_disk")
-            if container_disk_mb is not None:
-                try:
-                    gondolin_disk_mb = int(container_disk_mb)
-                except (TypeError, ValueError):
-                    gondolin_disk_mb = None
-        if gondolin_disk_mb is not None and int(gondolin_disk_mb) != -1:
+        if gondolin_disk_mb is not None:
             daemon_config["rootfs_size_mb"] = int(gondolin_disk_mb)
         # Host-wide concurrency knobs. lock_dir defaults to a shared dir
         # under HERMES_HOME so the cap is enforced across the CLI,

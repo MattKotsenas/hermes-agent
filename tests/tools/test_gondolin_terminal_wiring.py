@@ -177,16 +177,14 @@ def test_get_env_config_rejects_relative_cwd_for_gondolin(monkeypatch):
 
 
 @pytest.mark.skipif(not NODE_AVAILABLE, reason="node or daemon.mjs missing")
-def test_create_environment_translates_container_disk_to_rootfs_size_mb(
+def test_create_environment_forwards_explicit_rootfs_size_mb(
     tmp_path, _bypass_image_build
 ):
-    """The shared `terminal.container_disk` knob (MB int) is the same lever
-    docker/singularity/modal/daytona use to cap rootfs size. Gondolin's
-    equivalent is VMOptions.rootfs.size (qemu-suffix string). The factory
-    translates MB → wire key `rootfs_size_mb` so a user setting
-    `container_disk: 20480` gets a 20 GB gondolin rootfs without having to
-    learn a backend-specific schema. The daemon-side MB→qemu translation
-    is tested in socket_transport.test.mjs.
+    """When the user explicitly sets `terminal.gondolin.rootfs_size_mb: N`,
+    the factory forwards it to the daemon init payload under the wire key
+    `rootfs_size_mb`. The daemon then runs `resize2fs` inside the guest at
+    boot to grow the rootfs to N MB (image must ship e2fsprogs). The
+    daemon-side MB→qemu translation is tested in socket_transport.test.mjs.
     """
     from tools.terminal_tool import _create_environment
     from tools.environments.gondolin import GondolinEnvironment
@@ -196,30 +194,30 @@ def test_create_environment_translates_container_disk_to_rootfs_size_mb(
         image="",
         cwd="/workspace",
         timeout=60,
-        container_config={"container_disk": 20480},  # 20 GB
+        container_config={},
         gondolin_config={
             "sandbox_dir": str(tmp_path / "vm-sandbox"),
             "stub_vm": True,
             "image": "python:3.11-slim",
+            "rootfs_size_mb": 20480,  # 20 GB
         },
         task_id="test-disk",
     )
     try:
         assert isinstance(env, GondolinEnvironment)
-        # Python-side wiring: the disk MB lands on the daemon init payload
-        # under the wire key `rootfs_size_mb`.
         assert env.config.get("rootfs_size_mb") == 20480
     finally:
         env.cleanup()
 
 
 @pytest.mark.skipif(not NODE_AVAILABLE, reason="node or daemon.mjs missing")
-def test_create_environment_omits_rootfs_size_when_container_disk_unset(
+def test_create_environment_omits_rootfs_size_when_unset(
     tmp_path, _bypass_image_build
 ):
-    """When `container_disk` is absent from container_config, gondolin must
-    NOT pin a size — leave it null so the gondolin VM auto-sizes the rootfs
-    based on the image content (no surprise truncation when the image grows)."""
+    """When `rootfs_size_mb` is not set in gondolin_config, the factory
+    must NOT pass it to the daemon — gondolin then uses the image's
+    natural rootfs size (no resize2fs call, no e2fsprogs requirement).
+    This is the default-and-safe path."""
     from tools.terminal_tool import _create_environment
     from tools.environments.gondolin import GondolinEnvironment
 
@@ -228,7 +226,7 @@ def test_create_environment_omits_rootfs_size_when_container_disk_unset(
         image="",
         cwd="/workspace",
         timeout=60,
-        container_config={},  # no disk knob
+        container_config={},
         gondolin_config={
             "sandbox_dir": str(tmp_path / "vm-sandbox"),
             "stub_vm": True,
@@ -245,13 +243,18 @@ def test_create_environment_omits_rootfs_size_when_container_disk_unset(
 
 
 @pytest.mark.skipif(not NODE_AVAILABLE, reason="node or daemon.mjs missing")
-def test_create_environment_honors_minus_one_sentinel_in_container_disk(
+def test_create_environment_ignores_container_disk_for_gondolin(
     tmp_path, _bypass_image_build
 ):
-    """`container_disk: -1` is the opt-out sentinel — power users with a
-    custom image that lacks e2fsprogs, or who pinned `rootfs.mode='memory'`,
-    use it to skip the cap. The daemon then lets gondolin auto-size based
-    on the image. Validated at the shared-knob layer."""
+    """Gondolin does NOT pick up the shared `terminal.container_disk` knob.
+    For docker/modal/daytona/singularity, container_disk is a constructor
+    argument (allocate a disk of this size). For gondolin, the rootfs IS
+    the OCI image — capping it requires mutating the image at boot via
+    resize2fs, which is a different operation with a different precondition
+    (image must ship e2fsprogs). Same honesty as vercel_sandbox.
+
+    Users who want a gondolin rootfs cap set `terminal.gondolin.rootfs_size_mb`
+    explicitly. See test_create_environment_forwards_explicit_rootfs_size_mb."""
     from tools.terminal_tool import _create_environment
     from tools.environments.gondolin import GondolinEnvironment
 
@@ -260,47 +263,17 @@ def test_create_environment_honors_minus_one_sentinel_in_container_disk(
         image="",
         cwd="/workspace",
         timeout=60,
-        container_config={"container_disk": -1},
+        container_config={"container_disk": 20480},  # ignored by gondolin
         gondolin_config={
             "sandbox_dir": str(tmp_path / "vm-sandbox"),
             "stub_vm": True,
             "image": "python:3.11-slim",
         },
-        task_id="test-disk-optout-shared",
+        task_id="test-disk-no-shared-pickup",
     )
     try:
         assert isinstance(env, GondolinEnvironment)
-        assert "rootfs_size_mb" not in env.config
-    finally:
-        env.cleanup()
-
-
-@pytest.mark.skipif(not NODE_AVAILABLE, reason="node or daemon.mjs missing")
-def test_create_environment_honors_minus_one_sentinel_in_gondolin_rootfs(
-    tmp_path, _bypass_image_build
-):
-    """Same -1 sentinel at the per-backend layer: `terminal.gondolin.rootfs_size_mb: -1`
-    overrides any shared `container_disk` and skips the cap. This is the
-    "I only want to opt out for gondolin, not docker" path."""
-    from tools.terminal_tool import _create_environment
-    from tools.environments.gondolin import GondolinEnvironment
-
-    env = _create_environment(
-        env_type="gondolin",
-        image="",
-        cwd="/workspace",
-        timeout=60,
-        container_config={"container_disk": 20480},  # would otherwise apply
-        gondolin_config={
-            "sandbox_dir": str(tmp_path / "vm-sandbox"),
-            "stub_vm": True,
-            "image": "python:3.11-slim",
-            "rootfs_size_mb": -1,  # per-backend opt-out wins
-        },
-        task_id="test-disk-optout-backend",
-    )
-    try:
-        assert isinstance(env, GondolinEnvironment)
+        # container_disk does NOT leak into the daemon payload.
         assert "rootfs_size_mb" not in env.config
     finally:
         env.cleanup()
