@@ -280,6 +280,70 @@ def test_create_environment_ignores_container_disk_for_gondolin(
 
 
 @pytest.mark.skipif(not NODE_AVAILABLE, reason="node or daemon.mjs missing")
+def test_create_environment_forwards_user_extra_mounts(
+    tmp_path, _bypass_image_build
+):
+    """When the user sets `terminal.gondolin.extra_mounts`, the factory
+    must forward those entries through to the daemon's init config.
+
+    Regression: the factory previously built `daemon_config` without
+    `extra_mounts`, silently dropping every user-supplied vault mount.
+    Skills/credential mounts (auto-derived inside GondolinEnvironment)
+    still landed; user-supplied mounts did not. Symptom: agent reported
+    "wrote file ✓" but the host path never saw the write — the bytes
+    went to the guest's overlay rootfs and were destroyed at cleanup.
+    """
+    from tools.terminal_tool import _create_environment
+    from tools.environments.gondolin import GondolinEnvironment
+
+    (tmp_path / "vault-a").mkdir()
+    (tmp_path / "vault-b").mkdir()
+    user_mounts = [
+        {
+            "host_path": str(tmp_path / "vault-a"),
+            "guest_path": "/home/matt/vault-a",
+            "readonly": False,
+        },
+        {
+            "host_path": str(tmp_path / "vault-b"),
+            "guest_path": "/home/matt/vault-b",
+            "readonly": True,
+        },
+    ]
+
+    env = _create_environment(
+        env_type="gondolin",
+        image="",
+        cwd="/workspace",
+        timeout=60,
+        container_config={},
+        gondolin_config={
+            "sandbox_dir": str(tmp_path / "vm-sandbox"),
+            "stub_vm": True,
+            "image": "python:3.11-slim",
+            "extra_mounts": user_mounts,
+            # Opt out of skill/credential projection so we assert
+            # exactly on the user-supplied entries.
+            "project_skills": False,
+            "project_credentials": False,
+        },
+        task_id="test-extra-mounts",
+    )
+    try:
+        assert isinstance(env, GondolinEnvironment)
+        mounts = env.config.get("extra_mounts") or []
+        by_guest = {m["guest_path"]: m for m in mounts}
+        assert "/home/matt/vault-a" in by_guest, (
+            f"user-supplied mount /home/matt/vault-a dropped; got: {mounts}"
+        )
+        assert "/home/matt/vault-b" in by_guest
+        assert by_guest["/home/matt/vault-a"]["readonly"] is False
+        assert by_guest["/home/matt/vault-b"]["readonly"] is True
+    finally:
+        env.cleanup()
+
+
+@pytest.mark.skipif(not NODE_AVAILABLE, reason="node or daemon.mjs missing")
 def test_create_environment_forwards_container_persistent_to_gondolin(
     tmp_path, _bypass_image_build
 ):

@@ -1575,6 +1575,23 @@ def _create_environment(env_type: str, image: str, cwd: str, timeout: int,
             "secrets": gc.get("secrets", {}),
             "policy_script": gc.get("policy_script"),
         }
+        # Forward user-supplied `terminal.gondolin.extra_mounts` to the
+        # daemon's init config. GondolinEnvironment will append auto-derived
+        # skill/credential mounts to this list before sending it on. Without
+        # this forwarding step, every user-supplied vault/host mount is
+        # silently dropped — the symptom is "wrote file ✓" reports from
+        # inside the guest while the host path never sees the bytes (writes
+        # land on the guest's overlay rootfs and die at cleanup).
+        user_extra_mounts = gc.get("extra_mounts")
+        if user_extra_mounts:
+            daemon_config["extra_mounts"] = list(user_extra_mounts)
+        # `project_skills` / `project_credentials` are consumed inside
+        # GondolinEnvironment (not the daemon) to gate auto-derived
+        # mounts. Pass them through verbatim so the user can opt out.
+        if "project_skills" in gc:
+            daemon_config["project_skills"] = gc["project_skills"]
+        if "project_credentials" in gc:
+            daemon_config["project_credentials"] = gc["project_credentials"]
         # `image` is required end-to-end. The default is an OCI image
         # name (DEFAULT_GONDOLIN_IMAGE); _ensure_gondolin_image_built
         # materializes it via gondolin's OCI rootfs build pipeline on
