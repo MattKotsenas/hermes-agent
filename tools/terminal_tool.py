@@ -1355,6 +1355,33 @@ def _get_env_config() -> Dict[str, Any]:
             "cpus": _parse_env_var(
                 "TERMINAL_GONDOLIN_CPUS", "", lambda s: int(s) if s else None, "integer"
             ),
+            "max_concurrent_vms": _parse_env_var(
+                "TERMINAL_GONDOLIN_MAX_CONCURRENT_VMS", "",
+                lambda s: int(s) if s else None, "integer",
+            ),
+            "rootfs_size_mb": _parse_env_var(
+                "TERMINAL_GONDOLIN_ROOTFS_SIZE_MB", "",
+                lambda s: int(s) if s else None, "integer",
+            ),
+            "lock_dir": os.getenv("TERMINAL_GONDOLIN_LOCK_DIR") or None,
+            # Vault / extra bind mounts and skill/credential projection
+            # gates. Bridged via TERMINAL_GONDOLIN_EXTRA_MOUNTS_JSON +
+            # TERMINAL_GONDOLIN_PROJECT_{SKILLS,CREDENTIALS}. Keep in lock
+            # step with tools/environments/config_bridge.py — that file is
+            # the single source of truth for the YAML↔env mapping.
+            "extra_mounts": _parse_env_var(
+                "TERMINAL_GONDOLIN_EXTRA_MOUNTS_JSON", "[]", json.loads, "valid JSON",
+            ),
+            "project_skills": _parse_env_var(
+                "TERMINAL_GONDOLIN_PROJECT_SKILLS", "",
+                lambda s: s.lower() in {"true", "1", "yes"} if s else None,
+                "boolean",
+            ),
+            "project_credentials": _parse_env_var(
+                "TERMINAL_GONDOLIN_PROJECT_CREDENTIALS", "",
+                lambda s: s.lower() in {"true", "1", "yes"} if s else None,
+                "boolean",
+            ),
         },
     }
 

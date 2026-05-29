@@ -529,79 +529,60 @@ def load_cli_config() -> Dict[str, Any]:
     from hermes_cli.config import _expand_env_vars
     defaults = _expand_env_vars(defaults)
 
-    # Apply terminal config to environment variables (so terminal_tool picks them up)
+    # Apply terminal config to environment variables (so terminal_tool picks them up).
+    # The full terminal.* → TERMINAL_* mapping lives in
+    # tools/environments/config_bridge.py — the single source of truth shared
+    # with gateway/run.py's bridge and hermes_cli/config.py's `hermes config set`.
+    # If you're adding a new terminal.* knob, edit ONLY that file.
     terminal_config = defaults.get("terminal", {})
-    
+
     # Normalize config key: the new config system (hermes_cli/config.py) and all
     # documentation use "backend", the legacy cli-config.yaml uses "env_type".
     # Accept both, with "backend" taking precedence (it's the documented key).
-    if "backend" in terminal_config:
-        terminal_config["env_type"] = terminal_config["backend"]
-    
+    if "env_type" in terminal_config and "backend" not in terminal_config:
+        terminal_config["backend"] = terminal_config["env_type"]
+
     # CWD resolution for CLI/TUI. The gateway has its own config bridge in
     # gateway/run.py but may lazily import cli.py (triggering this code).
     # Local backend: always os.getcwd(). Use `cd /dir && hermes` to control it.
     # Non-local with placeholder: pop so terminal_tool uses its per-backend default.
     # Non-local with explicit path: keep as-is.
     _CWD_PLACEHOLDERS = (".", "auto", "cwd")
-    effective_backend = terminal_config.get("env_type", "local")
+    effective_backend = terminal_config.get("backend", "local")
 
     if effective_backend == "local":
         terminal_config["cwd"] = os.getcwd()
         defaults["terminal"]["cwd"] = terminal_config["cwd"]
     elif terminal_config.get("cwd") in _CWD_PLACEHOLDERS:
         terminal_config.pop("cwd", None)
-    
-    env_mappings = {
-        "env_type": "TERMINAL_ENV",
-        "cwd": "TERMINAL_CWD",
-        "timeout": "TERMINAL_TIMEOUT",
-        "lifetime_seconds": "TERMINAL_LIFETIME_SECONDS",
-        "docker_image": "TERMINAL_DOCKER_IMAGE",
-        "docker_forward_env": "TERMINAL_DOCKER_FORWARD_ENV",
-        "singularity_image": "TERMINAL_SINGULARITY_IMAGE",
-        "modal_image": "TERMINAL_MODAL_IMAGE",
-        "daytona_image": "TERMINAL_DAYTONA_IMAGE",
-        "vercel_runtime": "TERMINAL_VERCEL_RUNTIME",
-        # SSH config
-        "ssh_host": "TERMINAL_SSH_HOST",
-        "ssh_user": "TERMINAL_SSH_USER",
-        "ssh_port": "TERMINAL_SSH_PORT",
-        "ssh_key": "TERMINAL_SSH_KEY",
-        # Container resource config (docker, singularity, modal, daytona, vercel_sandbox -- ignored for local/ssh)
-        "container_cpu": "TERMINAL_CONTAINER_CPU",
-        "container_memory": "TERMINAL_CONTAINER_MEMORY",
-        "container_disk": "TERMINAL_CONTAINER_DISK",
-        "container_persistent": "TERMINAL_CONTAINER_PERSISTENT",
-        "docker_volumes": "TERMINAL_DOCKER_VOLUMES",
-        "docker_env": "TERMINAL_DOCKER_ENV",
-        "docker_mount_cwd_to_workspace": "TERMINAL_DOCKER_MOUNT_CWD_TO_WORKSPACE",
-        "docker_run_as_host_user": "TERMINAL_DOCKER_RUN_AS_HOST_USER",
-        "sandbox_dir": "TERMINAL_SANDBOX_DIR",
-        # Persistent shell (non-local backends)
-        "persistent_shell": "TERMINAL_PERSISTENT_SHELL",
-        # Sudo support (works with all backends)
-        "sudo_password": "SUDO_PASSWORD",
-    }
-    
-    # Bridge config → env vars for terminal_tool. TERMINAL_CWD is force-exported
-    # UNLESS we're inside a gateway process (detected by _HERMES_GATEWAY marker)
-    # where it was already set correctly by gateway/run.py's config bridge.
+
+    # CLI: always force-export TERMINAL_CWD (overrides stale .env or inherited
+    # values). Gateway sets _HERMES_GATEWAY=1 and handles cwd itself.
     _is_gateway = os.environ.get("_HERMES_GATEWAY") == "1"
-    for config_key, env_var in env_mappings.items():
-        if config_key in terminal_config:
-            if env_var == "TERMINAL_CWD":
-                if _is_gateway:
-                    continue
-                # CLI: always export (overrides stale .env or inherited values)
-                os.environ[env_var] = str(terminal_config[config_key])
-                continue
-            if _file_has_terminal_config or env_var not in os.environ:
-                val = terminal_config[config_key]
-                if isinstance(val, (list, dict)):
-                    os.environ[env_var] = json.dumps(val)
-                else:
-                    os.environ[env_var] = str(val)
+
+    from tools.environments.config_bridge import (
+        TerminalConfigKey,
+        apply_terminal_config_to_env,
+    )
+
+    def _cli_skip(key: TerminalConfigKey, value: object) -> bool:
+        if key.yaml_path == "cwd" and _is_gateway:
+            # Gateway already set TERMINAL_CWD; don't clobber.
+            return True
+        return False
+
+    # Force-export when the config file actually declares a terminal: block,
+    # honor pre-existing env vars otherwise. Matches the previous policy
+    # gated by _file_has_terminal_config.
+    apply_terminal_config_to_env(
+        terminal_config,
+        overwrite=_file_has_terminal_config,
+        skip=_cli_skip,
+    )
+    # TERMINAL_CWD has stricter precedence: CLI always force-exports unless
+    # the gateway already set it (handled in _cli_skip).
+    if not _is_gateway and "cwd" in terminal_config:
+        os.environ["TERMINAL_CWD"] = str(terminal_config["cwd"])
     
     # Apply browser config to environment variables
     browser_config = defaults.get("browser", {})

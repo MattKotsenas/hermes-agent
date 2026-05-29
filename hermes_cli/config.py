@@ -5419,41 +5419,27 @@ def set_config_value(key: str, value: str):
     
     # Keep .env in sync for keys that terminal_tool reads directly from env vars.
     # config.yaml is authoritative, but terminal_tool only reads TERMINAL_ENV etc.
+    # The full terminal.* → TERMINAL_* mapping lives in
+    # tools/environments/config_bridge.py — the single source of truth shared
+    # with cli.py and gateway/run.py. Add new terminal.* knobs there, not here.
+    #
+    # `terminal.cwd` is intentionally excluded — CLI resolves at runtime,
+    # gateway bridges it in gateway/run.py. Persisting to .env causes
+    # stale values to poison child processes.
+    from tools.environments.config_bridge import yaml_path_to_env_var
     _config_to_env_sync = {
-        "terminal.backend": "TERMINAL_ENV",
-        "terminal.modal_mode": "TERMINAL_MODAL_MODE",
-        "terminal.docker_image": "TERMINAL_DOCKER_IMAGE",
-        "terminal.singularity_image": "TERMINAL_SINGULARITY_IMAGE",
-        "terminal.modal_image": "TERMINAL_MODAL_IMAGE",
-        "terminal.daytona_image": "TERMINAL_DAYTONA_IMAGE",
-        "terminal.vercel_runtime": "TERMINAL_VERCEL_RUNTIME",
-        "terminal.docker_mount_cwd_to_workspace": "TERMINAL_DOCKER_MOUNT_CWD_TO_WORKSPACE",
-        "terminal.docker_run_as_host_user": "TERMINAL_DOCKER_RUN_AS_HOST_USER",
-        "terminal.docker_env": "TERMINAL_DOCKER_ENV",
-        # terminal.cwd intentionally excluded — CLI resolves at runtime,
-        # gateway bridges it in gateway/run.py. Persisting to .env causes
-        # stale values to poison child processes.
-        "terminal.timeout": "TERMINAL_TIMEOUT",
-        "terminal.sandbox_dir": "TERMINAL_SANDBOX_DIR",
-        "terminal.persistent_shell": "TERMINAL_PERSISTENT_SHELL",
-        "terminal.container_cpu": "TERMINAL_CONTAINER_CPU",
-        "terminal.container_memory": "TERMINAL_CONTAINER_MEMORY",
-        "terminal.container_disk": "TERMINAL_CONTAINER_DISK",
-        "terminal.container_persistent": "TERMINAL_CONTAINER_PERSISTENT",
-        # Gondolin-specific YAML keys. terminal_tool reads only env vars,
-        # so each YAML key has to mirror to a TERMINAL_GONDOLIN_* env var
-        # or the user's `hermes config set` silently has no effect.
-        "terminal.gondolin.image": "TERMINAL_GONDOLIN_IMAGE",
-        "terminal.gondolin.allowed_hosts": "TERMINAL_GONDOLIN_ALLOWED_HOSTS",
-        "terminal.gondolin.secrets": "TERMINAL_GONDOLIN_SECRETS_JSON",
-        "terminal.gondolin.policy_script": "TERMINAL_GONDOLIN_POLICY_SCRIPT",
-        "terminal.gondolin.sandbox_dir": "TERMINAL_GONDOLIN_SANDBOX_DIR",
-        "terminal.gondolin.memory": "TERMINAL_GONDOLIN_MEMORY",
-        "terminal.gondolin.cpus": "TERMINAL_GONDOLIN_CPUS",
-        "terminal.gondolin.max_concurrent_vms": "TERMINAL_GONDOLIN_MAX_CONCURRENT_VMS",
+        k: v for k, v in yaml_path_to_env_var().items() if k != "terminal.cwd"
     }
     if key in _config_to_env_sync:
-        save_env_value(_config_to_env_sync[key], str(value))
+        # JSON-encode list/dict values so they survive the .env round trip.
+        # Scalar values use str().
+        from tools.environments.config_bridge import lookup_by_yaml_path, encode_value
+        # Strip the "terminal." prefix to look up the encoding metadata.
+        bridge_key = lookup_by_yaml_path(key.removeprefix("terminal."))
+        if bridge_key is not None:
+            save_env_value(_config_to_env_sync[key], encode_value(bridge_key, value))
+        else:
+            save_env_value(_config_to_env_sync[key], str(value))
 
     print(f"✓ Set {key} = {value} in {config_path}")
 
