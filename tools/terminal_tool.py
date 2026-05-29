@@ -1587,110 +1587,36 @@ def _create_environment(env_type: str, image: str, cwd: str, timeout: int,
         # (via the daemon subprocess) and our wrapper script. Keep it out
         # of the import path for the other backends.
         from tools.environments.gondolin import GondolinEnvironment as _GondolinEnvironment
+        from tools.environments.gondolin_factory import build_daemon_config
+        from hermes_constants import get_hermes_home
         gc = gondolin_config or {}
         sandbox_dir = gc.get("sandbox_dir")
         if not sandbox_dir:
             # Default: per-task sandbox under HERMES_HOME so subagents /
             # parallel sessions never collide on the daemon socket path.
-            from hermes_constants import get_hermes_home
             sandbox_dir = str(get_hermes_home() / "sandboxes" / "gondolin" / task_id)
-        # config dict forwarded to the daemon's init RPC. Keep only the
-        # keys the daemon understands; anything else stays out of the
-        # JSON-RPC payload.
-        daemon_config = {
-            "allowed_hosts": gc.get("allowed_hosts", ["*"]),
-            "secrets": gc.get("secrets", {}),
-            "policy_script": gc.get("policy_script"),
-        }
-        # Forward user-supplied `terminal.gondolin.extra_mounts` to the
-        # daemon's init config. GondolinEnvironment will append auto-derived
-        # skill/credential mounts to this list before sending it on. Without
-        # this forwarding step, every user-supplied vault/host mount is
-        # silently dropped — the symptom is "wrote file ✓" reports from
-        # inside the guest while the host path never sees the bytes (writes
-        # land on the guest's overlay rootfs and die at cleanup).
-        user_extra_mounts = gc.get("extra_mounts")
-        if user_extra_mounts:
-            daemon_config["extra_mounts"] = list(user_extra_mounts)
-        # `project_skills` / `project_credentials` are consumed inside
-        # GondolinEnvironment (not the daemon) to gate auto-derived
-        # mounts. Pass them through verbatim so the user can opt out.
-        if "project_skills" in gc:
-            daemon_config["project_skills"] = gc["project_skills"]
-        if "project_credentials" in gc:
-            daemon_config["project_credentials"] = gc["project_credentials"]
-        # `image` is required end-to-end. The default is an OCI image
-        # name (DEFAULT_GONDOLIN_IMAGE); _ensure_gondolin_image_built
-        # materializes it via gondolin's OCI rootfs build pipeline on
-        # first use and returns the gondolin-store tag the daemon needs.
-        # A user-pinned absolute path or pre-built gondolin tag flows
-        # through unchanged. Build runs synchronously here; the wizard
-        # offers to pre-warm so the first session isn't the one that
-        # waits.
-        daemon_config["image"] = _ensure_gondolin_image_built(gc.get("image"))
-        # Per-VM resource caps. Two layers:
-        # 1. Shared `terminal.container_memory` (int MB) and
-        #    `terminal.container_cpu` (float cores) — same knobs the
-        #    docker/singularity/modal/daytona backends use. Default 5120
-        #    MB / 1 cpu. Translated below into gondolin's native shapes
-        #    ("1G" string + integer cpus) so a user switching backends
-        #    doesn't relearn the schema.
-        # 2. `terminal.gondolin.memory` / `terminal.gondolin.cpus`
-        #    overrides — power users who want gondolin-native formats
-        #    (e.g. fractional GB strings the shared knob can't express).
-        #    Wins over (1) when set.
-        gondolin_mem = gc.get("memory")
-        if not gondolin_mem:
-            cc = container_config or {}
-            container_mem_mb = cc.get("container_memory")
-            if container_mem_mb is not None:
-                try:
-                    gondolin_mem = f"{int(container_mem_mb)}M"
-                except (TypeError, ValueError):
-                    gondolin_mem = None
-        if gondolin_mem:
-            daemon_config["memory"] = gondolin_mem
-
-        gondolin_cpus = gc.get("cpus")
-        if gondolin_cpus is None:
-            cc = container_config or {}
-            container_cpu = cc.get("container_cpu")
-            if container_cpu is not None:
-                try:
-                    # Gondolin's cpus knob is an integer; round 1.5 → 2
-                    # so users who set container_cpu=1.5 for docker get a
-                    # sensible VM cap (vs. silently failing the int cast).
-                    gondolin_cpus = max(1, round(float(container_cpu)))
-                except (TypeError, ValueError):
-                    gondolin_cpus = None
-        if gondolin_cpus is not None:
-            daemon_config["cpus"] = int(gondolin_cpus)
-        # Rootfs disk-size cap (opt-in). The shared `terminal.container_disk`
-        # knob is a *constructor* argument for the other backends (the
-        # platform allocates a disk of that size). For gondolin the rootfs
-        # IS the OCI image — its size is the image's size. Capping it
-        # requires invoking `resize2fs` inside the guest at boot, which
-        # mutates the image's filesystem and requires e2fsprogs in the
-        # image. That's not the same operation, so gondolin doesn't pick
-        # up `container_disk` — same honesty as vercel_sandbox.
+        # ``daemon_config`` is built by the gondolin_factory registry —
+        # the source of truth for every ``terminal.gondolin.*`` key that
+        # crosses from user YAML into the daemon's init RPC. Adding a
+        # new key in just one place (here or in the env) is the bug
+        # class that originally dropped ``extra_mounts`` silently;
+        # ``test_gondolin_factory_registry.py`` makes that drift a
+        # red test instead of a silent prod incident.
         #
-        # If you explicitly set `terminal.gondolin.rootfs_size_mb: N`,
-        # we forward it; the daemon translates MB → qemu suffix and runs
-        # resize2fs inside the guest. Your image must ship e2fsprogs.
-        gondolin_disk_mb = gc.get("rootfs_size_mb")
-        if gondolin_disk_mb is not None:
-            daemon_config["rootfs_size_mb"] = int(gondolin_disk_mb)
-        # Host-wide concurrency knobs. lock_dir defaults to a shared dir
-        # under HERMES_HOME so the cap is enforced across the CLI,
-        # subagents, the gateway, and cron jobs by default — no extra
-        # config required.
-        if gc.get("max_concurrent_vms") is not None:
-            daemon_config["max_concurrent_vms"] = int(gc["max_concurrent_vms"])
-        lock_dir = gc.get("lock_dir")
-        if not lock_dir:
-            from hermes_constants import get_hermes_home
-            lock_dir = str(get_hermes_home() / "sandboxes" / "gondolin" / ".locks")
-        daemon_config["lock_dir"] = lock_dir
+        # Per-VM resource caps interact with the shared
+        # ``terminal.container_*`` knobs the docker/singularity/modal/
+        # daytona backends use; the relevant transforms inside
+        # gondolin_factory consult ``container_config`` so a user who
+        # only set the shared knob still gets a memory/cpu setting
+        # forwarded. ``container_disk`` deliberately doesn't pick up
+        # rootfs sizing — see _xform_rootfs_size_mb for the rationale.
+        daemon_config = build_daemon_config(
+            gc,
+            container_config,
+            ensure_image_built=_ensure_gondolin_image_built,
+            hermes_home=get_hermes_home,
+            task_id=task_id,
+        )
         return _GondolinEnvironment(
             sandbox_dir=sandbox_dir,
             cwd=cwd,
