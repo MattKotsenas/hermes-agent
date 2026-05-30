@@ -1,5 +1,66 @@
 # Hermes Gondolin Terminal Backend — Design
 
+> # 🚧🚧🚧 DO NOT MERGE 🚧🚧🚧
+>
+> **This PR is not ready to ship.** The overlay/isolation work in this branch
+> peels the next layer of the onion but leaves enough rough edges that the
+> author (Matt) does not believe it can land in its current form. Use this
+> branch for experimentation only; revisit the items below before opening
+> a merge-targeting PR.
+>
+> **Revisit before merge:**
+>
+> 1. **Overlay staleness during a session.** fuse-overlayfs treats the lower
+>    layer as point-in-time; host edits to a mounted vault are invisible to
+>    a running sandbox. Acceptable UX for short-lived sessions, broken UX
+>    for long-lived ones. Pick one and document, or move to a different
+>    overlay strategy (kernel overlayfs in a user namespace, periodic remount,
+>    explicit refresh RPC).
+> 2. **uid 1000 ownership inside the guest.** Removing `squash_to_root` made
+>    writes succeed but vault files now appear as uid 1000 in a root-shell
+>    guest, forcing per-sandbox `git config --global --add safe.directory ...`
+>    workarounds. The right fix is fuse-overlayfs with a proper
+>    subuid/subgid uidmapping (or a user-namespace wrap) so the guest sees
+>    root-owned files without giving the daemon CAP_SETUID.
+> 3. **`extra_mounts` dict mutation contract.** The daemon mutates
+>    caller-provided dict entries in place (popping `overlay`, rewriting
+>    `host_path`). We patched the symptom with `copy.deepcopy` in
+>    `GondolinEnvironment.__init__`, but the underlying contract — that a
+>    config consumer is allowed to mutate the config — is still wrong.
+>    Audit other call sites and either freeze the config or refactor to
+>    return new entries instead of mutating.
+> 4. **Single-file bind-mount workaround.** gondolin's `waitForBindMount`
+>    runs `mkdir -p` on the target, which clobbers file mounts. We worked
+>    around it by mounting the parent directory with `allowed_files` to
+>    shadow siblings. The clean fix is in gondolin itself: detect a file
+>    source and `touch` (not `mkdir`) the target.
+> 5. **Image-ref lookup mismatch.** `mcr.microsoft.com/devcontainers/universal:6`
+>    is canonical in config but stored locally as
+>    `mcr.microsoft.com_devcontainers_universal:6`; the slash form doesn't
+>    resolve. Pre-existing gondolin client bug; we rely on the fallback. File
+>    it upstream and fix before depending on a specific image.
+> 6. **No automated tests.** Everything in this branch was validated via
+>    ad-hoc probe scripts in `/tmp/`. Need real coverage for: overlay
+>    isolation between concurrent sandboxes, no-leak to host, freshness on
+>    respawn, cleanup contract (no leaked fuse mounts), `gh-cred-env`
+>    round-trip. The probe in this PR's history is a good template.
+> 7. **`fuse-overlayfs` is a hard dependency now.** The Dockerfile / install
+>    docs / readiness checks need to either require it or degrade gracefully
+>    when `overlay: true` is requested but the binary is missing.
+> 8. **`gh-cred-env` distribution.** Currently a hand-curated script in
+>    `~/.local/bin/`. To ship, it needs to live in the repo, be installed
+>    by the install path, and be discoverable from the guest without
+>    hard-coding `/home/matt/.local/bin`.
+> 9. **Failed-init cleanup.** When daemon init fails after
+>    `_setup_overlay_mounts` succeeded, we unmount but leave the staging
+>    dirs (`overlays/<safe>/{upper,work,merged}`) on disk. Cleans up
+>    eventually via `cleanup()`'s rmtree, but the inner-except path should
+>    rmtree too.
+>
+> Until each of these has a decision (fix, defer-with-issue, accept-with-doc),
+> treat this branch as a spike, not a deliverable.
+
+
 **Status:** phase 2 implementation complete; pre-PR cleanup
 (2026-05-26)
 **Predecessor:** phase 1 spike at `../phase-1/` proved Gondolin runs in WSL2,

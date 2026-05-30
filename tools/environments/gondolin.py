@@ -24,9 +24,11 @@ crash, or VM hang surfaces as a clean tool error on the next call.
 from __future__ import annotations
 
 import fcntl
+import hashlib
 import json
 import logging
 import os
+import re
 import shutil
 import socket
 import subprocess
@@ -41,6 +43,201 @@ from tools.environments.base import BaseEnvironment, _popen_bash
 from tools.environments.gondolin_secret_refresh import SecretRefresher
 
 logger = logging.getLogger(__name__)
+
+
+# Run once at import: clean up overlay mounts leaked by a prior hard
+# crash so the next sandbox's rmtree(sandbox_dir) doesn't fail with EBUSY.
+try:
+    _SWEEP_DONE
+except NameError:
+    _SWEEP_DONE = False
+
+
+def _overlay_safe_name(guest_path: str) -> str:
+    """Filesystem-safe per-mount directory name under sandbox/overlays/.
+
+    Sanitizes the guest path and appends a short hash so two mounts
+    with similar paths can't collide.
+    """
+    cleaned = re.sub(r"[^a-zA-Z0-9._-]", "_", guest_path).strip("_") or "mount"
+    h = hashlib.sha1(guest_path.encode("utf-8")).hexdigest()[:8]
+    return f"{cleaned}_{h}"
+
+
+def _setup_overlay_mounts(
+    extra_mounts: list[dict], sandbox_dir: Path
+) -> list[str]:
+    """For each extra_mounts entry with ``overlay: True``, spawn
+    fuse-overlayfs and rewrite the entry's host_path to point at the
+    merged dir. Returns the list of merged paths that must be
+    unmounted on cleanup.
+
+    Layout (per mount): ``<sandbox_dir>/overlays/<safe>/{upper,work,merged}``.
+    The user's live vault dir becomes the lower layer. Writes from the
+    sandbox land in upper/ and never touch the host vault.
+
+    Freshness caveat: fuse-overlayfs treats the lower as point-in-time at
+    mount; host-side edits made while the sandbox is running are NOT
+    visible inside the sandbox. Each new sandbox sees the current host
+    state at spawn. See docs/design/gondolin-terminal-backend.md (the
+    "DO NOT MERGE" revisit list) for the open follow-ups.
+
+    Cleanup is the caller's responsibility — if the daemon init fails,
+    pair this with ``_teardown_overlay_mounts``.
+    """
+    if not extra_mounts:
+        return []
+    if not any(entry.get("overlay") for entry in extra_mounts):
+        # Strip stray False/None overlay keys so the daemon never sees them.
+        for entry in extra_mounts:
+            entry.pop("overlay", None)
+        return []
+
+    if shutil.which("fuse-overlayfs") is None:
+        raise RuntimeError(
+            "gondolin: overlay mount requested but fuse-overlayfs is not "
+            "installed. Install it with `sudo apt install fuse-overlayfs` "
+            "(WSL/Debian/Ubuntu) or remove `overlay: true` from the mount "
+            "config to bind directly."
+        )
+
+    overlays_root = sandbox_dir / "overlays"
+    overlays_root.mkdir(parents=True, exist_ok=True)
+    mounted: list[str] = []
+    try:
+        for entry in extra_mounts:
+            if not entry.pop("overlay", False):
+                continue
+            if entry.get("readonly"):
+                logger.warning(
+                    "gondolin: ignoring overlay=true on readonly mount %s "
+                    "(overlay only makes sense for read-write mounts)",
+                    entry.get("guest_path", "?"),
+                )
+                continue
+            lower = entry["host_path"]
+            if not os.path.isdir(lower):
+                raise RuntimeError(
+                    f"gondolin: overlay lower dir does not exist or is not "
+                    f"a directory: {lower}"
+                )
+            safe = _overlay_safe_name(entry["guest_path"])
+            odir = overlays_root / safe
+            upper = odir / "upper"
+            work = odir / "work"
+            merged = odir / "merged"
+            for p in (upper, work, merged):
+                p.mkdir(parents=True, exist_ok=True)
+            # fuse-overlayfs runs as the host user that spawned the daemon
+            # (e.g. matt, uid 1000). gondolin's sandboxfs proxies guest I/O
+            # to the host as that same uid, so as long as upper/work are
+            # owned by the daemon user, writes from the guest "root"
+            # (which is actually uid 1000 on the host side) succeed.
+            # We deliberately do NOT pass squash_to_root: that flag makes
+            # fuse-overlayfs attempt copy-up writes as uid 0, which fails
+            # because the daemon lacks CAP_SETUID -- the guest then sees
+            # EACCES on every write into the merged tree.
+            opts = (
+                f"lowerdir={lower},upperdir={upper},workdir={work},"
+                f"noatime"
+            )
+            proc = subprocess.run(
+                ["fuse-overlayfs", "-o", opts, str(merged)],
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=20,
+            )
+            if proc.returncode != 0:
+                raise RuntimeError(
+                    f"fuse-overlayfs mount failed for {entry['guest_path']} "
+                    f"(rc={proc.returncode}): {proc.stderr.strip() or proc.stdout.strip()}"
+                )
+            entry["host_path"] = str(merged)
+            mounted.append(str(merged))
+            logger.debug(
+                "gondolin: overlay mounted %s -> %s (lower=%s)",
+                entry["guest_path"], merged, lower,
+            )
+    except Exception:
+        _teardown_overlay_mounts(mounted)
+        raise
+    return mounted
+
+
+def _teardown_overlay_mounts(merged_paths: list[str]) -> None:
+    """Lazy-unmount each fuse-overlayfs mount. Best-effort; never raises.
+
+    Lazy unmount (-z) detaches even if something inside still has open
+    file handles — important because the daemon may not have fully
+    released the rootfs yet when cleanup runs. Without -z we'd see EBUSY
+    and leak the mount forever.
+    """
+    umount = shutil.which("fusermount3") or shutil.which("fusermount")
+    if umount is None:
+        return
+    for m in merged_paths:
+        try:
+            subprocess.run(
+                [umount, "-u", "-z", m],
+                check=False,
+                capture_output=True,
+                timeout=10,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("gondolin overlay unmount failed for %s: %s", m, exc)
+
+
+def _sweep_stale_overlay_mounts() -> None:
+    """One-shot cleanup of fuse-overlayfs mounts under our sandboxes dir.
+
+    Called once at module import so a hard-killed prior process (kill
+    -9, OOM, WSL restart) doesn't leave us with mounts the next gateway
+    can't safely rmtree. Scoped strictly to mountpoints under
+    ``~/.hermes/sandboxes/gondolin/*/overlays/*/merged`` so we can't
+    accidentally unmount something unrelated.
+    """
+    try:
+        mountinfo = Path("/proc/self/mountinfo").read_text()
+    except OSError:
+        return
+    sandboxes_root = Path.home() / ".hermes" / "sandboxes" / "gondolin"
+    try:
+        sandboxes_root_resolved = sandboxes_root.resolve()
+    except Exception:  # noqa: BLE001
+        return
+    if not sandboxes_root_resolved.exists():
+        return
+    umount = shutil.which("fusermount3") or shutil.which("fusermount")
+    if umount is None:
+        return
+    sandboxes_prefix = str(sandboxes_root_resolved) + os.sep
+    for line in mountinfo.splitlines():
+        if "fuse-overlayfs" not in line:
+            continue
+        parts = line.split()
+        if len(parts) < 5:
+            continue
+        mp = parts[4]
+        try:
+            mp_resolved = Path(mp).resolve(strict=False)
+        except Exception:  # noqa: BLE001
+            continue
+        mp_str = str(mp_resolved)
+        if not (mp_str == str(sandboxes_root_resolved) or mp_str.startswith(sandboxes_prefix)):
+            continue
+        if mp_resolved.name != "merged":
+            continue
+        logger.warning("gondolin: sweeping stale overlay mount %s", mp)
+        try:
+            subprocess.run(
+                [umount, "-u", "-z", mp],
+                check=False,
+                capture_output=True,
+                timeout=10,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("gondolin stale-mount sweep failed for %s: %s", mp, exc)
 
 
 def _start_daemon_stderr_reaper(
@@ -472,7 +669,14 @@ class GondolinEnvironment(BaseEnvironment):
         # possible.
         project_skills = self.config.pop("project_skills", True)
         project_credentials = self.config.pop("project_credentials", True)
-        extra_mounts = list(self.config.get("extra_mounts") or [])
+        # Deep-copy: this list (and its entries) is mutated below — overlay
+        # setup rewrites host_path and pops "overlay", credential grouping
+        # appends to allowed_files. Without a deepcopy two GondolinEnvironment
+        # instances built from the same config dict alias their entries and
+        # the second instance binds the first instance's overlay merged dir
+        # instead of creating its own — defeating overlay isolation.
+        import copy as _copy
+        extra_mounts = _copy.deepcopy(list(self.config.get("extra_mounts") or []))
         if project_skills or project_credentials:
             try:
                 from tools.credential_files import (
@@ -541,6 +745,23 @@ class GondolinEnvironment(BaseEnvironment):
                 extra_mounts.extend(grouped.values())
         if extra_mounts:
             self.config["extra_mounts"] = extra_mounts
+
+        # Per-mount fuse-overlayfs setup. For each extra_mounts entry
+        # with overlay: True, we mount the live host dir as the lower
+        # layer of an overlayfs whose upper+work live under this
+        # sandbox's directory. The entry's host_path is rewritten in
+        # place to point at the merged dir, so the daemon (and the VM
+        # via vfs.mounts) sees a normal bind whose writes never touch
+        # the host vault. Two concurrent sandboxes thus have fully
+        # isolated upper layers — no spooky action across sandboxes.
+        # See website/docs/user-guide/configuration.md "Overlay mounts".
+        global _SWEEP_DONE
+        if not _SWEEP_DONE:
+            _sweep_stale_overlay_mounts()
+            _SWEEP_DONE = True
+        self._overlay_mounts: list[str] = _setup_overlay_mounts(
+            extra_mounts, self.sandbox_dir
+        )
 
         # Captured from the init response; useful for tests and for
         # higher-level code that wants to know where the workspace lives.
@@ -644,6 +865,8 @@ class GondolinEnvironment(BaseEnvironment):
             self._start_secret_refresher_if_needed()
         except Exception:
             self._terminate_daemon()
+            _teardown_overlay_mounts(self._overlay_mounts)
+            self._overlay_mounts = []
             raise
 
     # ------------------------------------------------------------------
@@ -815,6 +1038,16 @@ class GondolinEnvironment(BaseEnvironment):
             logger.debug("gondolin shutdown rpc failed (will SIGTERM): %s", exc)
 
         self._terminate_daemon()
+
+        # Unmount any per-mount fuse-overlayfs overlays this session
+        # spawned. Must happen BEFORE the outer sandbox_dir is rmtree'd
+        # (by the lifecycle layer above this class), otherwise the
+        # rmtree races with the still-mounted merged dir and fails with
+        # EBUSY. Lazy unmount (-z) keeps us safe even if something in
+        # the VM still has open file descriptors at this instant.
+        if getattr(self, "_overlay_mounts", None):
+            _teardown_overlay_mounts(self._overlay_mounts)
+            self._overlay_mounts = []
 
         # Honor the persistence lifecycle. Non-persistent sessions rm the
         # workspace dir so its content doesn't leak into the next session
