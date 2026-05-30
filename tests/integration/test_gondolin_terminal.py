@@ -57,6 +57,32 @@ def _python_image_present() -> bool:
         return False
 
 
+UNIVERSAL_DEVCONTAINER_IMAGE = "mcr.microsoft.com/devcontainers/universal:6"
+
+
+def _universal_devcontainer_image_present() -> bool:
+    """Probe for the universal:6 devcontainer image.
+
+    Separate from ``_python_image_present`` because universal:6 is a
+    distinct image (huge, ships ruby/rvm/conda/etc.) that historically
+    surfaced two snapshot-capture regressions:
+
+    1. ``nvs.sh`` uses a bashism (``&>``) sourced by dash, leaking
+       ``/opt/conda/bin/xz`` onto every command's stdout
+       (fixed in 1aec96cef: argv-form vm.exec, no /bin/sh -lc wrap).
+    2. ``rvm.sh`` uses process substitution (``<(cmd)``), which fails
+       because gondolin guests don't ship /dev/fd symlinks
+       (fixed in fd2896a38: daemon-side setupGuestDevSymlinks).
+
+    The regression test below depends on this image being built.
+    """
+    try:
+        from hermes_cli.gondolin_image import is_image_built, oci_image_tag
+        return is_image_built(oci_image_tag(UNIVERSAL_DEVCONTAINER_IMAGE))
+    except Exception:  # noqa: BLE001
+        return False
+
+
 @pytest.fixture
 def gondolin_env(tmp_path):
     """A real GondolinEnvironment with a real VM. ~16s cold boot."""
@@ -199,6 +225,92 @@ def gondolin_env_with_python(tmp_path):
         yield env
     finally:
         env.cleanup()
+
+
+@pytest.fixture
+def gondolin_env_universal_devcontainer(tmp_path):
+    """Real Gondolin VM on the universal:6 devcontainer image.
+
+    Used by the snapshot-capture regression below. universal:6 is the
+    image that surfaced both prior steady-state-leak bugs (xz from nvs.sh,
+    /dev/fd from rvm.sh) so we lock down clean behavior here.
+    """
+    from hermes_cli.gondolin_image import oci_image_tag
+    from tools.environments.gondolin import GondolinEnvironment
+
+    env = GondolinEnvironment(
+        sandbox_dir=str(tmp_path / "sandbox"),
+        cwd="/workspace",
+        timeout=60,
+        init_timeout=240.0,  # universal:6 is ~5GB; allow extra cold-boot budget
+        stub_vm=False,
+        config={"image": oci_image_tag(UNIVERSAL_DEVCONTAINER_IMAGE)},
+    )
+    try:
+        yield env
+    finally:
+        env.cleanup()
+
+
+@requires_gondolin
+@pytest.mark.skipif(
+    not _universal_devcontainer_image_present(),
+    reason="universal:6 image not built locally — run `hermes gondolin prebuild`",
+)
+def test_snapshot_capture_is_clean_on_universal_devcontainer(
+    gondolin_env_universal_devcontainer,
+):
+    """Cross-cutting leak detector for the BaseEnvironment snapshot
+    machinery on a real-world devcontainer image with profile.d scripts.
+
+    universal:6 has historically broken two ways in steady-state output:
+      1. ``/etc/profile.d/nvs.sh`` uses ``&>`` (bashism) → dash backgrounds
+         ``command -v xz`` → ``/opt/conda/bin/xz`` leaks onto every command
+         (fixed in 1aec96cef: argv-form vm.exec bypasses the SDK shell wrap).
+      2. ``/etc/profile.d/rvm.sh`` uses process substitution ``<(cmd)`` →
+         fails because gondolin guests ship no /dev/fd symlink
+         (fixed in fd2896a38: daemon installs the symlinks at VM init).
+
+    Both bugs were invisible to existing assertions because they only
+    surfaced at session-snapshot time (login=True), not under the
+    steady-state stub fixtures. This test exercises the real path on
+    the canonical real-world image.
+
+    Asserts:
+      - ``init_session`` succeeds and sets ``_snapshot_ready = True``
+        (no silent fallback to login-every-call).
+      - A trivial ``echo`` round-trips with EXACT output (no extra bytes
+        leaked from profile scripts).
+      - No known leak patterns (xz path, /dev/fd errors) appear in output.
+      - Process substitution works (sanity check for the /dev/fd fix).
+    """
+    env = gondolin_env_universal_devcontainer
+    env.init_session()
+    assert env._snapshot_ready, (
+        "snapshot capture must succeed on universal:6 — if this is False, "
+        "every execute() falls back to bash -l and pays the full profile "
+        "cost on every call"
+    )
+
+    # Exact-match echo: any prefix/suffix from a profile script will trip this.
+    r = env.execute("echo HERMES_PROBE_OK")
+    assert r["returncode"] == 0, r
+    assert r["output"] == "HERMES_PROBE_OK\n", (
+        f"steady-state output has unexpected bytes: {r['output']!r}"
+    )
+
+    # Named-pattern leak detector across a second command.
+    r2 = env.execute("printf clean")
+    assert r2["output"] == "clean", repr(r2["output"])
+    for needle in ("/opt/conda/bin/xz", "/dev/fd/", "No such file or directory"):
+        assert needle not in r2["output"], (
+            f"known-leak pattern {needle!r} appeared in output: {r2['output']!r}"
+        )
+
+    # Process substitution sanity (locks in the /dev/fd fix at the bash level).
+    r3 = env.execute("cat <(echo procsub)")
+    assert r3["returncode"] == 0
+    assert r3["output"] == "procsub\n", repr(r3["output"])
 
 
 @requires_gondolin
