@@ -496,6 +496,18 @@ def _get_file_ops(task_id: str = "default") -> ShellFileOperations:
                     "persistent": config.get("local_persistent", False),
                 }
 
+            # Mirror terminal_tool.py's gondolin_config plumbing. Without
+            # this, _create_environment's gondolin branch sees
+            # gondolin_config=None, the factory's _xform_image is called
+            # with image=None, and write_file / patch fails with
+            # "Invalid gondolin image configuration: None" — but only when
+            # file_tools is the first creator of the env (i.e. after the
+            # 5-min cleanup thread reaped the prior one). Live for months
+            # before the user hit it in steady state on 2026-05-30.
+            gondolin_config = None
+            if env_type == "gondolin":
+                gondolin_config = config.get("gondolin") or {}
+
             terminal_env = _create_environment(
                 env_type=env_type,
                 image=image,
@@ -504,6 +516,7 @@ def _get_file_ops(task_id: str = "default") -> ShellFileOperations:
                 ssh_config=ssh_config,
                 container_config=container_config,
                 local_config=local_config,
+                gondolin_config=gondolin_config,
                 task_id=task_id,
                 host_cwd=config.get("host_cwd"),
             )
