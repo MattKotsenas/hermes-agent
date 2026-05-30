@@ -1293,3 +1293,105 @@ infrastructure.
 - Optional skill-specific image hints: a skill declares it needs
   `gh`; the wizard's default suggestion narrows to images that ship
   it. Out of scope for the upstream PR; tracked separately.
+
+## Per-instance vs per-task state split (2026-05-30)
+
+### The bug this closes
+
+Two Hermes processes (interactive session + cron job, two concurrent
+agents in the same gateway, etc.) defaulting to `task_id="default"`
+both call `GondolinEnvironment(sandbox_dir=".../gondolin/default/")`.
+Prior to this change, both daemons bound their AF_UNIX socket at the
+same path `<sandbox_dir>/gondolin.sock`. The second daemon's
+unlink+bind orphaned the first daemon's listener — the file on disk
+pointed to the second daemon, the first daemon's connection-accept
+loop stayed alive in the kernel but unreachable from the filesystem,
+and the first agent saw "sandbox died" on its next call.
+
+The same collision broke fuse-overlayfs scratch: two daemons mounting
+`<sandbox_dir>/overlays/<safe>/` would either error (EBUSY) or — if
+the first mount was torn down — silently corrupt each other's upper
+layers.
+
+### How docker/singularity solve it (the reference)
+
+`docker.py` keeps `sandbox_dir = sandboxes/docker/<task_id>` (per-task,
+for persistent state) but stamps `container_name = f"hermes-{uuid8}"`
+(per-instance, for runtime identity). `singularity.py` does the same
+with `instance_id = f"hermes_{uuid12}"`. Two processes can both have
+`task_id="default"` and never collide because the running container's
+name is uuid-suffixed.
+
+### Gondolin's split (matching the docker model)
+
+Three categories of state, treated differently:
+
+| Category | Lives at | Lifetime | Shared across instances? |
+|---|---|---|---|
+| Persistent state (workspace) | `<sandbox_dir>/workspace/` | Across `--resume`; rm'd on cleanup when `persistent=False` | **Yes** — same task ⇒ same workspace (matches docker contract) |
+| Per-instance runtime (pidfile, overlay scratch) | `<sandbox_dir>/instances/<instance_id>/` | rm'd on every cleanup | No |
+| Daemon socket | `/tmp/gondolin-sock-<instance_id>.sock` | rm'd on every cleanup | No |
+
+The socket lives in `/tmp` (not inside `instance_dir`) because AF_UNIX
+paths are capped at 108 bytes on Linux. Pytest's nested tmp_paths +
+the per-instance subdir would blow past that ceiling. `/tmp` matches
+the pattern gondolin already uses for its qcow2 files
+(`/tmp/gondolin-disk-*.qcow2`) and that `code_execution_tool` uses for
+its own RPC socket (`/tmp/hermes_rpc_*.sock`).
+
+### Sweep ownership-awareness
+
+`_sweep_stale_overlay_mounts` runs once at module import to clean up
+fuse-overlayfs mounts that survived a hard process crash (kill -9,
+OOM, WSL restart). With per-instance scratch dirs, the sweep MUST be
+ownership-aware — without it, a fresh process starting up while
+another instance is live would unmount the live instance's overlay
+out from under it.
+
+Each instance writes its PID to `<instance_dir>/owner.pid` at
+construction (before any other instance setup, so the sweep can't
+race a half-built instance). The sweep walks each fuse-overlayfs
+mount, climbs the path to find the owning instance_dir, and skips
+the mount if `os.kill(pid, 0)` confirms the owner is still alive.
+`ProcessLookupError` means the pid is gone (safe to sweep);
+`PermissionError` means the pid belongs to another user (treat as
+alive — don't touch their mount).
+
+### Cross-process cap actually engages
+
+The `terminal.gondolin.lock_dir` knob already existed and the factory
+already populated a sensible default at
+`~/.hermes/sandboxes/gondolin/.locks/`. But the in-process cap
+defaulted to 0 (unlimited), which short-circuited the cross-process
+flock layer (`if cap > 0 and lock_dir`). The cap was decorative.
+
+`_DEFAULT_MAX_CONCURRENT_VMS = 4` now defaults the cap to 4 — safe
+for a 32+ GB laptop at the typical 5 GB/VM memory setting, and high
+enough that an interactive session + a couple of cron ticks coexist
+without friction. Users with more headroom bump via
+`TERMINAL_GONDOLIN_MAX_CONCURRENT_VMS` / `terminal.gondolin.max_concurrent_vms`;
+setting to 0 restores legacy unlimited behavior.
+
+The cross-process flock layer (slot-N.lock files under `lock_dir`)
+now engages out of the box without explicit opt-in.
+
+### Open follow-ups
+
+- **Workspace contention policy (Phase 3 of the original plan)**:
+  two instances of the same task currently share `workspace/`. That
+  matches docker's contract but means a cron job can `rm -rf`
+  something the interactive session is editing. Options: keep the
+  shared model and document it; fork-on-write via fuse-overlayfs
+  per-instance like extra_mounts does; or refuse the second
+  instance with a clear error when an active first instance is
+  detected. Decision deferred — needs real usage to know which
+  failure mode is more common.
+
+- **Cross-backend hoisting (Phase 5 of the original plan)**: docker,
+  singularity, and gondolin all implement the per-task-persistent-state
+  vs per-instance-runtime split slightly differently. Drift is
+  inevitable; a small `tools/environments/instance_id.py` helper
+  would centralize the pattern. Out of scope for this commit;
+  worth it once a fourth backend (or a fourth bug from drift)
+  motivates the refactor.
+

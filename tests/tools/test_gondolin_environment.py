@@ -378,6 +378,262 @@ def test_concurrent_vm_cap_disabled_when_zero_or_negative(tmp_path, monkeypatch)
             e.cleanup()
 
 
+# ----------------------------------------------------------------------
+# Same-sandbox-dir (same task_id) coexistence — regression for the
+# multi-process daemon collision discovered 2026-05-30:
+# - two processes both with task="default" → both daemons listen() on
+#   the same gondolin.sock path
+# - second daemon's bind() unlinks the first daemon's socket file
+# - first daemon's listener still exists in the kernel but is unreachable
+#   from the filesystem; the first agent reports "sandbox died" with a
+#   socket error on the next call
+# - the bandage today is "whoever spawned last wins, the other gets a
+#   confused VM"
+#
+# Fix: each GondolinEnvironment instance gets its own per-instance
+# subdirectory under sandbox_dir/, and its socket + overlay scratch
+# live there. Multiple instances with the same sandbox_dir coexist
+# without ever touching each other's runtime files.
+# ----------------------------------------------------------------------
+
+
+@requires_node
+def test_two_envs_same_sandbox_dir_get_isolated_sockets(tmp_path, monkeypatch):
+    """Two GondolinEnvironment instances sharing the same sandbox_dir
+    (the on-disk equivalent of two processes both with task_id='default')
+    MUST get separate socket paths so neither daemon unlinks the other's
+    listener. Without this, the second instance's bind() steals the
+    socket file and the first instance silently loses connectivity."""
+    from tools.environments import gondolin as gondolin_mod
+    from tools.environments.gondolin import GondolinEnvironment
+
+    # Disable the cap so both instances spawn without slot conflict.
+    monkeypatch.setattr(gondolin_mod, "_max_concurrent_vms", 0)
+
+    shared = str(tmp_path / "shared-task")
+    env_a = GondolinEnvironment(sandbox_dir=shared, stub_vm=True)
+    try:
+        env_b = GondolinEnvironment(sandbox_dir=shared, stub_vm=True)
+        try:
+            # Per-instance: socket paths must differ.
+            assert env_a.sock_path != env_b.sock_path, (
+                f"both instances landed on the same socket path: "
+                f"{env_a.sock_path!r} — second bind would unlink the first"
+            )
+            # Both socket files exist on disk.
+            assert os.path.exists(env_a.sock_path), (
+                f"env_a socket missing at {env_a.sock_path} — was it unlinked "
+                f"when env_b started?"
+            )
+            assert os.path.exists(env_b.sock_path), (
+                f"env_b socket missing at {env_b.sock_path}"
+            )
+            # Both daemons accept connections (proves neither was orphaned).
+            for env in (env_a, env_b):
+                s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                try:
+                    s.connect(env.sock_path)
+                finally:
+                    s.close()
+            # Workspace dir is SHARED — that's the persistent contract
+            # tied to task_id. Sanity check that we didn't accidentally
+            # isolate that too.
+            assert env_a.workspace_dir == env_b.workspace_dir, (
+                "workspace_dir must stay shared across instances of the "
+                "same sandbox_dir (it's the persistent-by-task contract)"
+            )
+        finally:
+            env_b.cleanup()
+    finally:
+        env_a.cleanup()
+
+
+@requires_node
+def test_two_envs_same_sandbox_dir_overlay_scratch_isolated(tmp_path, monkeypatch):
+    """When two instances share sandbox_dir and both configure an
+    overlay extra_mount, their fuse-overlayfs upper/work scratch dirs
+    must be in separate per-instance paths so they don't corrupt each
+    other (two fuse-overlayfs processes writing to the same upper layer
+    is a recipe for filesystem-level disaster)."""
+    from tools.environments import gondolin as gondolin_mod
+    from tools.environments.gondolin import GondolinEnvironment
+
+    monkeypatch.setattr(gondolin_mod, "_max_concurrent_vms", 0)
+
+    # Skip if fuse-overlayfs isn't available — the overlay code path
+    # short-circuits and there's nothing to test.
+    if shutil.which("fuse-overlayfs") is None:
+        pytest.skip("fuse-overlayfs not installed")
+
+    # A real host dir for the overlay lower.
+    lower = tmp_path / "lower"
+    lower.mkdir()
+    (lower / "preexisting.txt").write_text("hi\n")
+
+    shared = str(tmp_path / "shared-task")
+    overlay_cfg = {
+        "extra_mounts": [
+            {
+                "host_path": str(lower),
+                "guest_path": "/mnt/lower",
+                "readonly": False,
+                "overlay": True,
+            }
+        ],
+        # Disable skill/credential projection so we only see the overlay we set up.
+        "project_skills": False,
+        "project_credentials": False,
+    }
+
+    env_a = GondolinEnvironment(sandbox_dir=shared, stub_vm=True, config=dict(overlay_cfg))
+    try:
+        env_b = GondolinEnvironment(sandbox_dir=shared, stub_vm=True, config=dict(overlay_cfg))
+        try:
+            # Overlay merged paths must differ (different upper/work dirs
+            # → different merged mount points).
+            assert env_a._overlay_mounts, "env_a should have at least one overlay mount"
+            assert env_b._overlay_mounts, "env_b should have at least one overlay mount"
+            assert set(env_a._overlay_mounts).isdisjoint(set(env_b._overlay_mounts)), (
+                f"overlay scratch collided across instances: "
+                f"env_a={env_a._overlay_mounts!r}, env_b={env_b._overlay_mounts!r}"
+            )
+        finally:
+            env_b.cleanup()
+    finally:
+        env_a.cleanup()
+
+
+def test_module_default_cap_enforces_a_nonzero_limit():
+    """The default cap MUST be non-zero so the cross-process lock_dir
+    machinery actually engages out of the box. A default of 0 leaves
+    the cap disabled and the lock_dir decorative — that's the bug
+    Phase 4 fixes."""
+    from tools.environments import gondolin as gondolin_mod
+
+    # Default is module-level; check the constant rather than the
+    # runtime value (env var / monkeypatch may shift it in CI).
+    assert gondolin_mod._DEFAULT_MAX_CONCURRENT_VMS > 0, (
+        "default cap must be > 0 so the cross-process flock layer "
+        "engages without explicit opt-in"
+    )
+
+
+@requires_node
+def test_default_lock_dir_materializes_on_first_env(tmp_path, monkeypatch):
+    """When the factory provides a lock_dir (the normal case) and the
+    cap is the default, constructing a GondolinEnvironment must create
+    the lock dir and write a slot file. Today this happens via
+    _acquire_vm_slot's os.makedirs — this test locks it in."""
+    from tools.environments import gondolin as gondolin_mod
+    from tools.environments.gondolin import GondolinEnvironment
+
+    lock_dir = tmp_path / "locks"
+    assert not lock_dir.exists()
+    # Force the default cap into effect (in case the env or another test
+    # monkeypatched it elsewhere).
+    monkeypatch.setattr(
+        gondolin_mod,
+        "_max_concurrent_vms",
+        gondolin_mod._DEFAULT_MAX_CONCURRENT_VMS,
+    )
+    env = GondolinEnvironment(
+        sandbox_dir=str(tmp_path / "sb"),
+        stub_vm=True,
+        config={"lock_dir": str(lock_dir)},
+    )
+    try:
+        assert lock_dir.is_dir(), (
+            f"lock_dir not materialized at {lock_dir} — "
+            f"_acquire_vm_slot should have os.makedirs'd it"
+        )
+        # Exactly one slot file should be flocked (this instance's).
+        slot_files = list(lock_dir.glob("slot-*.lock"))
+        assert len(slot_files) >= 1, (
+            f"no slot files in {lock_dir}; flock layer didn't fire"
+        )
+    finally:
+        env.cleanup()
+
+
+# ----------------------------------------------------------------------
+# Sweep ownership-awareness — protects against a second process's
+# import-time sweep unmounting a live instance's fuse-overlayfs mount.
+# These are pure-function tests against the helpers; the cross-process
+# integration scenario is hard to exercise from a single test runner.
+# ----------------------------------------------------------------------
+
+def test_instance_is_alive_returns_true_for_own_pid(tmp_path):
+    """A pidfile containing the test runner's own PID is by definition alive."""
+    from tools.environments.gondolin import (
+        _instance_is_alive,
+        _INSTANCE_PIDFILE,
+    )
+    instance_dir = tmp_path / "live"
+    instance_dir.mkdir()
+    (instance_dir / _INSTANCE_PIDFILE).write_text(f"{os.getpid()}\n")
+    assert _instance_is_alive(instance_dir) is True
+
+
+def test_instance_is_alive_returns_false_for_dead_pid(tmp_path):
+    """A pidfile pointing at a PID that doesn't exist must report dead.
+    Picks a PID known to be free by walking up from 2**31 - 1 (max int32
+    pid on Linux; never assigned)."""
+    from tools.environments.gondolin import (
+        _instance_is_alive,
+        _INSTANCE_PIDFILE,
+    )
+    instance_dir = tmp_path / "dead"
+    instance_dir.mkdir()
+    # PIDs above /proc/sys/kernel/pid_max never exist; 2**22 is well
+    # past the default 4M ceiling on most distros.
+    fake_pid = 2**22
+    (instance_dir / _INSTANCE_PIDFILE).write_text(f"{fake_pid}\n")
+    assert _instance_is_alive(instance_dir) is False
+
+
+def test_instance_is_alive_returns_false_for_missing_pidfile(tmp_path):
+    """No pidfile at all → not a recognizable live instance (e.g. legacy
+    pre-instance-split scratch dir, or partially-cleaned-up dir)."""
+    from tools.environments.gondolin import _instance_is_alive
+    instance_dir = tmp_path / "no_pidfile"
+    instance_dir.mkdir()
+    assert _instance_is_alive(instance_dir) is False
+
+
+def test_instance_is_alive_returns_false_for_junk_pidfile(tmp_path):
+    """A pidfile with non-integer content shouldn't crash the sweep; treat
+    it as dead so the cleanup proceeds."""
+    from tools.environments.gondolin import (
+        _instance_is_alive,
+        _INSTANCE_PIDFILE,
+    )
+    instance_dir = tmp_path / "junk"
+    instance_dir.mkdir()
+    (instance_dir / _INSTANCE_PIDFILE).write_text("not-a-pid\n")
+    assert _instance_is_alive(instance_dir) is False
+
+
+def test_find_owning_instance_dir_walks_up_to_instances_subdir(tmp_path):
+    """Given a fuse-overlayfs merged path, the helper must return the
+    per-instance dir (the grandparent of overlays/)."""
+    from tools.environments.gondolin import (
+        _find_owning_instance_dir,
+        _INSTANCES_SUBDIR,
+    )
+    instance = tmp_path / "sb" / _INSTANCES_SUBDIR / "abc12345"
+    mount = instance / "overlays" / "vault_xyz" / "merged"
+    assert _find_owning_instance_dir(str(mount)) == instance
+
+
+def test_find_owning_instance_dir_returns_none_for_legacy_layout(tmp_path):
+    """Pre-instance-split mount paths (no `instances/` segment) return
+    None — the sweep treats those as ownerless and proceeds to clean
+    them up (which is the right behavior for legacy leaks)."""
+    from tools.environments.gondolin import _find_owning_instance_dir
+    legacy = tmp_path / "sb" / "overlays" / "vault_xyz" / "merged"
+    assert _find_owning_instance_dir(str(legacy)) is None
+
+
 # ---- Cross-process cap -------------------------------------------------
 #
 # The in-process cap above only blocks excess VMs from a single Python

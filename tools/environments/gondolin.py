@@ -35,6 +35,7 @@ import subprocess
 import sys
 import threading
 import time
+import uuid
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -45,8 +46,41 @@ from tools.environments.gondolin_secret_refresh import SecretRefresher
 logger = logging.getLogger(__name__)
 
 
+# Per-instance subdirectory layout under sandbox_dir:
+#
+#   <sandbox_dir>/                    ← persistent state (per task_id)
+#     workspace/                      ← bind-mounted at /workspace (persistent)
+#     instances/                      ← per-instance scratch root
+#       <instance_id>/                ← uuid8, one per GondolinEnvironment
+#         owner.pid                   ← writer's PID (for sweep ownership check)
+#         overlays/<safe>/            ← fuse-overlayfs scratch (upper/work/merged)
+#
+#   /tmp/gondolin-sock-<instance_id>.sock   ← daemon AF_UNIX socket
+#                                             (lives outside sandbox_dir so
+#                                             deep paths don't hit the 108-byte
+#                                             AF_UNIX kernel cap)
+#
+# The split exists because two processes can legitimately share the same
+# task_id (interactive session + cron jobs both defaulting to "default"),
+# and they need to share workspace state (the persistent contract) but
+# NOT the daemon socket or overlay scratch (sharing those is undefined
+# behavior — second daemon's bind() steals the first's socket; two
+# fuse-overlayfs processes on the same upper/work corrupt each other).
+#
+# Docker handles this by giving each container a uuid-suffixed name
+# while keeping the sandbox dir keyed by task_id; this is the same idea
+# applied to gondolin's per-process daemon model. See
+# docs/design/gondolin-terminal-backend.md for the architectural
+# rationale and the open follow-ups (workspace-contention policy,
+# cross-backend hoisting of the pattern).
+_INSTANCES_SUBDIR = "instances"
+_INSTANCE_PIDFILE = "owner.pid"
+
+
 # Run once at import: clean up overlay mounts leaked by a prior hard
 # crash so the next sandbox's rmtree(sandbox_dir) doesn't fail with EBUSY.
+# With per-instance scratch dirs, this only sweeps instances whose owning
+# process is dead — live instances are skipped via PID-file check.
 try:
     _SWEEP_DONE
 except NameError:
@@ -65,14 +99,17 @@ def _overlay_safe_name(guest_path: str) -> str:
 
 
 def _setup_overlay_mounts(
-    extra_mounts: list[dict], sandbox_dir: Path
+    extra_mounts: list[dict], scratch_root: Path
 ) -> list[str]:
     """For each extra_mounts entry with ``overlay: True``, spawn
     fuse-overlayfs and rewrite the entry's host_path to point at the
     merged dir. Returns the list of merged paths that must be
     unmounted on cleanup.
 
-    Layout (per mount): ``<sandbox_dir>/overlays/<safe>/{upper,work,merged}``.
+    Layout (per mount): ``<scratch_root>/overlays/<safe>/{upper,work,merged}``.
+    ``scratch_root`` is the per-instance directory (sandbox_dir/instances/
+    <instance_id>) — NOT the shared sandbox_dir, so two concurrent
+    sandboxes with the same task_id get fully isolated upper/work layers.
     The user's live vault dir becomes the lower layer. Writes from the
     sandbox land in upper/ and never touch the host vault.
 
@@ -101,7 +138,7 @@ def _setup_overlay_mounts(
             "config to bind directly."
         )
 
-    overlays_root = sandbox_dir / "overlays"
+    overlays_root = scratch_root / "overlays"
     overlays_root.mkdir(parents=True, exist_ok=True)
     mounted: list[str] = []
     try:
@@ -216,14 +253,58 @@ def _teardown_overlay_mounts(merged_paths: list[str]) -> None:
             )
 
 
+def _instance_is_alive(instance_dir: Path) -> bool:
+    """True if the instance dir has a pidfile pointing at a live process.
+
+    Used by ``_sweep_stale_overlay_mounts`` to skip live instances when
+    cleaning up after a crashed prior process. ``ProcessLookupError``
+    means the pid no longer exists (instance is dead). ``PermissionError``
+    means the pid belongs to another user; we conservatively treat that
+    as alive so we never unmount someone else's mount.
+    """
+    pidfile = instance_dir / _INSTANCE_PIDFILE
+    try:
+        pid_str = pidfile.read_text().strip()
+        pid = int(pid_str)
+    except (OSError, ValueError):
+        # No pidfile or junk content: not a recognizable live instance.
+        return False
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        # PID belongs to another user — don't sweep their mount.
+        return True
+
+
+def _find_owning_instance_dir(mount_path: str) -> Path | None:
+    """Walk up from a fuse-overlayfs merged path to find the per-instance
+    directory that owns it. Returns None if the path doesn't fit the
+    expected layout (e.g. legacy pre-instance-split mounts)."""
+    p = Path(mount_path)
+    for parent in p.parents:
+        # Layout: <sandbox_dir>/instances/<instance_id>/overlays/<safe>/merged
+        if parent.parent.name == _INSTANCES_SUBDIR:
+            return parent
+    return None
+
+
 def _sweep_stale_overlay_mounts() -> None:
     """One-shot cleanup of fuse-overlayfs mounts under our sandboxes dir.
 
     Called once at module import so a hard-killed prior process (kill
     -9, OOM, WSL restart) doesn't leave us with mounts the next gateway
     can't safely rmtree. Scoped strictly to mountpoints under
-    ``~/.hermes/sandboxes/gondolin/*/overlays/*/merged`` so we can't
-    accidentally unmount something unrelated.
+    ``~/.hermes/sandboxes/gondolin/*/instances/*/overlays/*/merged`` so
+    we can't accidentally unmount something unrelated.
+
+    With per-instance scratch dirs, this MUST be ownership-aware: a
+    second concurrent process whose own instance is still alive must
+    not have its mounts swept. Each instance writes its PID to
+    ``<instance_dir>/owner.pid`` at construction; the sweep skips any
+    mount whose owning instance has a live PID.
     """
     try:
         mountinfo = Path("/proc/self/mountinfo").read_text()
@@ -255,6 +336,15 @@ def _sweep_stale_overlay_mounts() -> None:
         if not (mp_str == str(sandboxes_root_resolved) or mp_str.startswith(sandboxes_prefix)):
             continue
         if mp_resolved.name != "merged":
+            continue
+        # Ownership check: skip mounts owned by a live instance.
+        instance_dir = _find_owning_instance_dir(mp)
+        if instance_dir is not None and _instance_is_alive(instance_dir):
+            logger.debug(
+                "gondolin: skipping live instance's overlay mount %s "
+                "(owner pidfile %s)",
+                mp, instance_dir / _INSTANCE_PIDFILE,
+            )
             continue
         logger.warning("gondolin: sweeping stale overlay mount %s", mp)
         try:
@@ -359,20 +449,31 @@ _HERE = Path(__file__).resolve().parent
 _DAEMON_JS = _HERE / "gondolin_host" / "src" / "daemon.mjs"
 
 # In-process cap on the number of live Gondolin VMs. Each VM costs
-# ~256-512 MB of host memory at default settings; a gateway hosting many
-# parallel chats could exhaust memory without a cap. Override at runtime
-# by re-binding this module attribute (used by tests and by the factory
-# when the user sets TERMINAL_GONDOLIN_MAX_CONCURRENT_VMS).
+# ~256-512 MB at minimum gondolin defaults, and the BaseEnvironment-level
+# container_memory knob commonly bumps that to 5+ GB per VM. A gateway
+# hosting many parallel chats — or an interactive session running
+# alongside cron jobs — can exhaust memory without a cap.
 #
-# Set to <= 0 to disable the cap entirely. This module-level value is the
-# IN-PROCESS cap. When a lock_dir is also configured, we additionally hold
-# a flock() on a slot file so the cap is honored host-wide across the CLI,
-# subagents, the gateway, and cron jobs. flock() is released on process
-# exit by the kernel, so a crashed process doesn't leak slots.
+# Default is 4: safe for a developer laptop with 32+ GB RAM at the
+# typical 5 GB-per-VM memory setting (4 * 5 = 20 GB), and high enough
+# that an interactive session + a couple of cron ticks coexist without
+# friction. Bump via TERMINAL_GONDOLIN_MAX_CONCURRENT_VMS / config knob
+# if you have headroom and run many parallel sessions; set to 0 to
+# disable the cap entirely (legacy unlimited behavior).
+#
+# This module-level value is the IN-PROCESS cap. When a lock_dir is
+# also configured (the factory sets one by default), we additionally
+# hold a flock() on a slot file so the cap is honored host-wide across
+# the CLI, subagents, the gateway, and cron jobs. flock() is released
+# on process exit by the kernel, so a crashed process doesn't leak slots.
+_DEFAULT_MAX_CONCURRENT_VMS = 4
 try:
-    _max_concurrent_vms = int(os.environ.get("TERMINAL_GONDOLIN_MAX_CONCURRENT_VMS", "0") or "0")
+    _max_concurrent_vms = int(
+        os.environ.get("TERMINAL_GONDOLIN_MAX_CONCURRENT_VMS", str(_DEFAULT_MAX_CONCURRENT_VMS))
+        or str(_DEFAULT_MAX_CONCURRENT_VMS)
+    )
 except ValueError:
-    _max_concurrent_vms = 0
+    _max_concurrent_vms = _DEFAULT_MAX_CONCURRENT_VMS
 
 # Default cross-process lock directory. Resolved lazily so HERMES_HOME /
 # tests can override via the config knob. Empty string = in-process only.
@@ -651,15 +752,42 @@ class GondolinEnvironment(BaseEnvironment):
     ) -> None:
         self.sandbox_dir = Path(sandbox_dir)
         self.sandbox_dir.mkdir(parents=True, exist_ok=True)
-        self.sock_path = str(self.sandbox_dir / "gondolin.sock")
+
+        # Per-instance subdir under sandbox_dir holds the owner pidfile
+        # and the fuse-overlayfs scratch — anything that benefits from
+        # living next to the per-task persistent state but MUST NOT be
+        # shared across two concurrent instances of the same task_id.
+        # See the module-level _INSTANCES_SUBDIR comment for the
+        # architectural rationale.
+        self.instance_id = uuid.uuid4().hex[:8]
+        self.instance_dir = (
+            self.sandbox_dir / _INSTANCES_SUBDIR / self.instance_id
+        )
+        self.instance_dir.mkdir(parents=True, exist_ok=True)
+        # Write the owner pidfile BEFORE any other instance setup so the
+        # sweep can never race and treat a half-built instance as dead.
+        (self.instance_dir / _INSTANCE_PIDFILE).write_text(f"{os.getpid()}\n")
+
+        # AF_UNIX socket paths are kernel-capped at 108 bytes on Linux.
+        # Deeply-nested sandbox_dir paths (especially pytest tmp_paths)
+        # blow past that ceiling once we add the per-instance subdir,
+        # so we put the socket in /tmp with a uuid name — same strategy
+        # gondolin uses for its qcow2 files (/tmp/gondolin-disk-*.qcow2)
+        # and code_execution_tool uses for its RPC socket
+        # (/tmp/hermes_rpc_*.sock). The socket has no lifecycle tie to
+        # sandbox_dir; we explicitly unlink it on cleanup.
+        self.sock_path = str(
+            Path("/tmp") / f"gondolin-sock-{self.instance_id}.sock"
+        )
         self.config = dict(config or {})
         self.stub_vm = stub_vm
 
-        # Workspace lives in a SUBDIR of sandbox_dir, not at the root. The
-        # root holds infra the agent has no business seeing (the daemon's
-        # gondolin.sock, future per-session lock/state files). Binding the
-        # subdir keeps that infra out of the guest's /workspace listing
-        # while still letting the host pick up files the agent wrote.
+        # Workspace lives in a SUBDIR of sandbox_dir (NOT instance_dir),
+        # so two instances of the same task_id share it — that's the
+        # persistent-across-runs contract. The root holds the
+        # instances/ subdir; workspace/ is sibling to it. Binding the
+        # subdir keeps infra out of the guest's /workspace listing while
+        # still letting the host pick up files the agent wrote.
         self.workspace_dir = self.sandbox_dir / "workspace"
         self.workspace_dir.mkdir(parents=True, exist_ok=True)
 
@@ -788,7 +916,7 @@ class GondolinEnvironment(BaseEnvironment):
             _sweep_stale_overlay_mounts()
             _SWEEP_DONE = True
         self._overlay_mounts: list[str] = _setup_overlay_mounts(
-            extra_mounts, self.sandbox_dir
+            extra_mounts, self.instance_dir
         )
 
         # Captured from the init response; useful for tests and for
@@ -1098,6 +1226,18 @@ class GondolinEnvironment(BaseEnvironment):
                 shutil.rmtree(self.workspace_dir, ignore_errors=True)
             except Exception as exc:  # noqa: BLE001
                 logger.debug("gondolin workspace cleanup failed: %s", exc)
+
+        # The instance_dir is ALWAYS removed regardless of the persistent
+        # flag — it only holds per-instance runtime state (socket file,
+        # pidfile, overlay scratch) that's meaningless after the daemon
+        # is gone. Persistence applies to the workspace, not to the
+        # daemon's runtime files.
+        instance_dir = getattr(self, "instance_dir", None)
+        if instance_dir is not None:
+            try:
+                shutil.rmtree(instance_dir, ignore_errors=True)
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("gondolin instance_dir cleanup failed: %s", exc)
 
         # Release the concurrent-VM slot so the next session can spawn.
         # Guarded against double-cleanup (cleanup called twice would
