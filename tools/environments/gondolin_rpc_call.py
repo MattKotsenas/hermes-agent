@@ -144,6 +144,33 @@ def main(argv: list[str] | None = None) -> int:
     params: dict[str, Any] = {"cmd": args.cmd}
     if args.timeout_ms is not None:
         params["timeout_ms"] = args.timeout_ms
+
+    # Forward our own stdin to the daemon as msgpack `bin` in
+    # ``params.stdin``. BaseEnvironment._pipe_stdin pipes the caller's
+    # ``stdin_data`` into our stdin and closes the pipe, so a bounded
+    # read here drains everything and returns on EOF. Without this
+    # forwarding, ShellFileOperations.write_file (which does
+    # ``cat > path`` with the file content on stdin) silently writes
+    # 0-byte files because the daemon never sees the bytes. We skip
+    # the read when stdin is a TTY so an accidental interactive
+    # invocation doesn't block waiting for the user to type EOF.
+    stdin_bytes = b""
+    if not sys.stdin.isatty():
+        try:
+            stdin_bytes = sys.stdin.buffer.read(_MAX_FRAME_BYTES + 1)
+        except (OSError, ValueError):
+            # Closed stdin / no buffer attribute (rare in CPython, but
+            # defensible) -> just send no stdin field.
+            stdin_bytes = b""
+    if len(stdin_bytes) > _MAX_FRAME_BYTES:
+        sys.stderr.write(
+            f"gondolin: stdin payload exceeds {_MAX_FRAME_BYTES} bytes; "
+            f"refusing to forward (write a smaller chunk or stream it)\n"
+        )
+        return 1
+    if stdin_bytes:
+        params["stdin"] = stdin_bytes
+
     method = "exec_stream" if args.stream else "exec"
     request = {"id": 1, "method": method, "params": params}
 

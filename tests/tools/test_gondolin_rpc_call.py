@@ -116,8 +116,23 @@ class FakeDaemon:
             conn.sendall(_encode_frame(resp))
 
 
-def _run_wrapper(sock_path: str, cmd: str, *, timeout_ms: int | None = None, env: dict | None = None, stream: bool = False):
-    """Invoke the wrapper as a subprocess; return CompletedProcess."""
+def _run_wrapper(
+    sock_path: str,
+    cmd: str,
+    *,
+    timeout_ms: int | None = None,
+    env: dict | None = None,
+    stream: bool = False,
+    stdin_bytes: bytes | None = None,
+):
+    """Invoke the wrapper as a subprocess; return CompletedProcess.
+
+    ``stdin_bytes``: bytes to feed to the wrapper's stdin (pipe closed
+    after write). Mirrors what BaseEnvironment._pipe_stdin does in
+    production when ShellFileOperations.write_file pipes content into
+    ``cat > path``. When None, the wrapper's stdin is closed immediately
+    (DEVNULL-like).
+    """
     full_env = os.environ.copy()
     # Make sure the wrapper can import from the repo without an editable install.
     full_env["PYTHONPATH"] = str(REPO_ROOT) + os.pathsep + full_env.get("PYTHONPATH", "")
@@ -128,10 +143,20 @@ def _run_wrapper(sock_path: str, cmd: str, *, timeout_ms: int | None = None, env
         argv.extend(["--timeout-ms", str(timeout_ms)])
     if stream:
         argv.append("--stream")
+    if stdin_bytes is None:
+        return subprocess.run(
+            argv,
+            capture_output=True,
+            text=True,
+            timeout=30,
+            env=full_env,
+        )
+    # Use bytes mode so callers can probe non-UTF-8 stdin without the
+    # text-mode encoder mangling it.
     return subprocess.run(
         argv,
+        input=stdin_bytes,
         capture_output=True,
-        text=True,
         timeout=30,
         env=full_env,
     )
@@ -394,3 +419,86 @@ def test_streaming_rpc_error_after_partial_chunks():
     assert result.returncode != 0
     assert "before-crash" in result.stdout
     assert "vm crashed mid-stream" in result.stderr
+
+
+# ---------------------------------------------------------------------------
+# Stdin forwarding - the wrapper must propagate its own stdin to the daemon
+# as params.stdin so `cat > path` style writes actually get content.
+# Regression: ShellFileOperations.write_file silently produced 0-byte files
+# because gondolin_rpc_call dropped stdin on the floor.
+# ---------------------------------------------------------------------------
+
+
+def test_stdin_forwarded_to_daemon_in_params_non_stream():
+    """Non-streaming exec: wrapper's stdin bytes appear in params.stdin."""
+    response = {
+        "result": {"exit_code": 0, "stdout": "", "stderr": "", "duration_ms": 1}
+    }
+    payload = b"the quick brown fox jumps over the lazy dog\n"
+    with FakeDaemon(response) as daemon:
+        result = _run_wrapper(daemon.sock_path, "cat > /tmp/out", stdin_bytes=payload)
+
+    assert result.returncode == 0, result
+    req = daemon.received_request
+    assert req["method"] == "exec"
+    # The wrapper sends bytes (msgpack bin) so the daemon can hand them
+    # directly to vm.exec's stdin option as a Buffer without round-tripping
+    # through UTF-8.
+    assert req["params"].get("stdin") == payload, (
+        f"expected stdin={payload!r}, got {req['params'].get('stdin')!r}"
+    )
+
+
+def test_no_stdin_means_no_stdin_field_in_params():
+    """If the wrapper sees an empty stdin (DEVNULL or closed pipe), the
+    request must NOT carry a stdin field - the daemon's exec stays exactly
+    backwards-compatible for the no-input case."""
+    response = {
+        "result": {"exit_code": 0, "stdout": "", "stderr": "", "duration_ms": 1}
+    }
+    # stdin_bytes=None routes through subprocess.run without input=, so
+    # the child's stdin is implicitly closed (no pipe attached).
+    with FakeDaemon(response) as daemon:
+        result = _run_wrapper(daemon.sock_path, "true")
+
+    assert result.returncode == 0
+    req = daemon.received_request
+    assert "stdin" not in req["params"], (
+        f"expected no stdin key in params for empty stdin, got {req['params']}"
+    )
+
+
+def test_stdin_forwarded_in_streaming_path():
+    """Streaming exec_stream takes the same stdin path - the daemon needs
+    stdin for write_file regardless of whether output is buffered or streamed."""
+    frames = [{"kind": "stdout", "data": ""}]
+    response = {"result": {"exit_code": 0, "chunks": 1, "duration_ms": 1}}
+    payload = b"streamed-input\n"
+    with FakeDaemon(response, stream_frames=frames) as daemon:
+        result = _run_wrapper(
+            daemon.sock_path, "cat > /tmp/out", stream=True, stdin_bytes=payload
+        )
+
+    assert result.returncode == 0, result
+    req = daemon.received_request
+    assert req["method"] == "exec_stream"
+    assert req["params"].get("stdin") == payload, (
+        f"expected stdin={payload!r}, got {req['params'].get('stdin')!r}"
+    )
+
+
+def test_binary_stdin_roundtrips_via_msgpack_bin():
+    """Non-UTF-8 bytes (PNG header, embedded NULs, high bits) survive the
+    wrapper -> msgpack -> daemon path byte-for-byte. ShellFileOperations
+    is currently str-only but the wire should not be the bottleneck."""
+    response = {
+        "result": {"exit_code": 0, "stdout": "", "stderr": "", "duration_ms": 1}
+    }
+    payload = b"\x89PNG\r\n\x1a\n\x00\x01\x02\xff\xfe\xfd"
+    with FakeDaemon(response) as daemon:
+        result = _run_wrapper(daemon.sock_path, "cat > /tmp/bin", stdin_bytes=payload)
+
+    assert result.returncode == 0
+    received = daemon.received_request["params"].get("stdin")
+    assert received == payload, f"binary stdin mangled: {received!r} != {payload!r}"
+

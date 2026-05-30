@@ -85,6 +85,39 @@
 >    `overlay: true`, or hard-error in `_setup_overlay_mounts` when the
 >    combination is invalid.
 >
+> 12. ~~**`ShellFileOperations.write_file` silently produced 0-byte files.**~~
+>    ✅ **Resolved.** The RPC bridge dropped the caller's stdin: the
+>    Python wrapper (`gondolin_rpc_call.py`) never read its own stdin,
+>    and the daemon's `exec`/`exec_stream` handlers only forwarded
+>    `{cmd, timeout_ms}` to `vm.exec`. `cat > path` therefore saw an
+>    empty stdin → 0-byte file → `wc -c` returned 0 → `WriteResult(bytes_written=0,
+>    error=None)`. Local + docker backends were unaffected (they wire
+>    stdin via `Popen(stdin=PIPE)` and `docker exec -i` respectively).
+>    Fix: wrapper now reads its own stdin (bounded by `_MAX_FRAME_BYTES`,
+>    skipped on TTY for interactive safety) and ships it as `params.stdin`.
+>    Daemon coerces the wire value (msgpack `str` → JS string, msgpack
+>    `bin` → `Uint8Array` → `Buffer`) and forwards via a shared
+>    `buildExecOptions` helper so `exec` and `exec_stream` can't drift.
+>    Test coverage: unit (`test_gondolin_rpc_call.py`) for the wrapper
+>    wire format, stub-VM daemon integration (`socket_transport.test.mjs`,
+>    new `STDIN_ECHO` marker) for the daemon path, and live KVM
+>    (`test_gondolin_terminal.py::test_shell_file_operations_write_file_actually_writes_bytes`)
+>    for the full stack against a real VM.
+>
+> 13. **No cross-backend conformance suite.** Every backend has its own
+>    bespoke `test_<backend>_terminal.py` / `test_<backend>_environment.py`
+>    with overlapping-but-inconsistent coverage. `test_file_operations.py`
+>    uses a `MagicMock` env, so contract bugs (item 12) hide until they
+>    hit production. Right shape: a parametrized
+>    `tests/integration/conformance/test_backend_conformance.py` over
+>    `[local, docker, gondolin, modal, daytona, ssh, vercel]`, each
+>    parametrization gated by its requirement (KVM, docker socket,
+>    modal token, ...). Coverage candidates: `write_file` byte-equal
+>    roundtrip (text + binary), read→write roundtrip, exit-code
+>    propagation, stderr separation, cwd persistence, env-var persistence
+>    across calls, `patch_replace`. Out of scope for this branch;
+>    blocks "gondolin is on equal footing with local/docker."
+>
 > Until each of these has a decision (fix, defer-with-issue, accept-with-doc),
 > treat this branch as a spike, not a deliverable.
 

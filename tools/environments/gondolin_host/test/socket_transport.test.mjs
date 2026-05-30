@@ -1211,3 +1211,166 @@ test("daemon: exec_stream aborts when the client disconnects mid-stream", async 
     "of hanging on output.once('drain') forever.");
 });
 
+
+// ------------------------------------------------------------
+// stdin forwarding (B16 fix): ShellFileOperations.write_file silently
+// produced 0-byte files because the daemon dropped params.stdin on the
+// floor. exec/exec_stream now coerce wire-level stdin (msgpack `str` ->
+// JS string, msgpack `bin` -> Uint8Array -> Buffer) and pass it through
+// to vm.exec via buildExecOptions. The stub VM honors the STDIN_ECHO
+// marker by returning options.stdin verbatim as stdout, so these tests
+// can verify the daemon plumbs stdin all the way to the SDK boundary
+// without needing a real `cat` in a VM.
+// ------------------------------------------------------------
+
+test("daemon: exec forwards params.stdin (string) through to vm.exec options", async (t) => {
+  const tmp = mkdtempSync(path.join(os.tmpdir(), "gondolin-stdin-exec-"));
+  const sockPath = path.join(tmp, "d.sock");
+  const proc = spawn("node", [DAEMON, "--socket", sockPath], {
+    stdio: ["ignore", "ignore", "pipe"],
+    env: { ...process.env, GONDOLIN_DAEMON_QUIET: "1", GONDOLIN_DAEMON_STUB_VM: "1" },
+  });
+  proc.stderr.on("data", () => {});
+  t.after(async () => {
+    try { proc.kill("SIGTERM"); } catch {}
+    await new Promise((r) => {
+      if (proc.exitCode != null) return r();
+      proc.once("exit", r);
+      setTimeout(r, 2000);
+    });
+    rmSync(tmp, { recursive: true, force: true });
+  });
+
+  await waitForSocket(sockPath);
+  const init = await rpcCall(sockPath, { id: 1, method: "init", params: { config: {} } });
+  assert.equal(init.error, undefined);
+
+  const payload = "hello-from-stdin\n";
+  const resp = await rpcCall(sockPath, {
+    id: 42,
+    method: "exec",
+    params: { cmd: "STDIN_ECHO", stdin: payload },
+  });
+  assert.equal(resp.error, undefined, `exec failed: ${JSON.stringify(resp.error)}`);
+  assert.equal(resp.result.exit_code, 0);
+  assert.equal(resp.result.stdout, payload,
+    "daemon must forward params.stdin to vm.exec options.stdin");
+});
+
+test("daemon: exec forwards params.stdin (binary bytes) through to vm.exec options", async (t) => {
+  // msgpack-encoded `bin` decodes to Uint8Array on the daemon side. The
+  // bytes must round-trip via Buffer.from() without UTF-8 reinterpretation
+  // so write_file can ship arbitrary binary content (PNG headers, nulls,
+  // high-bit bytes).
+  const tmp = mkdtempSync(path.join(os.tmpdir(), "gondolin-stdin-binary-"));
+  const sockPath = path.join(tmp, "d.sock");
+  const proc = spawn("node", [DAEMON, "--socket", sockPath], {
+    stdio: ["ignore", "ignore", "pipe"],
+    env: { ...process.env, GONDOLIN_DAEMON_QUIET: "1", GONDOLIN_DAEMON_STUB_VM: "1" },
+  });
+  proc.stderr.on("data", () => {});
+  t.after(async () => {
+    try { proc.kill("SIGTERM"); } catch {}
+    await new Promise((r) => {
+      if (proc.exitCode != null) return r();
+      proc.once("exit", r);
+      setTimeout(r, 2000);
+    });
+    rmSync(tmp, { recursive: true, force: true });
+  });
+
+  await waitForSocket(sockPath);
+  const init = await rpcCall(sockPath, { id: 1, method: "init", params: { config: {} } });
+  assert.equal(init.error, undefined);
+
+  const payload = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x01, 0xff, 0xfe, 0xfd]);
+  const resp = await rpcCall(sockPath, {
+    id: 43,
+    method: "exec",
+    params: { cmd: "STDIN_ECHO", stdin: payload },
+  });
+  assert.equal(resp.error, undefined, `exec failed: ${JSON.stringify(resp.error)}`);
+  assert.equal(resp.result.exit_code, 0);
+  // The stub UTF-8-coerces binary stdin on the non-stream path; that's
+  // fine for this assertion because we just need to prove bytes arrived
+  // at the SDK boundary. The byte-for-byte round-trip assertion lives
+  // in the streaming test below (where the stub yields a raw Buffer).
+  assert.equal(Buffer.byteLength(resp.result.stdout, "utf8") > 0, true,
+    "daemon must forward binary stdin to vm.exec options.stdin");
+});
+
+test("daemon: exec without params.stdin omits stdin from vm.exec options", async (t) => {
+  // Backwards-compat guard: existing callers that never sent stdin
+  // (every caller before the write_file fix) must keep working. The stub
+  // VM's STDIN_ECHO marker returns "" when options.stdin is null/absent.
+  const tmp = mkdtempSync(path.join(os.tmpdir(), "gondolin-stdin-absent-"));
+  const sockPath = path.join(tmp, "d.sock");
+  const proc = spawn("node", [DAEMON, "--socket", sockPath], {
+    stdio: ["ignore", "ignore", "pipe"],
+    env: { ...process.env, GONDOLIN_DAEMON_QUIET: "1", GONDOLIN_DAEMON_STUB_VM: "1" },
+  });
+  proc.stderr.on("data", () => {});
+  t.after(async () => {
+    try { proc.kill("SIGTERM"); } catch {}
+    await new Promise((r) => {
+      if (proc.exitCode != null) return r();
+      proc.once("exit", r);
+      setTimeout(r, 2000);
+    });
+    rmSync(tmp, { recursive: true, force: true });
+  });
+
+  await waitForSocket(sockPath);
+  const init = await rpcCall(sockPath, { id: 1, method: "init", params: { config: {} } });
+  assert.equal(init.error, undefined);
+
+  const resp = await rpcCall(sockPath, {
+    id: 44,
+    method: "exec",
+    params: { cmd: "STDIN_ECHO" },
+  });
+  assert.equal(resp.error, undefined);
+  assert.equal(resp.result.exit_code, 0);
+  assert.equal(resp.result.stdout, "",
+    "STDIN_ECHO with no stdin must return empty stdout");
+});
+
+test("daemon: exec_stream forwards params.stdin (binary bytes) through to vm.execStreaming", async (t) => {
+  // Streaming path is independent code, easy to miss when wiring stdin
+  // through. The stub yields stdin as a single Buffer chunk so this
+  // asserts byte-for-byte round-trip (no UTF-8 reinterpretation).
+  const tmp = mkdtempSync(path.join(os.tmpdir(), "gondolin-stdin-stream-"));
+  const sockPath = path.join(tmp, "d.sock");
+  const proc = spawn("node", [DAEMON, "--socket", sockPath], {
+    stdio: ["ignore", "ignore", "pipe"],
+    env: { ...process.env, GONDOLIN_DAEMON_QUIET: "1", GONDOLIN_DAEMON_STUB_VM: "1" },
+  });
+  proc.stderr.on("data", () => {});
+  t.after(async () => {
+    try { proc.kill("SIGTERM"); } catch {}
+    await new Promise((r) => {
+      if (proc.exitCode != null) return r();
+      proc.once("exit", r);
+      setTimeout(r, 2000);
+    });
+    rmSync(tmp, { recursive: true, force: true });
+  });
+
+  await waitForSocket(sockPath);
+  const init = await rpcCall(sockPath, { id: 1, method: "init", params: { config: {} } });
+  assert.equal(init.error, undefined);
+
+  const payload = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x01, 0xff, 0xfe, 0xfd]);
+  const { streamFrames, final } = await rpcCallStreaming(sockPath, {
+    id: 45,
+    method: "exec_stream",
+    params: { cmd: "STDIN_ECHO", stdin: payload },
+  });
+  assert.equal(final.error, undefined, `exec_stream failed: ${JSON.stringify(final.error)}`);
+  assert.equal(final.result.exit_code, 0);
+  assert.equal(streamFrames.length, 1, "expected exactly one stdin-echo chunk");
+  assert.equal(streamFrames[0].kind, "stdout");
+  const got = Buffer.from(streamFrames[0].data);
+  assert.equal(Buffer.compare(got, payload), 0,
+    `binary stdin must round-trip byte-for-byte through exec_stream; got ${got.toString('hex')} expected ${payload.toString('hex')}`);
+});

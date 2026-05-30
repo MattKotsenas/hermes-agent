@@ -482,3 +482,65 @@ def test_overlay_writes_do_not_leak_between_env_lifecycles(tmp_path):
         )
     finally:
         env2.cleanup()
+
+
+
+# ------------------------------------------------------------
+# stdin forwarding: ShellFileOperations.write_file silently produced
+# 0-byte files because the daemon dropped params.stdin. This test
+# exercises the full write_file -> _exec -> _run_bash -> wrapper
+# -> daemon -> vm.exec stack with a REAL Gondolin VM, against the
+# default workspace bind mount.
+#
+# Pre-fix observation: WriteResult(bytes_written=0, error=None) plus a
+# 0-byte file in the guest. This test fails loudly in that state.
+# ------------------------------------------------------------
+
+@requires_gondolin
+def test_shell_file_operations_write_file_actually_writes_bytes(gondolin_env_workspace):
+    """write_file must produce a file whose byte count matches the input
+    on BOTH the in-guest filesystem and the host-side bind mount.
+
+    Regression test for the daemon dropping params.stdin on the floor.
+    Exercises text content (with newlines) and arbitrary binary bytes
+    (PNG header + null + high-bit) to catch UTF-8 reinterpretation bugs
+    in the wire-format path.
+    """
+    from tools.file_operations import ShellFileOperations
+
+    env = gondolin_env_workspace
+    fops = ShellFileOperations(env)
+
+    text = "hello-from-write-file\n" * 6
+    result = fops.write_file("/workspace/probe.txt", text)
+    assert result.error is None, f"write_file errored: {result.error}"
+    assert result.bytes_written == len(text), (
+        f"bytes_written mismatch: want {len(text)}, got {result.bytes_written}. "
+        f"Pre-fix this returned 0 because the daemon dropped params.stdin."
+    )
+
+    guest = env.execute("wc -c < /workspace/probe.txt")
+    assert guest["returncode"] == 0, f"in-guest wc failed: {guest}"
+    assert guest["output"].strip() == str(len(text)), (
+        f"in-guest byte count mismatch: want {len(text)}, got {guest['output'].strip()}"
+    )
+
+    host = Path(env.workspace_dir) / "probe.txt"
+    assert host.exists(), f"host-side file missing: {host}"
+    assert host.stat().st_size == len(text), (
+        f"host-side byte count mismatch: want {len(text)}, got {host.stat().st_size}"
+    )
+    assert host.read_text() == text, "host-side content mismatch"
+
+    blob = bytes([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x01, 0xff, 0xfe, 0xfd]) * 100
+    result2 = fops.write_file("/workspace/probe.bin", blob)
+    assert result2.error is None, f"binary write_file errored: {result2.error}"
+    assert result2.bytes_written == len(blob), (
+        f"binary bytes_written mismatch: want {len(blob)}, got {result2.bytes_written}"
+    )
+    host_bin = Path(env.workspace_dir) / "probe.bin"
+    assert host_bin.exists() and host_bin.stat().st_size == len(blob)
+    assert host_bin.read_bytes() == blob, (
+        "binary content drifted in transit (likely UTF-8 reinterpretation "
+        "somewhere along the wrapper / msgpack / daemon path)"
+    )

@@ -129,6 +129,30 @@ let secretManager = null;
 const LIFECYCLE = "lifecycle";
 const STEADY = "steady";
 
+// Normalize a wire-level stdin value (msgpack `str` -> JS string,
+// msgpack `bin` -> Uint8Array) into something the Gondolin SDK accepts.
+// Returns null when there's nothing to forward so callers can skip
+// adding it to the exec options (an empty Buffer can confuse the SDK
+// into allocating a stdin pipe with no producer).
+function coerceStdin(value) {
+  if (value == null) return null;
+  if (typeof value === "string") return value.length ? value : null;
+  // Uint8Array (msgpack `bin`) or an existing Buffer. Buffer.from of
+  // an existing Buffer is a zero-copy view; for Uint8Array it wraps.
+  const buf = Buffer.from(value);
+  return buf.length ? buf : null;
+}
+
+// Single source of truth for the options object handed to vm.exec /
+// vm.execStreaming. Keeps exec and exec_stream from drifting on how
+// they forward timeout/stdin to the SDK.
+function buildExecOptions(params, extra) {
+  const opts = { timeout: params?.timeout_ms ?? 180_000, ...(extra || {}) };
+  const stdin = coerceStdin(params?.stdin);
+  if (stdin != null) opts.stdin = stdin;
+  return opts;
+}
+
 const handlers = {
   async init(params) {
     if (vm) throw new Error("already initialized");
@@ -252,7 +276,7 @@ const handlers = {
 
     if (STUB_VM) {
       vm = {
-        async exec(cmd) {
+        async exec(cmd, options) {
           // Honor a "SLEEP:<ms>:" prefix so tests can assert on concurrent
           // dispatch (one long-running exec should not block a short one).
           // Strip the bash-c wrap the daemon adds so the marker survives.
@@ -261,6 +285,18 @@ const handlers = {
           const sleepMatch = inner.match(/^SLEEP:(\d+):/);
           if (sleepMatch) {
             await new Promise((r) => setTimeout(r, Number(sleepMatch[1])));
+          }
+          // STDIN_ECHO marker: return options.stdin verbatim as stdout so
+          // daemon-integration tests can verify the daemon plumbs the
+          // wire-level params.stdin all the way through to the SDK
+          // boundary without needing a real `cat` running in a VM.
+          if (inner === "STDIN_ECHO") {
+            const stdinStr = options?.stdin == null
+              ? ""
+              : (typeof options.stdin === "string"
+                  ? options.stdin
+                  : Buffer.from(options.stdin).toString("utf8"));
+            return { exitCode: 0, stdout: stdinStr, stderr: "" };
           }
           return { exitCode: 0, stdout: cmd + "\n", stderr: "" };
         },
@@ -274,12 +310,30 @@ const handlers = {
         // Stub chunks are emitted as Buffers (binary-safe), mirroring the
         // real path where Gondolin yields Buffer chunks. Tests that
         // assert on the data payload should compare bytes, not strings.
-        execStreaming(cmd) {
+        execStreaming(cmd, options) {
           // The daemon wraps every cmd in `bash -c '...'`. Strip that wrap
           // so the STREAM: marker still works for tests that drive the
           // daemon through the full bash-wrap path.
           const m = cmd.match(/^bash -c '(.*)'$/);
           const inner = m ? m[1].replace(/'\\''/g, "'") : cmd;
+          // STDIN_ECHO marker: stream options.stdin as a single chunk so
+          // daemon-integration tests can verify exec_stream forwards stdin
+          // the same way exec does. See the non-stream stub for context.
+          if (inner === "STDIN_ECHO") {
+            const stdinBuf = options?.stdin == null
+              ? Buffer.alloc(0)
+              : (typeof options.stdin === "string"
+                  ? Buffer.from(options.stdin, "utf8")
+                  : Buffer.from(options.stdin));
+            return {
+              async *chunks() {
+                if (stdinBuf.length > 0) {
+                  yield { kind: "stdout", data: stdinBuf };
+                }
+              },
+              async exitCode() { return 0; },
+            };
+          }
           // STREAM_SLOW:<delayMs>:<count> yields <count> small chunks with
           // <delayMs> between each, so a test can disconnect mid-stream
           // and observe whether the handler aborts.
@@ -449,7 +503,7 @@ const handlers = {
     // standard way (POSIX trick: end-quote, escape, start-quote).
     const escaped = cmd.replace(/'/g, "'\\''");
     const wrapped = `bash -c '${escaped}'`;
-    const result = await vm.exec(wrapped, { timeout: timeoutMs });
+    const result = await vm.exec(wrapped, buildExecOptions(params));
     return {
       exit_code: result.exitCode,
       stdout: result.stdout,
@@ -478,7 +532,7 @@ const handlers = {
     let proc;
     if (typeof vm.execStreaming === "function") {
       // Stub path or any adapter that exposes a stream-shaped interface.
-      proc = vm.execStreaming(wrapped, { timeout: timeoutMs });
+      proc = vm.execStreaming(wrapped, buildExecOptions(params));
     } else {
       // Real Gondolin: vm.exec returns an ExecProcess. The Symbol.asyncIterator
       // surface yields the merged stdout (all chunks tagged "string") which
@@ -487,7 +541,7 @@ const handlers = {
       // instead: it returns AsyncIterable<OutputChunk> with each chunk
       // carrying { stream: "stdout"|"stderr", data: Buffer, text: string },
       // matching the non-stream exec's split exactly.
-      const real = vm.exec(wrapped, { timeout: timeoutMs, stdout: "pipe", stderr: "pipe" });
+      const real = vm.exec(wrapped, buildExecOptions(params, { stdout: "pipe", stderr: "pipe" }));
       proc = {
         async *chunks() {
           for await (const chunk of real.output()) {
