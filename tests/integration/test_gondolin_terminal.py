@@ -359,3 +359,126 @@ def test_execute_code_round_trip(gondolin_env_with_python):
     assert "Traceback" not in result_str, (
         f"script raised an exception inside the VM:\n{result_str}"
     )
+
+
+# ----------------------------------------------------------------------
+# Overlay isolation across env lifecycles (matches docker behaviour)
+# ----------------------------------------------------------------------
+
+@requires_gondolin
+def test_overlay_writes_do_not_leak_between_env_lifecycles(tmp_path):
+    """A fresh GondolinEnvironment for the same sandbox_dir + same
+    overlay extra_mount must NOT see writes made by the previous env's
+    lifecycle into that mount.
+
+    Matches the docker backend's per-init isolation: docker.py:508 stamps
+    a fresh ``hermes-<uuid>`` container name on every ``_init``, so the
+    next env after teardown gets a brand-new filesystem. Gondolin's
+    sandbox_dir is deterministic from task_id, so without this guarantee
+    a stale on-disk overlay scratch leaks session N's writes into
+    session N+1.
+
+    Asserts the BEHAVIOURAL invariant via ``execute()`` and does not
+    inspect any host-side dir or mention fuse-overlayfs. A future
+    migration to a custom upstream VFSProvider (see
+    @earendil-works/gondolin's ``vfs/provider``) satisfies the same
+    contract trivially — per-VM scratch is ephemeral by construction —
+    and this test passes for free.
+    """
+    from tools.environments.gondolin import GondolinEnvironment
+
+    # Lower layer: a host-side "vault" the agent should be able to read
+    # but not pollute. Each env mounts this read-mostly under the overlay.
+    vault = tmp_path / "vault"
+    vault.mkdir()
+    (vault / "host_file.txt").write_text("from host\n")
+
+    sandbox_dir = tmp_path / "sandbox"
+
+    def _mount_config():
+        # Build a fresh config dict per lifecycle — overlay setup mutates
+        # ``host_path`` (rewriting it to the merged dir) and pops the
+        # ``overlay`` key, so we cannot reuse the same dict across envs.
+        return {
+            "extra_mounts": [{
+                "host_path": str(vault),
+                "guest_path": "/root/vault",
+                "overlay": True,
+                # Must be set explicitly: the daemon defaults
+                # ``readonly`` to True (daemon.mjs ~line 216), which
+                # would wrap the overlay in ReadonlyProvider and reject
+                # the guest writes that make this test meaningful.
+                "readonly": False,
+            }],
+            # Skip skill / credential projection — the test must not
+            # depend on the host's hermes install layout.
+            "project_skills": False,
+            "project_credentials": False,
+        }
+
+    # ── Lifecycle 1: write a "secret" into the overlay, then tear down.
+    env1 = GondolinEnvironment(
+        sandbox_dir=str(sandbox_dir),
+        cwd="/root",
+        timeout=60,
+        init_timeout=120.0,
+        stub_vm=False,
+        config=_mount_config(),
+    )
+    try:
+        # Precondition: the host file IS visible, the secret file is NOT.
+        # Asserting both proves the test inputs are wired correctly.
+        r = env1.execute("cat /root/vault/host_file.txt")
+        assert r["returncode"] == 0, f"precondition: cat host_file failed: {r}"
+        assert "from host" in r["output"]
+        r = env1.execute("test ! -e /root/vault/secret.txt && echo absent")
+        assert "absent" in r["output"], (
+            f"precondition: secret.txt must not pre-exist: {r}"
+        )
+
+        # Write a sandbox-only file into the overlay and confirm it lands.
+        r = env1.execute(
+            "printf 'session1 secret\\n' > /root/vault/secret.txt "
+            "&& cat /root/vault/secret.txt"
+        )
+        assert r["returncode"] == 0, f"setup: write to overlay failed: {r}"
+        assert "session1 secret" in r["output"]
+
+        # And the host vault MUST NOT see the write (overlay correctness
+        # — orthogonal to the leak we're testing, but a useful guard).
+        assert not (vault / "secret.txt").exists(), (
+            "overlay leaked guest write back to host vault"
+        )
+    finally:
+        env1.cleanup()
+
+    # ── Lifecycle 2: same sandbox_dir, same mount, a brand-new env.
+    env2 = GondolinEnvironment(
+        sandbox_dir=str(sandbox_dir),
+        cwd="/root",
+        timeout=60,
+        init_timeout=120.0,
+        stub_vm=False,
+        config=_mount_config(),
+    )
+    try:
+        # Lower is unchanged across lifecycles, so the host file is still
+        # visible. (If this fails, the mount itself is broken — the next
+        # assertion would be a false positive.)
+        r = env2.execute("cat /root/vault/host_file.txt")
+        assert r["returncode"] == 0, f"lower no longer visible: {r}"
+        assert "from host" in r["output"]
+
+        # THE invariant: session 1's write must NOT be visible to session 2.
+        # Implementation-agnostic — true for fuse-overlayfs with per-init
+        # scratch teardown, true for a per-VM ephemeral VFSProvider, false
+        # for any backend that carries scratch forward.
+        r = env2.execute("cat /root/vault/secret.txt 2>&1; echo rc=$?")
+        assert "session1 secret" not in r["output"], (
+            f"OVERLAY LEAK: session 2 read session 1's write: {r}"
+        )
+        assert "rc=1" in r["output"] or "rc=2" in r["output"], (
+            f"expected ENOENT (rc=1 from cat) but got: {r}"
+        )
+    finally:
+        env2.cleanup()

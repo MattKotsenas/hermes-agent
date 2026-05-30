@@ -39,11 +39,15 @@
 >    `mcr.microsoft.com_devcontainers_universal:6`; the slash form doesn't
 >    resolve. Pre-existing gondolin client bug; we rely on the fallback. File
 >    it upstream and fix before depending on a specific image.
-> 6. **No automated tests.** Everything in this branch was validated via
->    ad-hoc probe scripts in `/tmp/`. Need real coverage for: overlay
->    isolation between concurrent sandboxes, no-leak to host, freshness on
->    respawn, cleanup contract (no leaked fuse mounts), `gh-cred-env`
->    round-trip. The probe in this PR's history is a good template.
+> 6. **Test coverage is incomplete.** One behavioural integration test
+>    now exists (`test_overlay_writes_do_not_leak_between_env_lifecycles`
+>    — cross-lifecycle isolation via real VM, KVM-gated). Still missing:
+>    concurrent same-task_id isolation (blocked on item 10), no-leak to
+>    host, freshness on respawn, `gh-cred-env` round-trip, cleanup
+>    contract (no leaked fuse mounts under load). The existing test is a
+>    good template — it asserts via `execute()` rather than host-side
+>    inspection, so it stays meaningful when we migrate to a custom
+>    VFSProvider.
 > 7. **`fuse-overlayfs` is a hard dependency now.** The Dockerfile / install
 >    docs / readiness checks need to either require it or degrade gracefully
 >    when `overlay: true` is requested but the binary is missing.
@@ -51,11 +55,35 @@
 >    `~/.local/bin/`. To ship, it needs to live in the repo, be installed
 >    by the install path, and be discoverable from the guest without
 >    hard-coding `/home/matt/.local/bin`.
-> 9. **Failed-init cleanup.** When daemon init fails after
->    `_setup_overlay_mounts` succeeded, we unmount but leave the staging
->    dirs (`overlays/<safe>/{upper,work,merged}`) on disk. Cleans up
->    eventually via `cleanup()`'s rmtree, but the inner-except path should
->    rmtree too.
+> 9. ~~**Failed-init cleanup.**~~ ✅ **Resolved.**
+>    `_teardown_overlay_mounts` now `rmtree`s the per-mount scratch dir
+>    on every teardown path (graceful, init-failure, idle reaper). This
+>    also closes the cross-lifecycle contamination bug described in
+>    item 10. Crash recovery (kill -9 / OOM / WSL restart) still
+>    preserves `upper/` because `_sweep_stale_overlay_mounts` only
+>    unmounts — post-mortem inspection remains possible.
+>
+> 10. **`task_id="default"` is shared across all top-level agents.**
+>    `_resolve_container_task_id` (terminal_tool.py) maps every
+>    top-level agent to the literal string `"default"`. The gateway
+>    process keeps the gondolin env warm (`_active_environments[task_id]`,
+>    300s idle reaper), so concurrent DMs from different platforms /
+>    users hit the SAME warm VM and the SAME overlay scratch while it's
+>    warm. The cross-lifecycle fix in item 9 closes the gap between
+>    sessions; it does NOT close concurrent-tenancy. Fix needs per-session
+>    `task_id` plumbed from the gateway session layer — a hermes-wide
+>    change, not a gondolin one, but the gondolin overlay design assumes
+>    per-session isolation which this violates.
+> 11. **`overlay: true` silently no-ops without `readonly: false`.**
+>    daemon.mjs defaults `readonly` to `true` for `extra_mounts` entries
+>    (~line 216). `_setup_overlay_mounts` happily creates the host-side
+>    overlay scratch, but the daemon wraps the result in
+>    `ReadonlyProvider` and the guest gets EROFS on every write. A user
+>    who writes `overlay: true` and forgets `readonly: false` thinks
+>    they have a writable overlay; they actually have a 3-dir disk leak
+>    and a read-only mount. Either default `readonly` to `false` when
+>    `overlay: true`, or hard-error in `_setup_overlay_mounts` when the
+>    combination is invalid.
 >
 > Until each of these has a decision (fix, defer-with-issue, accept-with-doc),
 > treat this branch as a spike, not a deliverable.

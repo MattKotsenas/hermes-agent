@@ -166,12 +166,30 @@ def _setup_overlay_mounts(
 
 
 def _teardown_overlay_mounts(merged_paths: list[str]) -> None:
-    """Lazy-unmount each fuse-overlayfs mount. Best-effort; never raises.
+    """Lazy-unmount each fuse-overlayfs mount and wipe its scratch dir.
 
     Lazy unmount (-z) detaches even if something inside still has open
     file handles — important because the daemon may not have fully
     released the rootfs yet when cleanup runs. Without -z we'd see EBUSY
     and leak the mount forever.
+
+    After unmounting, the per-mount scratch directory (the parent of
+    ``merged/``, containing ``upper/`` and ``work/``) is removed so the
+    next env using the same ``sandbox_dir`` + ``guest_path`` starts with
+    a clean upper layer. This matches the other backends' per-init
+    isolation: docker stamps a fresh ``hermes-<uuid>`` container name on
+    every ``_init`` (see docker.py), so a destroyed-then-recreated env
+    sees a brand-new filesystem. Without this rmtree, gondolin's
+    deterministic ``sandbox_dir`` + per-``guest_path`` overlay scratch
+    would carry writes from session N into session N+1 — a real
+    cross-session contamination bug, not just a disk leak.
+
+    Best-effort: never raises. The unmount is lazy, but on Linux open
+    fds keep the underlying inodes alive until close, so dropping the
+    dentries here doesn't yank live writes from any process still
+    draining. Crash recovery is the sweep's job
+    (``_sweep_stale_overlay_mounts`` only unmounts, never rmtrees) so
+    crashed-process upper layers survive for post-mortem inspection.
     """
     umount = shutil.which("fusermount3") or shutil.which("fusermount")
     if umount is None:
@@ -186,6 +204,16 @@ def _teardown_overlay_mounts(merged_paths: list[str]) -> None:
             )
         except Exception as exc:  # noqa: BLE001
             logger.debug("gondolin overlay unmount failed for %s: %s", m, exc)
+        # Wipe the scratch dir (parent of merged/). Each env's lifecycle
+        # owns its scratch; carrying it forward leaks session-N writes
+        # into session N+1's view of the mount. Done AFTER unmount so
+        # we never rmtree under a live mount.
+        try:
+            shutil.rmtree(Path(m).parent, ignore_errors=True)
+        except Exception as exc:  # noqa: BLE001
+            logger.debug(
+                "gondolin overlay scratch rmtree failed for %s: %s", m, exc
+            )
 
 
 def _sweep_stale_overlay_mounts() -> None:
