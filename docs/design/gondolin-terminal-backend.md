@@ -1375,17 +1375,45 @@ setting to 0 restores legacy unlimited behavior.
 The cross-process flock layer (slot-N.lock files under `lock_dir`)
 now engages out of the box without explicit opt-in.
 
-### Open follow-ups
+### Closed: workspace sharing is the intended contract (was "Phase 3")
 
-- **Workspace contention policy (Phase 3 of the original plan)**:
-  two instances of the same task currently share `workspace/`. That
-  matches docker's contract but means a cron job can `rm -rf`
-  something the interactive session is editing. Options: keep the
-  shared model and document it; fork-on-write via fuse-overlayfs
-  per-instance like extra_mounts does; or refuse the second
-  instance with a clear error when an active first instance is
-  detected. Decision deferred — needs real usage to know which
-  failure mode is more common.
+The original plan listed a "workspace contention policy" follow-up:
+two same-task instances share `workspace/`, so a cron job can `rm -rf`
+something the interactive session is editing. After tracing the
+task_id flow we concluded this is **not** a bug — it's the designed
+contract — and Phase 3 closes without code changes.
+
+The dig:
+
+`agent/conversation_loop.py:343` generates `effective_task_id = task_id
+or str(uuid.uuid4())` *with a comment about isolation* — looks like
+uniqueness by default. But `tools/terminal_tool.py:_resolve_container_task_id`
+then **deliberately collapses every task_id back to "default"** except
+RL-benchmark overrides, with the comment: *"so subagents share the
+parent's long-lived container (one bash, one /workspace, one set of
+installed packages)."*
+
+The design intent is that everything under one Hermes user shares
+one task=`default` container. That's why interactive + cron both land
+on `default` — it's not a misconfiguration. The Phase-1+2 daemon
+collision was an oversight in this contract (the on-disk socket path
+was conflated with task_id), not a problem with the contract itself.
+
+Workspace sharing is wanted: if a cron updates the kanban vault, the
+interactive agent should see it. Diverging the workspaces would
+defeat that. If a user actually wants cron isolation, the proper fix
+is caller-side — have the cron scheduler pass a non-default task_id
+AND add an explicit "keep this task_id" path in
+`_resolve_container_task_id` (today only RL benchmarks have that).
+Out of scope for this commit.
+
+The warning option (log a WARN when two processes detect each other
+on the same task_id) was considered and rejected: it would fire on
+every cron tick in this design, which is exactly the configuration
+the design wants. Adding noise on the intended path is worse than
+silent.
+
+### Open follow-ups
 
 - **Cross-backend hoisting (Phase 5 of the original plan)**: docker,
   singularity, and gondolin all implement the per-task-persistent-state
