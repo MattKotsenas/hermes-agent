@@ -922,3 +922,72 @@ def test_persistent_default_is_false_for_safety(tmp_path):
     (workspace / "marker.txt").write_text("x")
     env.cleanup()
     assert not workspace.exists()
+
+
+
+# ---- _run_bash login threading -----------------------------------------
+#
+# BaseEnvironment hands ``login=True`` to ``_run_bash`` only during
+# ``init_session`` (snapshot capture) and ``login=False`` for every
+# subsequent command. Each backend’s ``_run_bash`` is responsible
+# for translating that into the right shell invocation. For gondolin the
+# right invocation is to forward ``--login`` to the wrapper subprocess,
+# which in turn ships ``params.login=True`` on the RPC, which lets the
+# daemon build ``[bash, "-l", "-c", cmd]`` argv instead of the
+# default ``[bash, "-c", cmd]``.
+#
+# Prior to this contract, gondolin’s ``_run_bash`` silently
+# discarded the login flag (the docstring openly admitted "has no
+# effect") and the SDK’s default ``/bin/sh -lc`` wrap fired
+# /etc/profile on every command — leaking /opt/conda/bin/xz from
+# images like devcontainers/universal:6 whose nvs.sh uses a bashism
+# (``&>``) in a dash-sourced script.
+
+
+def test_run_bash_appends_login_flag_to_wrapper_argv_when_login_true(
+    stub_env_factory, monkeypatch
+):
+    """login=True must surface as ``--login`` in the wrapper subprocess argv
+    so the wire-level ``params.login`` is set on the exec RPC."""
+    env = stub_env_factory()
+    captured: list[list[str]] = []
+
+    def fake_popen(argv, stdin_data=None):
+        captured.append(list(argv))
+        # Return any minimal object; the test never reads it.
+        class _Stub:
+            pass
+        return _Stub()
+
+    monkeypatch.setattr(gondolin_mod, "_popen_bash", fake_popen)
+    env._run_bash("echo hi", login=True, timeout=5)
+
+    assert len(captured) == 1, f"expected exactly one _popen_bash call, got {captured}"
+    argv = captured[0]
+    assert "--login" in argv, (
+        f"login=True must add --login to wrapper argv, got: {argv}"
+    )
+
+
+def test_run_bash_omits_login_flag_when_login_false(stub_env_factory, monkeypatch):
+    """login=False (the default for every steady-state command) must NOT
+    add --login. Otherwise profile.d fires on every call — defeating
+    the BaseEnvironment snapshot mechanism that’s supposed to source
+    profile once per session."""
+    env = stub_env_factory()
+    captured: list[list[str]] = []
+
+    def fake_popen(argv, stdin_data=None):
+        captured.append(list(argv))
+        class _Stub:
+            pass
+        return _Stub()
+
+    monkeypatch.setattr(gondolin_mod, "_popen_bash", fake_popen)
+    env._run_bash("echo hi", login=False, timeout=5)
+
+    assert len(captured) == 1
+    argv = captured[0]
+    assert "--login" not in argv, (
+        f"login=False must not add --login to wrapper argv, got: {argv}"
+    )

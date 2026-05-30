@@ -1374,3 +1374,224 @@ test("daemon: exec_stream forwards params.stdin (binary bytes) through to vm.exe
   assert.equal(Buffer.compare(got, payload), 0,
     `binary stdin must round-trip byte-for-byte through exec_stream; got ${got.toString('hex')} expected ${payload.toString('hex')}`);
 });
+
+
+// --- argv form + login flag ---
+//
+// The daemon hands the user’s command to vm.exec as an argv array
+// ("bash", ["-l",] "-c", cmd) instead of a pre-wrapped
+// "bash -c '...'" string. This is what bypasses the Gondolin SDK’s
+// /bin/sh -lc per-call wrap, which was sourcing every image’s
+// profile.d on every command and leaking junk like
+// /opt/conda/bin/xz from devcontainers/universal:6’s nvs.sh.
+//
+// The login flag controls whether -l is included, matching the contract
+// every other Hermes backend (local, docker, singularity, ssh, modal,
+// vercel) already honors: login=true only during init_session for
+// snapshot capture; login=false for every subsequent command. Profile.d
+// fires once during snapshot, never per call.
+//
+// We assert by introspecting the stub VM via the _debug_last_exec RPC,
+// which returns the shape vm.exec was called with on the daemon’s
+// most recent dispatch.
+
+test("daemon: exec hands an argv array to vm.exec (no login)", async (t) => {
+  const sockPath = path.join(os.tmpdir(), `daemon-${process.pid}-${Date.now()}-argv.sock`);
+  const daemon = spawn("node", [DAEMON, "--socket", sockPath], {
+    env: { ...process.env, GONDOLIN_DAEMON_QUIET: "1", GONDOLIN_DAEMON_STUB_VM: "1" },
+  });
+  t.after(() => { try { daemon.kill("SIGKILL"); } catch {} });
+
+  await waitForSocket(sockPath);
+  const init = await rpcCall(sockPath, { id: 1, method: "init", params: { config: {} } });
+  assert.equal(init.error, undefined);
+
+  const exec = await rpcCall(sockPath, {
+    id: 2,
+    method: "exec",
+    params: { cmd: "echo argv-form" },
+  });
+  assert.equal(exec.error, undefined, `exec failed: ${JSON.stringify(exec.error)}`);
+
+  const last = await rpcCall(sockPath, { id: 3, method: "_debug_last_exec" });
+  assert.equal(last.error, undefined);
+  assert.ok(Array.isArray(last.result.cmd),
+    `expected argv array, got ${typeof last.result.cmd}: ${JSON.stringify(last.result.cmd)}`);
+  assert.deepEqual(last.result.cmd, ["bash", "-c", "echo argv-form"],
+    "login=false (and unset) must produce bash -c argv, no -l flag, no shell escaping");
+});
+
+test("daemon: exec adds -l to argv when params.login is true", async (t) => {
+  const sockPath = path.join(os.tmpdir(), `daemon-${process.pid}-${Date.now()}-login.sock`);
+  const daemon = spawn("node", [DAEMON, "--socket", sockPath], {
+    env: { ...process.env, GONDOLIN_DAEMON_QUIET: "1", GONDOLIN_DAEMON_STUB_VM: "1" },
+  });
+  t.after(() => { try { daemon.kill("SIGKILL"); } catch {} });
+
+  await waitForSocket(sockPath);
+  const init = await rpcCall(sockPath, { id: 1, method: "init", params: { config: {} } });
+  assert.equal(init.error, undefined);
+
+  const exec = await rpcCall(sockPath, {
+    id: 2,
+    method: "exec",
+    params: { cmd: "echo login-form", login: true },
+  });
+  assert.equal(exec.error, undefined);
+
+  const last = await rpcCall(sockPath, { id: 3, method: "_debug_last_exec" });
+  assert.deepEqual(last.result.cmd, ["bash", "-l", "-c", "echo login-form"],
+    "login=true must produce bash -l -c argv");
+});
+
+test("daemon: exec_stream hands an argv array to vm.execStreaming (no login)", async (t) => {
+  const sockPath = path.join(os.tmpdir(), `daemon-${process.pid}-${Date.now()}-stream-argv.sock`);
+  const daemon = spawn("node", [DAEMON, "--socket", sockPath], {
+    env: { ...process.env, GONDOLIN_DAEMON_QUIET: "1", GONDOLIN_DAEMON_STUB_VM: "1" },
+  });
+  t.after(() => { try { daemon.kill("SIGKILL"); } catch {} });
+
+  await waitForSocket(sockPath);
+  const init = await rpcCall(sockPath, { id: 1, method: "init", params: { config: {} } });
+  assert.equal(init.error, undefined);
+
+  await rpcCallStreaming(sockPath, {
+    id: 2,
+    method: "exec_stream",
+    params: { cmd: "echo stream-argv" },
+  });
+
+  const last = await rpcCall(sockPath, { id: 3, method: "_debug_last_exec" });
+  assert.ok(Array.isArray(last.result.cmd),
+    `expected argv array, got ${typeof last.result.cmd}: ${JSON.stringify(last.result.cmd)}`);
+  assert.deepEqual(last.result.cmd, ["bash", "-c", "echo stream-argv"]);
+});
+
+test("daemon: exec_stream adds -l to argv when params.login is true", async (t) => {
+  const sockPath = path.join(os.tmpdir(), `daemon-${process.pid}-${Date.now()}-stream-login.sock`);
+  const daemon = spawn("node", [DAEMON, "--socket", sockPath], {
+    env: { ...process.env, GONDOLIN_DAEMON_QUIET: "1", GONDOLIN_DAEMON_STUB_VM: "1" },
+  });
+  t.after(() => { try { daemon.kill("SIGKILL"); } catch {} });
+
+  await waitForSocket(sockPath);
+  const init = await rpcCall(sockPath, { id: 1, method: "init", params: { config: {} } });
+  assert.equal(init.error, undefined);
+
+  await rpcCallStreaming(sockPath, {
+    id: 2,
+    method: "exec_stream",
+    params: { cmd: "echo stream-login", login: true },
+  });
+
+  const last = await rpcCall(sockPath, { id: 3, method: "_debug_last_exec" });
+  assert.deepEqual(last.result.cmd, ["bash", "-l", "-c", "echo stream-login"]);
+});
+
+test("daemon: exec passes user cmd verbatim — no shell escaping needed", async (t) => {
+  // String form required `'\''` POSIX-escape for embedded single quotes
+  // because the daemon was building `bash -c '<escaped cmd>'`. Argv form
+  // hands the cmd straight to bash -c with no extra shell pass, so any
+  // bytes (quotes, $vars, newlines) survive verbatim.
+  const sockPath = path.join(os.tmpdir(), `daemon-${process.pid}-${Date.now()}-verbatim.sock`);
+  const daemon = spawn("node", [DAEMON, "--socket", sockPath], {
+    env: { ...process.env, GONDOLIN_DAEMON_QUIET: "1", GONDOLIN_DAEMON_STUB_VM: "1" },
+  });
+  t.after(() => { try { daemon.kill("SIGKILL"); } catch {} });
+
+  await waitForSocket(sockPath);
+  await rpcCall(sockPath, { id: 1, method: "init", params: { config: {} } });
+
+  const tricky = "echo 'a'\"b'\"'c' && printf '%s\\n' \"$HOME\"";
+  await rpcCall(sockPath, {
+    id: 2,
+    method: "exec",
+    params: { cmd: tricky },
+  });
+
+  const last = await rpcCall(sockPath, { id: 3, method: "_debug_last_exec" });
+  assert.deepEqual(last.result.cmd, ["bash", "-c", tricky],
+    "argv form must pass cmd verbatim with no shell-quote escaping");
+});
+
+// ---------------------------------------------------------------------
+// Coverage for the real-Gondolin adapter path inside exec_stream.
+//
+// The handler picks between two branches:
+//
+//   if (typeof vm.execStreaming === "function") {
+//     proc = vm.execStreaming(argv, opts);            // stub / adapter
+//   } else {
+//     const real = vm.exec(argv, opts);               // real Gondolin
+//     proc = { chunks: real.output(), exitCode: ... };
+//   }
+//
+// All the prior tests exercise the stub branch because the stub VM
+// always exposes execStreaming. STUB_EXEC_PROC_MODE=1 hides
+// execStreaming on the stub and makes vm.exec return an
+// ExecProcess-shaped object (Thenable + .output()), forcing the
+// handler down the else branch — the one that wraps real Gondolin.
+//
+// Without this test, a future refactor that updated the stub branch
+// but forgot the real branch would silently regress the universal:6
+// fix: argv-form would still apply in dev, but string-form would
+// sneak back into production.
+test("daemon: exec_stream real-Gondolin adapter path also hands argv to vm.exec", async (t) => {
+  const sockPath = path.join(os.tmpdir(), `daemon-${process.pid}-${Date.now()}-realstream.sock`);
+  const daemon = spawn("node", [DAEMON, "--socket", sockPath], {
+    env: {
+      ...process.env,
+      GONDOLIN_DAEMON_QUIET: "1",
+      GONDOLIN_DAEMON_STUB_VM: "1",
+      GONDOLIN_DAEMON_STUB_EXEC_PROC_MODE: "1",
+    },
+  });
+  t.after(() => { try { daemon.kill("SIGKILL"); } catch {} });
+
+  await waitForSocket(sockPath);
+  const init = await rpcCall(sockPath, { id: 1, method: "init", params: { config: {} } });
+  assert.equal(init.error, undefined);
+
+  // Drive the real-path adapter via exec_stream. We don't care about the
+  // streamed chunks — only that the daemon dispatched argv-form into the
+  // ExecProcess factory. rpcCallStreaming consumes the stream so the
+  // socket doesn't hang.
+  const streamed = await rpcCallStreaming(sockPath, {
+    id: 2,
+    method: "exec_stream",
+    params: { cmd: "echo realpath-noflag" },
+  });
+  assert.equal(streamed.final.error, undefined,
+    `exec_stream failed: ${JSON.stringify(streamed.final.error)}`);
+
+  const last = await rpcCall(sockPath, { id: 3, method: "_debug_last_exec" });
+  assert.deepEqual(last.result.cmd, ["bash", "-c", "echo realpath-noflag"],
+    "real-Gondolin adapter must also hand vm.exec an argv array, not a wrapped string");
+});
+
+test("daemon: exec_stream real-Gondolin adapter honors --login", async (t) => {
+  const sockPath = path.join(os.tmpdir(), `daemon-${process.pid}-${Date.now()}-realstream-login.sock`);
+  const daemon = spawn("node", [DAEMON, "--socket", sockPath], {
+    env: {
+      ...process.env,
+      GONDOLIN_DAEMON_QUIET: "1",
+      GONDOLIN_DAEMON_STUB_VM: "1",
+      GONDOLIN_DAEMON_STUB_EXEC_PROC_MODE: "1",
+    },
+  });
+  t.after(() => { try { daemon.kill("SIGKILL"); } catch {} });
+
+  await waitForSocket(sockPath);
+  await rpcCall(sockPath, { id: 1, method: "init", params: { config: {} } });
+
+  const streamed = await rpcCallStreaming(sockPath, {
+    id: 2,
+    method: "exec_stream",
+    params: { cmd: "echo realpath-login", login: true },
+  });
+  assert.equal(streamed.final.error, undefined);
+
+  const last = await rpcCall(sockPath, { id: 3, method: "_debug_last_exec" });
+  assert.deepEqual(last.result.cmd, ["bash", "-l", "-c", "echo realpath-login"],
+    "real-Gondolin adapter must include -l when params.login=true");
+});

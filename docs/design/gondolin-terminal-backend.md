@@ -118,6 +118,36 @@
 >    across calls, `patch_replace`. Out of scope for this branch;
 >    blocks "gondolin is on equal footing with local/docker."
 >
+> 14. ~~**gondolin's ``_run_bash`` silently dropped ``login`` and used
+>    string-form ``vm.exec``.**~~ ✅ **Resolved.** Every other Hermes
+>    backend (local, docker, singularity, ssh, modal, vercel) honors
+>    ``login=True``: when BaseEnvironment captures its session snapshot
+>    it spawns ``bash -l -c`` so /etc/profile + profile.d fire exactly
+>    once, then ``login=False`` for every subsequent call so they don't
+>    fire again. gondolin's ``_run_bash`` docstring openly admitted
+>    "login is accepted ... but has no effect" — it built only the
+>    ``cmd`` string and sent it as a wire string. The daemon then handed
+>    that string to the SDK's ``vm.exec(string)``, which wraps in
+>    ``/bin/sh -lc``. Net effect: dash (BusyBox sh) sourced /etc/profile
+>    on EVERY exec. devcontainers/universal:6's
+>    ``/usr/local/nvs/nvs.sh`` line 213 uses a bashism
+>    (``command -v xz &> /dev/null``); dash parses it as
+>    ``command -v xz &`` (backgrounded) ``> /dev/null`` (no-op
+>    redirect), and the backgrounded ``command -v`` writes
+>    ``/opt/conda/bin/xz`` to the inherited stdout — prepended to
+>    EVERY subsequent command's output (``read_file`` then claims a
+>    bytes-mismatch verifier error). Fix wires ``--login`` through
+>    ``gondolin_rpc_call`` to ``params.login`` on the wire, and the
+>    daemon builds an argv array (``[bash, -l?, -c, cmd]``) and hands
+>    it to ``vm.exec`` directly, bypassing the SDK's ``/bin/sh -lc``
+>    wrap entirely. Test coverage: 5 new unit tests
+>    (``socket_transport.test.mjs``) assert the daemon emits the right
+>    argv; 5 new Python tests (``test_gondolin_rpc_call.py``,
+>    ``test_gondolin_environment.py``) assert ``--login`` threads
+>    through wrapper → wire → daemon. Related: item 13 (no
+>    cross-backend conformance suite) is what allowed this drift to
+>    go unnoticed until it reached production.
+>
 > Until each of these has a decision (fix, defer-with-issue, accept-with-doc),
 > treat this branch as a spike, not a deliverable.
 

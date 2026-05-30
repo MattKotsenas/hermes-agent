@@ -911,12 +911,19 @@ class GondolinEnvironment(BaseEnvironment):
     ) -> subprocess.Popen:
         """Spawn the gondolin_rpc_call wrapper subprocess.
 
-        ``login`` is accepted for BaseEnvironment compatibility but has no
-        effect: Gondolin's VM helper runs each command via ``bash -c`` with
-        no profile to source. The session-snapshot machinery still works —
-        it captures env vars from the first call and re-sources them on
-        subsequent ones — but ``bash -l`` semantics aren't available inside
-        the VM.
+        ``login`` is honored the same way every other Hermes backend
+        honors it: BaseEnvironment passes ``login=True`` exactly once
+        per session (during snapshot capture) so /etc/profile and
+        profile.d fire one time, and ``login=False`` for every
+        steady-state command afterwards. We surface that through to the
+        daemon as ``--login``, which builds an argv-form
+        ``["bash", "-l", "-c", cmd]`` (vs ``["bash", "-c", cmd]``)
+        and hands it to ``vm.exec`` directly, bypassing the SDK's
+        default ``/bin/sh -lc`` shell wrap. The wrap is what caused
+        ``devcontainers/universal:6`` to prepend ``/opt/conda/bin/xz``
+        to every command's stdout: nvs.sh uses a bashism (``&>``) that
+        dash parses as ``command -v xz &`` (backgrounded), leaking the
+        path to the inherited stdout.
 
         Output is streamed by default — the wrapper writes stdout/stderr
         chunks to its pipes as they arrive from the daemon rather than
@@ -937,6 +944,8 @@ class GondolinEnvironment(BaseEnvironment):
         # Streaming defaults to True. Honored per-env via config["stream"].
         if self.config.get("stream", True):
             argv.append("--stream")
+        if login:
+            argv.append("--login")
         return _popen_bash(argv, stdin_data)
 
     def _start_secret_refresher_if_needed(self) -> None:

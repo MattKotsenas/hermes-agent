@@ -124,6 +124,7 @@ def _run_wrapper(
     env: dict | None = None,
     stream: bool = False,
     stdin_bytes: bytes | None = None,
+    login: bool = False,
 ):
     """Invoke the wrapper as a subprocess; return CompletedProcess.
 
@@ -143,6 +144,8 @@ def _run_wrapper(
         argv.extend(["--timeout-ms", str(timeout_ms)])
     if stream:
         argv.append("--stream")
+    if login:
+        argv.append("--login")
     if stdin_bytes is None:
         return subprocess.run(
             argv,
@@ -502,3 +505,66 @@ def test_binary_stdin_roundtrips_via_msgpack_bin():
     received = daemon.received_request["params"].get("stdin")
     assert received == payload, f"binary stdin mangled: {received!r} != {payload!r}"
 
+
+
+
+def test_login_flag_sets_params_login_true_on_the_wire():
+    """--login wires through to params.login=true on the exec RPC.
+
+    Every other Hermes backend (local, docker, singularity, ssh, modal,
+    vercel) honors a login flag in ``_run_bash`` to control whether the
+    spawned shell is ``bash -l -c`` (sources /etc/profile + profile.d)
+    or just ``bash -c`` (no profile sourcing). Without this wire field
+    the daemon can’t distinguish snapshot capture (login=true,
+    once per session) from steady-state execs (login=false, every
+    other call), and profile.d fires on every call — the gondolin
+    drift that caused universal:6 to leak /opt/conda/bin/xz.
+    """
+    response = {
+        "result": {"exit_code": 0, "stdout": "", "stderr": "", "duration_ms": 1}
+    }
+    with FakeDaemon(response) as daemon:
+        result = _run_wrapper(daemon.sock_path, "true", login=True)
+
+    assert result.returncode == 0
+    req = daemon.received_request
+    assert req["method"] == "exec"
+    assert req["params"].get("login") is True, (
+        f"expected params.login=True, got {req['params']!r}"
+    )
+
+
+def test_no_login_flag_omits_login_from_params():
+    """Without --login the wire payload must NOT carry a login field.
+
+    Omission (rather than ``login: false``) is the wire-compat-friendly
+    way to default — a future daemon could grow new login modes
+    (login: "interactive" etc.) and a client that always sent
+    ``login: false`` would lock itself out of the default."""
+    response = {
+        "result": {"exit_code": 0, "stdout": "", "stderr": "", "duration_ms": 1}
+    }
+    with FakeDaemon(response) as daemon:
+        _run_wrapper(daemon.sock_path, "true")
+
+    req = daemon.received_request
+    assert "login" not in req["params"], (
+        f"expected no login key in params, got {req['params']!r}"
+    )
+
+
+def test_login_flag_in_streaming_path():
+    """--login also threads through exec_stream so the snapshot
+    machinery (which streams its capture output) gets the same shell
+    semantics as the non-streaming path."""
+    frames = [{"kind": "stdout", "data": ""}]
+    response = {"result": {"exit_code": 0, "chunks": 1, "duration_ms": 1}}
+    with FakeDaemon(response, stream_frames=frames) as daemon:
+        result = _run_wrapper(
+            daemon.sock_path, "true", stream=True, login=True
+        )
+
+    assert result.returncode == 0
+    req = daemon.received_request
+    assert req["method"] == "exec_stream"
+    assert req["params"].get("login") is True

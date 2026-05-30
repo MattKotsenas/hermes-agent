@@ -37,6 +37,15 @@ import { loadPolicy, buildHooksInput } from "./hooks.mjs";
 
 const QUIET = !!process.env.GONDOLIN_DAEMON_QUIET;
 const STUB_VM = !!process.env.GONDOLIN_DAEMON_STUB_VM;
+// When STUB_VM is on, this flag makes the stub hide ``execStreaming`` and
+// return an ExecProcess-shaped object from ``vm.exec`` (Thenable +
+// ``.output()``). That forces the daemon's exec_stream handler down the
+// "real Gondolin" adapter branch (the ``else`` arm of
+// ``typeof vm.execStreaming === "function"``) so tests can verify that
+// branch also hands ``vm.exec`` an argv array — not a string. Without
+// this, the stub's ``execStreaming`` always wins and the real-path
+// adapter goes uncovered (silent way for the bug to re-emerge later).
+const STUB_EXEC_PROC_MODE = !!process.env.GONDOLIN_DAEMON_STUB_EXEC_PROC_MODE;
 
 function log(...args) {
   if (!QUIET) console.error("[gondolin-host]", ...args);
@@ -151,6 +160,18 @@ function buildExecOptions(params, extra) {
   const stdin = coerceStdin(params?.stdin);
   if (stdin != null) opts.stdin = stdin;
   return opts;
+}
+
+// Build the argv array we hand to ``vm.exec``. Single source of truth
+// shared by exec + exec_stream so they can't drift on shell choice or
+// login handling — the original drift (string-form ``vm.exec`` +
+// dropped login flag, present in gondolin but not local/docker/etc.) is
+// what let devcontainers/universal:6 leak ``/opt/conda/bin/xz`` onto
+// every command's stdout in the first place.
+function buildBashArgv(cmd, login) {
+  return login === true
+    ? ["bash", "-l", "-c", cmd]
+    : ["bash", "-c", cmd];
 }
 
 const handlers = {
@@ -275,13 +296,39 @@ const handlers = {
     }
 
     if (STUB_VM) {
+      // extractInner unwraps the user-supplied command string from the
+      // shape vm.exec was called with, so the stub’s test markers
+      // (SLEEP:/STDIN_ECHO/STREAM:) keep working regardless of whether
+      // the daemon hands us a pre-wrapped string (legacy) or an argv
+      // array ("bash", ["-l",] "-c", cmd). Real Gondolin’s
+      // vm.exec accepts both; the daemon used to send the string form
+      // (which made the SDK add a /bin/sh -lc wrap on top, leaking
+      // /opt/conda/bin/xz from noisy-profile images) and now sends the
+      // array form. This helper keeps the stub agnostic to that
+      // transition so a regression to string-form is observable rather
+      // than silently "working."
+      function extractInner(cmd) {
+        if (Array.isArray(cmd)) {
+          // Walk past leading [bash, -l?, -c]; whatever comes after -c
+          // is the user’s payload.
+          const dashCIdx = cmd.indexOf("-c");
+          if (dashCIdx >= 0 && dashCIdx + 1 < cmd.length) {
+            return String(cmd[dashCIdx + 1]);
+          }
+          return cmd.map(String).join(" ");
+        }
+        const m = typeof cmd === "string"
+          ? cmd.match(/^bash -c '(.*)'$/s)
+          : null;
+        return m ? m[1].replace(/'\\''/g, "'") : String(cmd);
+      }
+
+      let __lastExecCall = null;
+
       vm = {
         async exec(cmd, options) {
-          // Honor a "SLEEP:<ms>:" prefix so tests can assert on concurrent
-          // dispatch (one long-running exec should not block a short one).
-          // Strip the bash-c wrap the daemon adds so the marker survives.
-          const m = cmd.match(/^bash -c '(.*)'$/);
-          const inner = m ? m[1].replace(/'\\''/g, "'") : cmd;
+          __lastExecCall = { cmd, options };
+          const inner = extractInner(cmd);
           const sleepMatch = inner.match(/^SLEEP:(\d+):/);
           if (sleepMatch) {
             await new Promise((r) => setTimeout(r, Number(sleepMatch[1])));
@@ -298,7 +345,7 @@ const handlers = {
                   : Buffer.from(options.stdin).toString("utf8"));
             return { exitCode: 0, stdout: stdinStr, stderr: "" };
           }
-          return { exitCode: 0, stdout: cmd + "\n", stderr: "" };
+          return { exitCode: 0, stdout: inner + "\n", stderr: "" };
         },
         // Streaming exec: if cmd starts with "STREAM:", split the rest by
         // "|" and yield each segment as its own chunk; otherwise yield a
@@ -311,11 +358,12 @@ const handlers = {
         // real path where Gondolin yields Buffer chunks. Tests that
         // assert on the data payload should compare bytes, not strings.
         execStreaming(cmd, options) {
-          // The daemon wraps every cmd in `bash -c '...'`. Strip that wrap
-          // so the STREAM: marker still works for tests that drive the
-          // daemon through the full bash-wrap path.
-          const m = cmd.match(/^bash -c '(.*)'$/);
-          const inner = m ? m[1].replace(/'\\''/g, "'") : cmd;
+          __lastExecCall = { cmd, options };
+          // extractInner handles both the legacy string form
+          // ("bash -c '...'") and the argv array form
+          // ("bash", ["-l",] "-c", inner). See the helper above for
+          // why both shapes have to be accepted in stub mode.
+          const inner = extractInner(cmd);
           // STDIN_ECHO marker: stream options.stdin as a single chunk so
           // daemon-integration tests can verify exec_stream forwards stdin
           // the same way exec does. See the non-stream stub for context.
@@ -364,7 +412,44 @@ const handlers = {
           };
         },
         async close() {},
+        _lastExec() { return __lastExecCall; },
       };
+      if (STUB_EXEC_PROC_MODE) {
+        // Tear out execStreaming so the daemon's exec_stream handler
+        // takes the real-Gondolin adapter branch (``vm.exec(argv, opts)``
+        // → ``real.output()``). Then replace vm.exec with an
+        // ExecProcess-shaped factory: the returned object is Thenable
+        // (so ``await real`` in the daemon resolves with
+        // ``{exitCode}``) AND exposes ``.output()`` yielding
+        // ``{stream, data}`` chunks. We still record __lastExecCall on
+        // entry so the test can assert the argv shape via
+        // ``_debug_last_exec``.
+        delete vm.execStreaming;
+        vm.exec = function execAsProcess(cmd, options) {
+          __lastExecCall = { cmd, options };
+          const inner = extractInner(cmd);
+          const finalP = Promise.resolve({
+            exitCode: 0,
+            stdout: inner + "\n",
+            stderr: "",
+          });
+          return {
+            output() {
+              return (async function* () {
+                yield {
+                  stream: "stdout",
+                  data: Buffer.from(inner + "\n", "utf8"),
+                };
+              })();
+            },
+            // Thenable surface so ``await real`` in the daemon’s
+            // exec_stream adapter resolves with ``{exitCode}``.
+            then(resolve, reject) {
+              return finalP.then(resolve, reject);
+            },
+          };
+        };
+      }
       // Fake secretManager seeded from config.secrets so set_secret tests
       // can exercise the plumbing without a real createHttpHooks() call.
       // Mirrors the real Gondolin API: updateSecret throws on unknown name,
@@ -495,15 +580,27 @@ const handlers = {
     if (typeof cmd !== "string") throw new Error("exec: 'cmd' must be a string");
     const timeoutMs = params?.timeout_ms ?? 180_000;
     const start = Date.now();
-    // Wrap with bash -c so the user's command runs under bash (which the
-    // BaseEnvironment session-snapshot prelude relies on: 'builtin cd',
-    // 'declare -f', 'shopt', 'set +e/+u' are all bashisms). The Gondolin
-    // helper image's default /bin/sh is BusyBox sh and would reject those.
-    // Single-quote the cmd and escape any embedded single quotes the
-    // standard way (POSIX trick: end-quote, escape, start-quote).
-    const escaped = cmd.replace(/'/g, "'\\''");
-    const wrapped = `bash -c '${escaped}'`;
-    const result = await vm.exec(wrapped, buildExecOptions(params));
+    // Hand vm.exec an argv array, not a string. Two reasons:
+    //
+    //   1. We need bash, not /bin/sh. The BaseEnvironment session-snapshot
+    //      prelude relies on bashisms ('builtin cd', 'declare -f', 'shopt',
+    //      'set +e/+u') that BusyBox sh would reject. Some helper images
+    //      ship a bash that is actually bash; others (Alpine derivatives)
+    //      do not.
+    //   2. The SDK's string-form vm.exec(str) wraps str in /bin/sh -lc so
+    //      /etc/profile + profile.d fire on EVERY exec. devcontainers/
+    //      universal:6's /usr/local/nvs/nvs.sh uses a bashism (`&>`) that
+    //      dash parses as `command -v xz &` (backgrounded) — leaking
+    //      "/opt/conda/bin/xz" onto stdout in front of the real command
+    //      output. Argv-form bypasses that wrap entirely.
+    //
+    // The --login flag turns this into ``[bash, -l, -c, cmd]`` so the
+    // BaseEnvironment snapshot capture (login=True, once per session)
+    // still sources /etc/profile exactly once; every steady-state call
+    // omits -l and skips profile.d. Argv-form means we never shell-quote
+    // cmd ourselves — bash receives it verbatim.
+    const argv = buildBashArgv(cmd, params?.login);
+    const result = await vm.exec(argv, buildExecOptions(params));
     return {
       exit_code: result.exitCode,
       stdout: result.stdout,
@@ -526,13 +623,14 @@ const handlers = {
     if (typeof cmd !== "string") throw new Error("exec_stream: 'cmd' must be a string");
     const timeoutMs = params?.timeout_ms ?? 180_000;
     const start = Date.now();
-    const escaped = cmd.replace(/'/g, "'\\''");
-    const wrapped = `bash -c '${escaped}'`;
+    // Argv-form (via buildBashArgv) avoids the SDK's /bin/sh -lc wrap
+    // and honors --login. Shared helper keeps this in step with exec().
+    const argv = buildBashArgv(cmd, params?.login);
 
     let proc;
     if (typeof vm.execStreaming === "function") {
       // Stub path or any adapter that exposes a stream-shaped interface.
-      proc = vm.execStreaming(wrapped, buildExecOptions(params));
+      proc = vm.execStreaming(argv, buildExecOptions(params));
     } else {
       // Real Gondolin: vm.exec returns an ExecProcess. The Symbol.asyncIterator
       // surface yields the merged stdout (all chunks tagged "string") which
@@ -541,7 +639,7 @@ const handlers = {
       // instead: it returns AsyncIterable<OutputChunk> with each chunk
       // carrying { stream: "stdout"|"stderr", data: Buffer, text: string },
       // matching the non-stream exec's split exactly.
-      const real = vm.exec(wrapped, buildExecOptions(params, { stdout: "pipe", stderr: "pipe" }));
+      const real = vm.exec(argv, buildExecOptions(params, { stdout: "pipe", stderr: "pipe" }));
       proc = {
         async *chunks() {
           for await (const chunk of real.output()) {
@@ -652,6 +750,21 @@ if (STUB_VM) {
     return { value: entry?.value, hosts: entry?.hosts };
   };
   HANDLER_CONCURRENCY._debug_get_secret = STEADY;
+
+  // Returns the shape of the most recent vm.exec / vm.execStreaming call
+  // recorded by the stub VM (see the stub’s exec/execStreaming
+  // below). Tests assert against this to verify the daemon hands argv
+  // arrays — not pre-wrapped "bash -c '...'" strings — down
+  // to vm.exec. The array form is what bypasses the SDK’s
+  // /bin/sh -lc per-call wrap, which is the leak vector on
+  // noisy-profile images like devcontainers/universal:6.
+  handlers._debug_last_exec = async function _debug_last_exec() {
+    if (!vm || typeof vm._lastExec !== "function") {
+      throw new Error("_debug_last_exec only available in stub mode");
+    }
+    return vm._lastExec();
+  };
+  HANDLER_CONCURRENCY._debug_last_exec = STEADY;
 
   // Debug helper: peek at the inFlightSteady set so a test can
   // observe whether a handler is stuck (e.g. exec_stream hanging on

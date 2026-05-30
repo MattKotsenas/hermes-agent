@@ -139,11 +139,29 @@ def main(argv: list[str] | None = None) -> int:
             "BaseEnvironment) wants to see live."
         ),
     )
+    parser.add_argument(
+        "--login",
+        action="store_true",
+        help=(
+            "Run the cmd under a login shell (bash -l -c) inside the VM. "
+            "BaseEnvironment passes login=True only during init_session "
+            "(snapshot capture) so /etc/profile + profile.d fire exactly "
+            "once per session; every steady-state exec should omit this "
+            "flag. The daemon turns login into an argv-form invocation "
+            "(bash -l -c <cmd>) so the SDK does not wrap us in its own "
+            "/bin/sh -lc shell."
+        ),
+    )
     args = parser.parse_args(argv)
 
     params: dict[str, Any] = {"cmd": args.cmd}
     if args.timeout_ms is not None:
         params["timeout_ms"] = args.timeout_ms
+    if args.login:
+        # Absent/false on the wire means non-login; true means
+        # ``bash -l -c``. We omit the key when false to keep the wire
+        # payload minimal rather than as a future-compat statement.
+        params["login"] = True
 
     # Forward our own stdin to the daemon as msgpack `bin` in
     # ``params.stdin``. BaseEnvironment._pipe_stdin pipes the caller's
