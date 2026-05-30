@@ -122,6 +122,33 @@ def test_nonzero_exit_codes_propagate(gondolin_env):
     assert result["returncode"] == 42
 
 
+@requires_gondolin
+def test_dev_fd_symlinks_exist(gondolin_env):
+    """Regression: upstream gondolin guests don't ship the standard
+    /dev/{fd,stdin,stdout,stderr} -> /proc/self/fd[/N] symlinks that
+    runc, crun, systemd, and OpenRC all set up at boot. Without them,
+    bash process substitution <(cmd) and anything that reads
+    /dev/stdin as a path fails -- most visibly /etc/profile.d/rvm.sh
+    on mcr.microsoft.com/devcontainers/universal:6, which prints
+    'cat: /dev/fd/63: No such file or directory' on every login shell.
+
+    The daemon installs the symlinks at init via setupGuestDevSymlinks().
+    Drop the workaround -- and this test -- once
+    https://github.com/earendil-works/gondolin/issues/118 ships upstream.
+    """
+    result = gondolin_env.execute(
+        'for p in /dev/fd /dev/stdin /dev/stdout /dev/stderr; do '
+        '  echo "$p -> $(readlink "$p" 2>/dev/null || echo NOT_A_SYMLINK)"; '
+        'done'
+    )
+    output = result["output"]
+    assert result["returncode"] == 0, f"non-zero exit: {result}"
+    assert "/dev/fd -> /proc/self/fd" in output, output
+    assert "/dev/stdin -> /proc/self/fd/0" in output, output
+    assert "/dev/stdout -> /proc/self/fd/1" in output, output
+    assert "/dev/stderr -> /proc/self/fd/2" in output, output
+
+
 # ----------------------------------------------------------------------
 # Workspace bind-mount: host <-> guest filesystem sharing.
 # These tests prove the vfs.mounts + RealFSProvider wiring actually works

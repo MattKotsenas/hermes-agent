@@ -174,6 +174,46 @@ function buildBashArgv(cmd, login) {
     : ["bash", "-c", cmd];
 }
 
+// Upstream gondolin guests boot ``sandboxd`` directly as PID 1 with no
+// init system, so the standard /dev/{fd,stdin,stdout,stderr} ->
+// /proc/self/fd[/N] symlinks never get created. runc, crun, systemd,
+// OpenRC, and Docker's containerd-shim all do this at container/boot
+// time; gondolin is the outlier. Without those symlinks bash process
+// substitution (``<(cmd)``) and anything reading /dev/stdin as a path
+// fails — most visibly /etc/profile.d/rvm.sh on
+// mcr.microsoft.com/devcontainers/universal:6, which prints
+// ``cat: /dev/fd/63: No such file or directory`` on every login shell.
+//
+// Workaround: run once after VM boot via the same SDK exec channel we
+// use for everything else. Argv-form bypasses the SDK's /bin/sh -lc
+// wrap. Fails soft (log, don't throw): if this somehow can't run, the
+// sandbox boot is still salvageable — a bricked init would be worse
+// than a broken <(cmd) for the rare image that hand-maintains its own
+// /dev symlinks.
+//
+// Drop this when https://github.com/earendil-works/gondolin/issues/118
+// lands upstream and the helper images include the symlinks at build
+// time (or sandboxd creates them at boot).
+async function setupGuestDevSymlinks(vm) {
+  const script =
+    "[ -e /dev/fd ]     || ln -snf /proc/self/fd   /dev/fd; " +
+    "[ -e /dev/stdin ]  || ln -snf /proc/self/fd/0 /dev/stdin; " +
+    "[ -e /dev/stdout ] || ln -snf /proc/self/fd/1 /dev/stdout; " +
+    "[ -e /dev/stderr ] || ln -snf /proc/self/fd/2 /dev/stderr";
+  try {
+    const result = await vm.exec(["sh", "-c", script], { timeout: 10_000 });
+    if (result.exitCode !== 0) {
+      log(
+        "dev symlink setup non-zero exit:",
+        result.exitCode,
+        result.stderr ?? "",
+      );
+    }
+  } catch (err) {
+    log("dev symlink setup failed:", err?.message ?? err);
+  }
+}
+
 const handlers = {
   async init(params) {
     if (vm) throw new Error("already initialized");
@@ -567,6 +607,9 @@ const handlers = {
     }
     vm = await VM.create(vmOptions);
     log("VM ready");
+    // See setupGuestDevSymlinks comment above re: gondolin#118. Once per
+    // VM boot; symlinks survive forever inside the guest.
+    await setupGuestDevSymlinks(vm);
     const result = { ready: true };
     if (hooksInput.secretDiagnostics && hooksInput.secretDiagnostics.length) {
       result.secretDiagnostics = hooksInput.secretDiagnostics;
