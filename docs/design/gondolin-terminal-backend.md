@@ -1228,6 +1228,72 @@ the wizard surfaces this cost upfront.
   gondolin as their backend; surfaces the time/size cost (`~2 min /
   ~1.5 GB` for the nikolaik default) before doing anything.
 
+### Customizing the image (where to add packages, system config, etc.)
+
+Users sooner or later want to ship something more than the stock
+image — extra apt packages, system-level config (gitconfig, sysctl,
+profile.d hooks), pre-pulled language toolchains. Two clean paths,
+and Hermes intentionally takes no opinion on which:
+
+**Path A — Containerfile (OCI tooling, the well-trodden path)**
+
+Write a Containerfile that `FROM`s your base image and adds whatever
+you need with `RUN`, then build with podman/docker and tag it:
+
+```dockerfile
+FROM mcr.microsoft.com/devcontainers/universal:6
+RUN apt-get update && apt-get install -y rustc cargo golang-go
+RUN git config --system --add safe.directory '*'
+```
+
+```bash
+podman build -t my-devbox:1 -f Containerfile .
+```
+
+Then point Hermes at the local tag:
+
+```yaml
+terminal:
+  gondolin:
+    image: my-devbox:1
+```
+
+Hermes' `_ensure_gondolin_image_built` picks up the local tag
+(via `is_image_built`) without trying to pull it. Best for: heavy
+additions (language toolchains, big package sets) where the
+Containerfile is the right home anyway; team-shared images you
+push to a registry; anyone already comfortable with Docker.
+
+**Path B — `gondolin build` with `postBuild.commands` (gondolin
+upstream's image-build hook)**
+
+Gondolin's own build config accepts a `postBuild.commands` list that
+runs shell commands inside the rootfs during the build, after the OCI
+layers are unpacked. Same end result (a baked rootfs), different
+tooling. See
+[gondolin custom-images docs](https://earendil-works.github.io/gondolin/custom-images/)
+for the JSON schema and `gondolin build --help` for invocation.
+
+Today, Hermes does NOT expose `postBuild` through its own config —
+`hermes_cli/gondolin_image._build_config_for_oci` builds a minimal
+spec with no postBuild section. To use `postBuild.commands`, run
+`gondolin build` yourself with a JSON spec, tag the result, and
+point Hermes at the tag (same `image:` config knob as Path A).
+
+Best for: gondolin-native workflows where you'd rather not maintain
+a Containerfile; small, declarative tweaks (e.g. `git config --system`,
+`sysctl`, `/etc/profile.d/foo.sh`) that don't warrant a full image
+layer.
+
+**Per-boot setup (not image-permanent)**
+
+Anything that needs to re-run on every VM boot — daemons that don't
+self-start, env-var seeding via `export`, agents that need a fresh
+PID at boot — lives in our daemon's runtime init phase
+(``setupGuestDevSymlinks`` in `daemon.mjs` is the precedent). There
+is no user-facing config knob for this today; it's a development
+follow-up if real demand surfaces.
+
 ### Why a content-derived tag, not Hermes's version
 
 `oci_image_tag` maps the OCI name into a safe gondolin tag
